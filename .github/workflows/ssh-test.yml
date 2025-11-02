@@ -1,0 +1,32 @@
+name: SSH connectivity test
+
+on:
+  workflow_dispatch: {}     # kézzel indítható
+  push:
+    branches: [ "main" ]    # vagy ideiglenesen kikapcsolhatod
+
+jobs:
+  ssh-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out (not strictly needed)
+        uses: actions/checkout@v4
+
+      - name: app.schoollive.hu
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: SSH to server and run commands
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host:     ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key:      ${{ secrets.DEPLOY_KEY }}
+          script: |
+            echo "Connected to: $(hostname)"
+            echo "User: $(whoami)"
+            echo "Uptime: $(uptime)"
+            mkdir -p /opt/schoollive/_probe && ls -la /opt/schoollive
+            echo "OK" > /opt/schoollive/_probe/ok.txt
+            ls -la /opt/schoollive/_probe
