@@ -1,20 +1,17 @@
 name: SSH connectivity test
 
 on:
-  workflow_dispatch: {}     # kézzel indítható
-  push:
-    branches: [ "main" ]    # vagy ideiglenesen kikapcsolhatod
+  workflow_dispatch: {}   # Kézzel indítható a Actions fülön
 
 jobs:
   ssh-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out (not strictly needed)
-        uses: actions/checkout@v4
-
-      - name: api.schoollive.hu
+      - name: Trust host key
         run: |
           mkdir -p ~/.ssh
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
           ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
 
       - name: SSH to server and run commands
@@ -27,6 +24,6 @@ jobs:
             echo "Connected to: $(hostname)"
             echo "User: $(whoami)"
             echo "Uptime: $(uptime)"
-            mkdir -p /opt/schoollive/_probe && ls -la /opt/schoollive
-            echo "OK" > /opt/schoollive/_probe/ok.txt
+            mkdir -p /opt/schoollive/_probe
+            echo "OK $(date)" > /opt/schoollive/_probe/ok.txt
             ls -la /opt/schoollive/_probe
