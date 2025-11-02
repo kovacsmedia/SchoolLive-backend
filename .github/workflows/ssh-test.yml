@@ -12,7 +12,7 @@ jobs:
       - name: Check out (not strictly needed)
         uses: actions/checkout@v4
 
-      - name: app.schoollive.hu
+      - name: api.schoollive.hu
         run: |
           mkdir -p ~/.ssh
           ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
