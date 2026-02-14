@@ -11,14 +11,17 @@ jobs:
     environment: production
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Trust host key
         run: |
           mkdir -p ~/.ssh
+          touch ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
           ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
 
-      - name: Upload source to server
+      - name: Upload backend to server (rsync)
         uses: burnett01/rsync-deployments@7.0.1
         with:
           switches: -avzr --delete --exclude='.git' --exclude='node_modules' --exclude='.env'
@@ -28,17 +31,33 @@ jobs:
           remote_user: ${{ secrets.DEPLOY_USER }}
           remote_key: ${{ secrets.DEPLOY_KEY }}
 
-      - name: Install & restart (PM2)
+      - name: Install, build and restart (PM2)
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ secrets.DEPLOY_HOST }}
+          host:     ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_KEY }}
+          key:      ${{ secrets.DEPLOY_KEY }}
           script: |
             set -e
             cd /opt/schoollive/backend
+
+            # függőségek
             npm ci
+
+            # build (ha van)
             npm run build || true
-            pm2 describe schoollive-api >/dev/null || pm2 start dist/main.js --name schoollive-api
-            pm2 reload schoollive-api
+
+            # indítás/reload
+            if [ -f "dist/main.js" ]; then
+              pm2 describe schoollive-api >/dev/null || pm2 start dist/main.js --name schoollive-api
+              pm2 reload schoollive-api
+            elif [ -f "index.js" ]; then
+              pm2 describe schoollive-api >/dev/null || pm2 start index.js --name schoollive-api
+              pm2 reload schoollive-api
+            else
+              echo "Nem találok belépési fájlt (dist/main.js vagy index.js)."
+              echo "Később ehhez igazítjuk a PM2 start parancsot."
+              exit 1
+            fi
+
             pm2 save
