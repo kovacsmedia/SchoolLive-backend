@@ -3,7 +3,6 @@
     echo -n "DEPLOY_HOST: "; [ -z "${{ secrets.DEPLOY_HOST }}" ] && echo "EMPTY" || echo "SET"
     echo -n "DEPLOY_USER: "; [ -z "${{ secrets.DEPLOY_USER }}" ] && echo "EMPTY" || echo "SET"
     echo -n "DEPLOY_KEY:  "; [ -z "${{ secrets.DEPLOY_KEY }}"  ] && echo "EMPTY" || echo "SET"
-
 name: SSH connectivity test
 
 on:
