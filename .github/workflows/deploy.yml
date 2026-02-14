@@ -1,3 +1,7 @@
+pwd
+ls -la
+sed -n '1,120p' package.json
+
 name: Deploy backend
 
 on:
