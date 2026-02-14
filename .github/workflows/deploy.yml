@@ -41,22 +41,30 @@ jobs:
             set -e
             cd /opt/schoollive/backend
 
-            # függőségek
-            npm ci
+            # Install dependencies (lockfile -> npm ci, otherwise fallback)
+            if [ -f "package-lock.json" ]; then
+              npm ci
+            else
+              npm install
+            fi
 
-            # build (ha van)
-            npm run build || true
+            # Run build only if it exists
+            npm run -s build || echo "No build script, skipping"
 
-            # indítás/reload
-            if [ -f "dist/main.js" ]; then
+            # Start/reload with PM2 using the correct entrypoint
+            if [ -f "server.js" ]; then
+              pm2 describe schoollive-api >/dev/null || pm2 start server.js --name schoollive-api
+              pm2 reload schoollive-api
+            elif [ -f "dist/main.js" ]; then
               pm2 describe schoollive-api >/dev/null || pm2 start dist/main.js --name schoollive-api
               pm2 reload schoollive-api
             elif [ -f "index.js" ]; then
               pm2 describe schoollive-api >/dev/null || pm2 start index.js --name schoollive-api
               pm2 reload schoollive-api
             else
-              echo "Nem találok belépési fájlt (dist/main.js vagy index.js)."
-              echo "Később ehhez igazítjuk a PM2 start parancsot."
+              echo "Nem találok belépési fájlt (server.js / dist/main.js / index.js)."
+              echo "Aktuális könyvtár tartalma:"
+              ls -la
               exit 1
             fi
 
