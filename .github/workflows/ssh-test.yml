@@ -1,17 +1,20 @@
-- name: Check secrets presence
-  run: |
-    echo -n "DEPLOY_HOST: "; [ -z "${{ secrets.DEPLOY_HOST }}" ] && echo "EMPTY" || echo "SET"
-    echo -n "DEPLOY_USER: "; [ -z "${{ secrets.DEPLOY_USER }}" ] && echo "EMPTY" || echo "SET"
-    echo -n "DEPLOY_KEY:  "; [ -z "${{ secrets.DEPLOY_KEY }}"  ] && echo "EMPTY" || echo "SET"
 name: SSH connectivity test
 
 on:
-  workflow_dispatch: {}   # Kézzel indítható a Actions fülön
- 
+  workflow_dispatch: {}
+
 jobs:
   ssh-test:
     runs-on: ubuntu-latest
+    environment: production
+
     steps:
+      - name: Check secrets presence
+        run: |
+          echo -n "DEPLOY_HOST: "; [ -z "${{ secrets.DEPLOY_HOST }}" ] && echo "EMPTY" || echo "SET"
+          echo -n "DEPLOY_USER: "; [ -z "${{ secrets.DEPLOY_USER }}" ] && echo "EMPTY" || echo "SET"
+          echo -n "DEPLOY_KEY:  "; [ -z "${{ secrets.DEPLOY_KEY }}"  ] && echo "EMPTY" || echo "SET"
+
       - name: Trust host key
         run: |
           mkdir -p ~/.ssh
