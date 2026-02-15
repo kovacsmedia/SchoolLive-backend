@@ -1,0 +1,214 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  TENANT_ADMIN
+  ORG_ADMIN
+  TEACHER
+  OPERATOR
+}
+
+enum MessageType {
+  TTS
+  AUDIO_FILE
+  YOUTUBE
+  PLAYLIST
+}
+
+enum TargetType {
+  DEVICE
+  GROUP
+  ORG_UNIT
+  ALL
+}
+
+enum CommandStatus {
+  QUEUED
+  SENT
+  ACKED
+  FAILED
+}
+
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  domain    String?  @unique
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  orgUnits  OrganizationalUnit[]
+  users     User[]
+  devices   Device[]
+  groups    DeviceGroup[]
+  messages  Message[]
+  commands  DeviceCommand[]
+
+  @@index([isActive])
+}
+
+model OrganizationalUnit {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  parentId  String?
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  parent    OrganizationalUnit? @relation("OrgUnitTree", fields: [parentId], references: [id])
+  children  OrganizationalUnit[] @relation("OrgUnitTree")
+
+  users     User[]
+  devices   Device[]
+
+  @@index([tenantId])
+  @@index([tenantId, parentId])
+  @@unique([tenantId, name])
+}
+
+model User {
+  id          String   @id @default(uuid())
+  tenantId    String?  // SUPER_ADMIN esetén lehet null
+  orgUnitId   String?
+
+  email       String   @unique
+  passwordHash String
+  role        UserRole
+  isActive    Boolean  @default(true)
+
+  // 2FA (TOTP)
+  twoFactorEnabled Boolean @default(false)
+  twoFactorSecret  String?
+
+  // Trusted device (a superadmin "eszközhöz kötése")
+  trustedDeviceHash String? // pl. user agent + random token hash
+  trustedDeviceSetAt DateTime?
+
+  lastLoginAt DateTime?
+  createdAt   DateTime @default(now())
+
+  tenant      Tenant?  @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  orgUnit     OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
+
+  messages    Message[] @relation("CreatedBy")
+
+  @@index([tenantId])
+  @@index([role])
+  @@index([isActive])
+}
+
+model Device {
+  id          String   @id @default(uuid())
+  tenantId    String
+  orgUnitId   String?
+
+  name        String
+  deviceKeyHash String // eszköz egyedi kulcs hash-e (nem plaintext)
+  firmwareVersion String?
+  ipAddress   String?
+
+  // állapot
+  lastSeenAt  DateTime?
+  online      Boolean  @default(false)
+  volume      Int      @default(5) // 0..10
+  muted       Boolean  @default(false)
+
+  // bővíthető státusz
+  statusPayload Json?
+
+  createdAt   DateTime @default(now())
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  orgUnit     OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
+
+  groupMembers DeviceGroupMember[]
+  commands     DeviceCommand[]
+
+  @@index([tenantId])
+  @@index([tenantId, online])
+  @@index([tenantId, lastSeenAt])
+  @@unique([tenantId, name])
+}
+
+model DeviceGroup {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  createdAt DateTime @default(now())
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  members   DeviceGroupMember[]
+
+  @@index([tenantId])
+  @@unique([tenantId, name])
+}
+
+model DeviceGroupMember {
+  groupId  String
+  deviceId String
+
+  group    DeviceGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  device   Device      @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@id([groupId, deviceId])
+  @@index([deviceId])
+}
+
+model Message {
+  id          String   @id @default(uuid())
+  tenantId    String
+
+  type        MessageType
+  title       String?
+  fileUrl     String?
+  scheduledAt DateTime?
+  targetType  TargetType
+  targetId    String? // DEVICE/GROUP/ORG_UNIT esetén
+  createdById String
+  createdAt   DateTime @default(now())
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy   User     @relation("CreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  commands    DeviceCommand[]
+
+  @@index([tenantId])
+  @@index([tenantId, scheduledAt])
+  @@index([tenantId, targetType])
+}
+
+model DeviceCommand {
+  id          String   @id @default(uuid())
+  tenantId    String
+  deviceId    String
+  messageId   String?
+
+  payload     Json
+  status      CommandStatus @default(QUEUED)
+
+  queuedAt    DateTime @default(now())
+  sentAt      DateTime?
+  ackedAt     DateTime?
+  error       String?
+
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  message     Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([deviceId])
+  @@index([tenantId, status])
+  @@index([tenantId, queuedAt])
+}
