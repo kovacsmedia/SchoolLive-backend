@@ -211,4 +211,8 @@ model DeviceCommand {
   @@index([deviceId])
   @@index([tenantId, status])
   @@index([tenantId, queuedAt])
+  
+  retryCount   Int      @default(0)
+  maxRetries   Int      @default(3)
+  lastError    String?
 }
