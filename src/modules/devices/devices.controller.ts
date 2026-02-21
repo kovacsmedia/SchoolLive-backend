@@ -139,45 +139,83 @@ export async function createDeviceCommand(req: Request, res: Response) {
 export async function pollCommands(req: Request, res: Response) {
   const dev = (req as any).device as { id: string; tenantId: string };
 
-  // 1) Lazy retry: timeoutolt SENT parancsok visszaállítása QUEUED-ra (retry++)
-  const timeoutBefore = new Date(Date.now() - COMMAND_TIMEOUT_MS);
-
-  // azok, amik még újrapróbálhatók
-  await prisma.deviceCommand.updateMany({
+  const now = new Date();
+  const ACK_TIMEOUT_MS = 60_000; // 60 mp, később configból
+  const timeoutBefore = new Date(now.getTime() - ACK_TIMEOUT_MS);
+  // 0) Safety net: ha valamiért több SENT van ugyanarra a device-ra,
+  //    akkor csak a legrégebbit hagyjuk "in-flight"-nak, a többit visszatesszük QUEUED-ba.
+  const sentList = await prisma.deviceCommand.findMany({
     where: {
       tenantId: dev.tenantId,
       deviceId: dev.id,
-      status: "SENT",
-      sentAt: { lt: timeoutBefore },
-      retryCount: { lt: 3 } // később maxRetries mezővel finomítjuk
+      status: "SENT"
     },
-    data: {
-      status: "QUEUED",
-      sentAt: null,
-      retryCount: { increment: 1 },
-      lastError: "Timeout: ACK not received"
-    }
+    orderBy: { queuedAt: "asc" }
   });
 
-  // azok, amik kifutottak a retry-ból → ERROR
-  await prisma.deviceCommand.updateMany({
+  if (sentList.length > 1) {
+    const keep = sentList[0]; // ezt hagyjuk meg in-flightnak
+
+    const toRequeueIds = sentList.slice(1).map(c => c.id);
+    await prisma.deviceCommand.updateMany({
+      where: { id: { in: toRequeueIds } },
+      data: {
+        status: "QUEUED",
+        sentAt: null,
+        lastError: "Superseded: another command was already in-flight"
+      }
+    });
+  }
+  // 1) Ha van in-flight (SENT) parancs, akkor azt kezeljük először.
+  //    - ha még nem timeoutos: NEM adunk újat
+  //    - ha timeoutos és van még retry: újraküldjük (retryCount++)
+  //    - ha elfogyott a retry: FAILED és mehetünk tovább a következő QUEUED-ra
+  const inFlight = await prisma.deviceCommand.findFirst({
     where: {
       tenantId: dev.tenantId,
       deviceId: dev.id,
-      status: "SENT",
-      sentAt: { lt: timeoutBefore },
-      retryCount: { gte: 3 }
+      status: "SENT"
     },
-    data: {
-      status: "FAILED",
-      ackedAt: new Date(),
-      lastError: "Timeout: max retries reached",
-      error: "Timeout: max retries reached"
-    }
+    orderBy: { sentAt: "asc" }
   });
 
-  // 2) legelső QUEUED parancs
-  const cmd = await prisma.deviceCommand.findFirst({
+  if (inFlight) {
+    // ha sentAt null lenne (nem kéne), kezeljük úgy, mintha timeoutos lenne
+    const sentAt = inFlight.sentAt ?? new Date(0);
+
+    if (sentAt > timeoutBefore) {
+      // még várunk ACK-ra, nem küldünk másik parancsot
+      return res.json({ ok: true, command: null });
+    }
+
+    // timeout -> retry vagy fail
+    if (inFlight.retryCount < inFlight.maxRetries) {
+      const updated = await prisma.deviceCommand.update({
+        where: { id: inFlight.id },
+        data: {
+          retryCount: { increment: 1 },
+          sentAt: now,
+          lastError: "Timeout: ACK not received"
+        }
+      });
+      return res.json({ ok: true, command: updated });
+    }
+
+    // max retry elérve -> FAILED és továbblépünk
+    await prisma.deviceCommand.update({
+      where: { id: inFlight.id },
+      data: {
+        status: "FAILED",
+        ackedAt: now,
+        lastError: "Timeout: max retries reached",
+        error: "Timeout: max retries reached"
+      }
+    });
+    // és folytatjuk lent a QUEUED-dal
+  }
+
+  // 2) Nincs in-flight -> a legrégebbi QUEUED-ot kiküldjük
+  const queued = await prisma.deviceCommand.findFirst({
     where: {
       tenantId: dev.tenantId,
       deviceId: dev.id,
@@ -186,22 +224,21 @@ export async function pollCommands(req: Request, res: Response) {
     orderBy: { queuedAt: "asc" }
   });
 
-  if (!cmd) {
+  if (!queued) {
     return res.json({ ok: true, command: null });
   }
 
-  // 3) jelöljük elküldöttnek (idempotens: csak ha még QUEUED)
+  // atomi átállítás QUEUED -> SENT (race ellen)
   const updated = await prisma.deviceCommand.updateMany({
-    where: { id: cmd.id, status: "QUEUED" },
-    data: { status: "SENT", sentAt: new Date() }
+    where: { id: queued.id, status: "QUEUED" },
+    data: { status: "SENT", sentAt: now }
   });
 
   if (updated.count === 0) {
     return res.json({ ok: true, command: null });
   }
 
-  // 4) friss rekord visszaadása
-  const fresh = await prisma.deviceCommand.findUnique({ where: { id: cmd.id } });
+  const fresh = await prisma.deviceCommand.findUnique({ where: { id: queued.id } });
   return res.json({ ok: true, command: fresh });
 }
 
