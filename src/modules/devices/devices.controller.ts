@@ -94,3 +94,107 @@ export async function deviceBeacon(req: Request, res: Response) {
 
   res.json({ ok: true, device: updated });
 }
+
+export async function createDeviceCommand(req: Request, res: Response) {
+  const user = req.user!;
+  if (user.role !== "TENANT_ADMIN" && user.role !== "ORG_ADMIN") {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  const deviceId = req.params.id;
+  const { payload } = req.body ?? {};
+
+  if (!payload || typeof payload !== "object") {
+    return res.status(400).json({ error: "payload is required (JSON object)" });
+  }
+
+  // tenant izoláció
+  const device = await prisma.device.findFirst({
+    where: {
+      id: deviceId,
+      tenantId: user.tenantId!
+    }
+  });
+
+  if (!device) {
+    return res.status(404).json({ error: "Device not found" });
+  }
+
+  const command = await prisma.deviceCommand.create({
+    data: {
+      tenantId: user.tenantId!,
+      deviceId,
+      payload,
+      status: "QUEUED"
+    }
+  });
+
+  res.status(201).json(command);
+}
+export async function pollCommands(req: Request, res: Response) {
+  const dev = (req as any).device as { id: string; tenantId: string };
+
+  // legelső QUEUED parancs
+  const cmd = await prisma.deviceCommand.findFirst({
+    where: {
+      tenantId: dev.tenantId,
+      deviceId: dev.id,
+      status: "QUEUED"
+    },
+    orderBy: { queuedAt: "asc" }
+  });
+
+  if (!cmd) {
+    return res.json({ ok: true, command: null });
+  }
+
+  // jelöljük elküldöttnek
+ const updated = await prisma.deviceCommand.updateMany({
+  where: { id: cmd.id, status: "QUEUED" },
+  data: { status: "SENT", sentAt: new Date() }
+});
+
+if (updated.count === 0) {
+  return res.json({ ok: true, command: null });
+}
+
+const fresh = await prisma.deviceCommand.findUnique({ where: { id: cmd.id } });
+return res.json({ ok: true, command: fresh });
+
+  res.json({ ok: true, command: updated });
+}
+export async function ackCommand(req: Request, res: Response) {
+  const dev = (req as any).device as { id: string; tenantId: string };
+
+  const { commandId, ok, error } = req.body ?? {};
+  if (!commandId || typeof commandId !== "string") {
+    return res.status(400).json({ error: "commandId is required" });
+  }
+  if (typeof ok !== "boolean") {
+    return res.status(400).json({ error: "ok is required (boolean)" });
+  }
+
+  // csak a saját tenant + saját device parancsát ACK-elheti
+  const cmd = await prisma.deviceCommand.findFirst({
+    where: {
+      id: commandId,
+      tenantId: dev.tenantId,
+      deviceId: dev.id
+    }
+  });
+
+  if (!cmd) {
+    return res.status(404).json({ error: "Command not found" });
+  }
+
+  const updated = await prisma.deviceCommand.update({
+    where: { id: cmd.id },
+    data: {
+      status: ok ? "ACKED" : "ERROR",
+      ackedAt: new Date(),
+      error: ok ? null : (typeof error === "string" ? error : "Device reported error")
+    }
+  });
+
+  res.json({ ok: true, command: updated });
+}
