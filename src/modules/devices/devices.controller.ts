@@ -169,7 +169,7 @@ export async function pollCommands(req: Request, res: Response) {
       retryCount: { gte: 3 }
     },
     data: {
-      status: "ERROR",
+      status: "FAILED",
       ackedAt: new Date(),
       lastError: "Timeout: max retries reached",
       error: "Timeout: max retries reached"
@@ -234,7 +234,7 @@ export async function ackCommand(req: Request, res: Response) {
   const updated = await prisma.deviceCommand.update({
     where: { id: cmd.id },
     data: {
-      status: ok ? "ACKED" : "ERROR",
+      status: ok ? "ACKED" : "FAILED",
       ackedAt: new Date(),
       // kompatibilitás: régi error mező + új lastError mező
       error: errMsg,
