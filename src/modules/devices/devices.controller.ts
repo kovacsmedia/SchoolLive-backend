@@ -1,5 +1,9 @@
 import { Request, Response } from "express";
 import { prisma } from "../../prisma/client";
+import crypto from "crypto";
+import bcrypt from "bcrypt";
+
+const COMMAND_TIMEOUT_MS = 30_000; // később .env-ből
 
 export async function listDevices(req: Request, res: Response) {
   const user = req.user!;
@@ -28,8 +32,6 @@ export async function listDevices(req: Request, res: Response) {
 
   res.json(devices);
 }
-import crypto from "crypto";
-import bcrypt from "bcrypt";
 
 export async function registerDevice(req: Request, res: Response) {
   const user = req.user!;
@@ -67,16 +69,17 @@ export async function registerDevice(req: Request, res: Response) {
 
   // plaintext kulcsot csak most adjuk vissza!
   res.status(201).json({ device, deviceKey });
-  
 }
+
 export async function deviceBeacon(req: Request, res: Response) {
   const dev = (req as any).device as { id: string; tenantId: string };
 
   const { volume, muted, statusPayload, firmwareVersion } = req.body ?? {};
 
-  const ipAddress = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
-    || req.socket.remoteAddress
-    || null;
+  const ipAddress =
+    (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+    req.socket.remoteAddress ||
+    null;
 
   const updated = await prisma.device.update({
     where: { id: dev.id },
@@ -126,15 +129,54 @@ export async function createDeviceCommand(req: Request, res: Response) {
       deviceId,
       payload,
       status: "QUEUED"
+      // retryCount/maxRetries defaultból jön
     }
   });
 
   res.status(201).json(command);
 }
+
 export async function pollCommands(req: Request, res: Response) {
   const dev = (req as any).device as { id: string; tenantId: string };
 
-  // legelső QUEUED parancs
+  // 1) Lazy retry: timeoutolt SENT parancsok visszaállítása QUEUED-ra (retry++)
+  const timeoutBefore = new Date(Date.now() - COMMAND_TIMEOUT_MS);
+
+  // azok, amik még újrapróbálhatók
+  await prisma.deviceCommand.updateMany({
+    where: {
+      tenantId: dev.tenantId,
+      deviceId: dev.id,
+      status: "SENT",
+      sentAt: { lt: timeoutBefore },
+      retryCount: { lt: 3 } // később maxRetries mezővel finomítjuk
+    },
+    data: {
+      status: "QUEUED",
+      sentAt: null,
+      retryCount: { increment: 1 },
+      lastError: "Timeout: ACK not received"
+    }
+  });
+
+  // azok, amik kifutottak a retry-ból → ERROR
+  await prisma.deviceCommand.updateMany({
+    where: {
+      tenantId: dev.tenantId,
+      deviceId: dev.id,
+      status: "SENT",
+      sentAt: { lt: timeoutBefore },
+      retryCount: { gte: 3 }
+    },
+    data: {
+      status: "ERROR",
+      ackedAt: new Date(),
+      lastError: "Timeout: max retries reached",
+      error: "Timeout: max retries reached"
+    }
+  });
+
+  // 2) legelső QUEUED parancs
   const cmd = await prisma.deviceCommand.findFirst({
     where: {
       tenantId: dev.tenantId,
@@ -148,21 +190,21 @@ export async function pollCommands(req: Request, res: Response) {
     return res.json({ ok: true, command: null });
   }
 
-  // jelöljük elküldöttnek
- const updated = await prisma.deviceCommand.updateMany({
-  where: { id: cmd.id, status: "QUEUED" },
-  data: { status: "SENT", sentAt: new Date() }
-});
+  // 3) jelöljük elküldöttnek (idempotens: csak ha még QUEUED)
+  const updated = await prisma.deviceCommand.updateMany({
+    where: { id: cmd.id, status: "QUEUED" },
+    data: { status: "SENT", sentAt: new Date() }
+  });
 
-if (updated.count === 0) {
-  return res.json({ ok: true, command: null });
+  if (updated.count === 0) {
+    return res.json({ ok: true, command: null });
+  }
+
+  // 4) friss rekord visszaadása
+  const fresh = await prisma.deviceCommand.findUnique({ where: { id: cmd.id } });
+  return res.json({ ok: true, command: fresh });
 }
 
-const fresh = await prisma.deviceCommand.findUnique({ where: { id: cmd.id } });
-return res.json({ ok: true, command: fresh });
-
-  res.json({ ok: true, command: updated });
-}
 export async function ackCommand(req: Request, res: Response) {
   const dev = (req as any).device as { id: string; tenantId: string };
 
@@ -187,12 +229,16 @@ export async function ackCommand(req: Request, res: Response) {
     return res.status(404).json({ error: "Command not found" });
   }
 
+  const errMsg = ok ? null : (typeof error === "string" ? error : "Device reported error");
+
   const updated = await prisma.deviceCommand.update({
     where: { id: cmd.id },
     data: {
       status: ok ? "ACKED" : "ERROR",
       ackedAt: new Date(),
-      error: ok ? null : (typeof error === "string" ? error : "Device reported error")
+      // kompatibilitás: régi error mező + új lastError mező
+      error: errMsg,
+      lastError: errMsg
     }
   });
 
