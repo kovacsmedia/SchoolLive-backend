@@ -31,41 +31,66 @@ jobs:
           remote_user: ${{ secrets.DEPLOY_USER }}
           remote_key: ${{ secrets.DEPLOY_KEY }}
 
-      - name: Install, build and restart (PM2)
+      - name: Install, migrate, build and restart (PM2)
         uses: appleboy/ssh-action@v1.2.0
         with:
           host:     ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key:      ${{ secrets.DEPLOY_KEY }}
           script: |
-            set -e
+            set -euo pipefail
             cd /opt/schoollive/backend
 
-            # Install dependencies (lockfile -> npm ci, otherwise fallback)
+            echo "== Node version =="
+            node -v || true
+            npm -v || true
+
+            echo "== Install deps =="
             if [ -f "package-lock.json" ]; then
               npm ci
             else
               npm install
             fi
 
-            # Run build only if it exists
+            # .env betöltése a szerveren (rsync nem írja felül)
+            # Prisma migrate/generate-hez kellhet DATABASE_URL stb.
+            if [ -f ".env" ]; then
+              echo "== Loading .env =="
+              set -a
+              . ./.env
+              set +a
+            else
+              echo "WARNING: .env not found on server! Prisma may fail if DATABASE_URL is missing."
+            fi
+
+            echo "== Prisma generate =="
+            npx prisma generate
+
+            echo "== Prisma migrate deploy =="
+            npx prisma migrate deploy
+
+            echo "== Build (optional) =="
             npm run -s build || echo "No build script, skipping"
 
-            # Start/reload with PM2 using the correct entrypoint
+            echo "== PM2 start/reload =="
             if [ -f "server.js" ]; then
               pm2 describe schoollive-api >/dev/null || pm2 start server.js --name schoollive-api
               pm2 reload schoollive-api
             elif [ -f "dist/main.js" ]; then
               pm2 describe schoollive-api >/dev/null || pm2 start dist/main.js --name schoollive-api
               pm2 reload schoollive-api
+            elif [ -f "dist/server.js" ]; then
+              pm2 describe schoollive-api >/dev/null || pm2 start dist/server.js --name schoollive-api
+              pm2 reload schoollive-api
             elif [ -f "index.js" ]; then
               pm2 describe schoollive-api >/dev/null || pm2 start index.js --name schoollive-api
               pm2 reload schoollive-api
             else
-              echo "Nem találok belépési fájlt (server.js / dist/main.js / index.js)."
+              echo "Nem találok belépési fájlt (server.js / dist/main.js / dist/server.js / index.js)."
               echo "Aktuális könyvtár tartalma:"
               ls -la
               exit 1
             fi
 
+            echo "== PM2 save =="
             pm2 save
