@@ -113,6 +113,8 @@ model Device {
   id          String   @id @default(uuid())
   tenantId    String
   orgUnitId   String?
+  serialNumber   String?   @unique
+  installCodeHash String?  // bcrypt hash, mint a deviceKeyHash
 
   name        String
   deviceKeyHash String // eszköz egyedi kulcs hash-e (nem plaintext)

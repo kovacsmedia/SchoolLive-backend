@@ -3,7 +3,25 @@ import { prisma } from "../../prisma/client";
 import crypto from "crypto";
 import bcrypt from "bcrypt";
 
-const COMMAND_TIMEOUT_MS = 30_000; // később .env-ből
+// ---- Retry/Timeout config ----
+// Base ACK timeout (első próbálkozásnál ennyi ideig várunk ACK-ra)
+const BASE_ACK_TIMEOUT_MS = 30_000; // 30s (később .env)
+// Felső korlát, nehogy végtelenre nőjön (pl. 5 perc)
+const MAX_ACK_TIMEOUT_MS = 5 * 60_000; // 5 min
+
+// Lineáris backoff: 30s, 60s, 90s, 120s...
+function ackTimeoutMs(retryCount: number) {
+  const rc = Math.max(0, Number.isFinite(retryCount) ? retryCount : 0);
+  const ms = BASE_ACK_TIMEOUT_MS * (rc + 1);
+  return Math.min(ms, MAX_ACK_TIMEOUT_MS);
+}
+
+// (Ha később exponenciális kell, erre cseréld)
+// function ackTimeoutMs(retryCount: number) {
+//   const rc = Math.max(0, Number.isFinite(retryCount) ? retryCount : 0);
+//   const ms = BASE_ACK_TIMEOUT_MS * Math.pow(2, rc);
+//   return Math.min(ms, MAX_ACK_TIMEOUT_MS);
+// }
 
 export async function listDevices(req: Request, res: Response) {
   const user = req.user!;
@@ -138,10 +156,8 @@ export async function createDeviceCommand(req: Request, res: Response) {
 
 export async function pollCommands(req: Request, res: Response) {
   const dev = (req as any).device as { id: string; tenantId: string };
-
   const now = new Date();
-  const ACK_TIMEOUT_MS = 60_000; // 60 mp, később configból
-  const timeoutBefore = new Date(now.getTime() - ACK_TIMEOUT_MS);
+
   // 0) Safety net: ha valamiért több SENT van ugyanarra a device-ra,
   //    akkor csak a legrégebbit hagyjuk "in-flight"-nak, a többit visszatesszük QUEUED-ba.
   const sentList = await prisma.deviceCommand.findMany({
@@ -155,6 +171,7 @@ export async function pollCommands(req: Request, res: Response) {
 
   if (sentList.length > 1) {
     const keep = sentList[0]; // ezt hagyjuk meg in-flightnak
+    void keep; // csak dokumentációs célból: keep az in-flight, nem használjuk tovább itt
 
     const toRequeueIds = sentList.slice(1).map(c => c.id);
     await prisma.deviceCommand.updateMany({
@@ -166,6 +183,7 @@ export async function pollCommands(req: Request, res: Response) {
       }
     });
   }
+
   // 1) Ha van in-flight (SENT) parancs, akkor azt kezeljük először.
   //    - ha még nem timeoutos: NEM adunk újat
   //    - ha timeoutos és van még retry: újraküldjük (retryCount++)
@@ -180,8 +198,12 @@ export async function pollCommands(req: Request, res: Response) {
   });
 
   if (inFlight) {
-    // ha sentAt null lenne (nem kéne), kezeljük úgy, mintha timeoutos lenne
+    // ha sentAt null lenne (nem kéne), kezeljük úgy, mintha "nagyon régi" lenne
     const sentAt = inFlight.sentAt ?? new Date(0);
+
+    // ✅ Dinamikus timeout retryCount alapján (backoff)
+    const timeoutMs = ackTimeoutMs(inFlight.retryCount);
+    const timeoutBefore = new Date(now.getTime() - timeoutMs);
 
     if (sentAt > timeoutBefore) {
       // még várunk ACK-ra, nem küldünk másik parancsot
@@ -195,7 +217,7 @@ export async function pollCommands(req: Request, res: Response) {
         data: {
           retryCount: { increment: 1 },
           sentAt: now,
-          lastError: "Timeout: ACK not received"
+          lastError: `Timeout: ACK not received (timeoutMs=${timeoutMs})`
         }
       });
       return res.json({ ok: true, command: updated });
@@ -266,18 +288,20 @@ export async function ackCommand(req: Request, res: Response) {
     return res.status(404).json({ error: "Command not found" });
   }
 
-  const errMsg = ok ? null : (typeof error === "string" ? error : "Device reported error");
+  // idempotencia: ha már ACKED/FAILED, akkor csak visszaadjuk
+  if (cmd.status === "ACKED" || cmd.status === "FAILED") {
+    return res.json({ ok: true, command: cmd, note: "Already finalized" });
+  }
 
   const updated = await prisma.deviceCommand.update({
     where: { id: cmd.id },
     data: {
       status: ok ? "ACKED" : "FAILED",
       ackedAt: new Date(),
-      // kompatibilitás: régi error mező + új lastError mező
-      error: errMsg,
-      lastError: errMsg
+      lastError: ok ? null : (typeof error === "string" ? error : "Device reported error"),
+      error: ok ? null : (typeof error === "string" ? error : "Device reported error")
     }
   });
 
-  res.json({ ok: true, command: updated });
+  return res.json({ ok: true, command: updated });
 }
