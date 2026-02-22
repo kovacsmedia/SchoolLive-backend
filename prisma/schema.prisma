@@ -137,6 +137,7 @@ model Device {
 
   groupMembers DeviceGroupMember[]
   commands     DeviceCommand[]
+  provisionSessions DeviceProvisionSession[]
 
   @@index([tenantId])
   @@index([tenantId, online])
@@ -217,4 +218,20 @@ model DeviceCommand {
   retryCount   Int      @default(0)
   maxRetries   Int      @default(3)
   lastError    String?
+}
+model DeviceProvisionSession {
+  id            String   @id @default(uuid())
+  tokenHash     String   @unique
+  deviceId      String
+  tenantId      String?
+  name          String
+  wifiSsid      String
+  wifiPassword  String
+  expiresAt     DateTime
+  createdAt     DateTime @default(now())
+
+  device        Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId])
+  @@index([expiresAt])
 }
