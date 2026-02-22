@@ -17,7 +17,9 @@ export async function login(email: string, password: string) {
     tenantId: user.tenantId ?? null
   };
 
-  const token = jwt.sign(payload, env.JWT_ACCESS_SECRET, { expiresIn: env.JWT_ACCESS_TTL });
+  const token = jwt.sign(payload, env.JWT_ACCESS_SECRET as string, {
+  expiresIn: env.JWT_ACCESS_TTL as string
+  });
 
   return {
     accessToken: token,
