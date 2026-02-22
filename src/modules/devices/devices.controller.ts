@@ -122,7 +122,7 @@ export async function createDeviceCommand(req: Request, res: Response) {
     return res.status(403).json({ error: "Forbidden" });
   }
 
-  const deviceId = req.params.id;
+  const deviceId = req.params.id as string;
   const { payload } = req.body ?? {};
 
   if (!payload || typeof payload !== "object") {
