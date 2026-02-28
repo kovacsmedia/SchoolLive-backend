@@ -1,0 +1,21 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.devicesRouter = void 0;
+const express_1 = require("express");
+const authJwt_1 = require("../../middleware/authJwt");
+const tenant_1 = require("../../middleware/tenant");
+const devices_controller_1 = require("./devices.controller");
+const devices_controller_2 = require("./devices.controller");
+const devices_controller_3 = require("./devices.controller");
+const deviceAuth_1 = require("../../middleware/deviceAuth");
+const devices_controller_4 = require("./devices.controller");
+const devices_controller_5 = require("./devices.controller");
+const devices_controller_6 = require("./devices.controller");
+exports.devicesRouter = (0, express_1.Router)();
+// később RBAC-ot teszünk rá, most csak auth + tenant
+exports.devicesRouter.get("/", authJwt_1.authJwt, tenant_1.requireTenant, devices_controller_1.listDevices);
+exports.devicesRouter.post("/register", authJwt_1.authJwt, tenant_1.requireTenant, devices_controller_2.registerDevice);
+exports.devicesRouter.post("/beacon", deviceAuth_1.deviceAuth, devices_controller_3.deviceBeacon);
+exports.devicesRouter.post("/:id/command", authJwt_1.authJwt, tenant_1.requireTenant, devices_controller_4.createDeviceCommand);
+exports.devicesRouter.post("/poll", deviceAuth_1.deviceAuth, devices_controller_5.pollCommands);
+exports.devicesRouter.post("/ack", deviceAuth_1.deviceAuth, devices_controller_6.ackCommand);
