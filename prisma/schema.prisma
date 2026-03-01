@@ -1,9 +1,4 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
-// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
-
+// prisma/schema.prisma
 
 generator client {
   provider = "prisma-client-js"
@@ -20,6 +15,12 @@ enum UserRole {
   ORG_ADMIN
   TEACHER
   OPERATOR
+  PLAYER
+}
+
+enum DeviceAuthType {
+  KEY
+  JWT
 }
 
 enum MessageType {
@@ -61,12 +62,12 @@ model Tenant {
 }
 
 model OrganizationalUnit {
-  id        String   @id @default(uuid())
+  id        String  @id @default(uuid())
   tenantId  String
   name      String
   parentId  String?
 
-  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   parent    OrganizationalUnit? @relation("OrgUnitTree", fields: [parentId], references: [id])
   children  OrganizationalUnit[] @relation("OrgUnitTree")
 
@@ -79,30 +80,33 @@ model OrganizationalUnit {
 }
 
 model User {
-  id          String   @id @default(uuid())
-  tenantId    String?  // SUPER_ADMIN esetén lehet null
-  orgUnitId   String?
+  id        String   @id @default(uuid())
+  tenantId  String?  // SUPER_ADMIN esetén lehet null
+  orgUnitId String?
 
-  email       String   @unique
+  email        String   @unique
   passwordHash String
-  role        UserRole
-  isActive    Boolean  @default(true)
+  role         UserRole
+  isActive     Boolean  @default(true)
 
   // 2FA (TOTP)
-  twoFactorEnabled Boolean @default(false)
+  twoFactorEnabled Boolean  @default(false)
   twoFactorSecret  String?
 
   // Trusted device (a superadmin "eszközhöz kötése")
-  trustedDeviceHash String? // pl. user agent + random token hash
+  trustedDeviceHash  String?
   trustedDeviceSetAt DateTime?
 
   lastLoginAt DateTime?
   createdAt   DateTime @default(now())
 
-  tenant      Tenant?  @relation(fields: [tenantId], references: [id], onDelete: SetNull)
-  orgUnit     OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
+  tenant   Tenant?             @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  orgUnit  OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
 
-  messages    Message[] @relation("CreatedBy")
+  messages Message[] @relation("CreatedBy")
+
+  // ✅ web-player “device”-ok (JWT authType)
+  devices  Device[]
 
   @@index([tenantId])
   @@index([role])
@@ -110,39 +114,55 @@ model User {
 }
 
 model Device {
-  id          String   @id @default(uuid())
-  tenantId    String
-  orgUnitId   String?
-  serialNumber   String?   @unique
-  installCodeHash String?  // bcrypt hash, mint a deviceKeyHash
+  id            String   @id @default(uuid())
+  tenantId      String
+  orgUnitId     String?
 
-  name        String
-  deviceKeyHash String // eszköz egyedi kulcs hash-e (nem plaintext)
+  serialNumber    String? @unique
+  installCodeHash String? // bcrypt hash, mint a deviceKeyHash
+
+  name String
+
+  // ✅ AUTH:
+  authType     DeviceAuthType @default(KEY)
+  deviceKeyHash String?       // KEY esetén kötelezően kitöltjük alkalmazás-logikával
+
+  // ✅ JWT-es “virtual device” támogatás
+  clientId String?
+  userId   String?
+
   firmwareVersion String?
-  ipAddress   String?
+  ipAddress       String?
 
   // állapot
-  lastSeenAt  DateTime?
-  online      Boolean  @default(false)
-  volume      Int      @default(5) // 0..10
-  muted       Boolean  @default(false)
+  lastSeenAt DateTime?
+  online     Boolean  @default(false)
+
+  volume Int     @default(5)  // 0..10
+  muted  Boolean @default(false)
 
   // bővíthető státusz
   statusPayload Json?
 
-  createdAt   DateTime @default(now())
+  createdAt DateTime @default(now())
 
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  orgUnit     OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  orgUnit OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
 
-  groupMembers DeviceGroupMember[]
-  commands     DeviceCommand[]
+  // ✅ JWT-es device tulajdonosa (PLAYER user)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  groupMembers     DeviceGroupMember[]
+  commands         DeviceCommand[]
   provisionSessions DeviceProvisionSession[]
 
   @@index([tenantId])
   @@index([tenantId, online])
   @@index([tenantId, lastSeenAt])
+  @@index([userId])
+
   @@unique([tenantId, name])
+  @@unique([tenantId, clientId])
 }
 
 model DeviceGroup {
@@ -151,8 +171,8 @@ model DeviceGroup {
   name      String
   createdAt DateTime @default(now())
 
-  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  members   DeviceGroupMember[]
+  tenant  Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  members DeviceGroupMember[]
 
   @@index([tenantId])
   @@unique([tenantId, name])
@@ -162,30 +182,31 @@ model DeviceGroupMember {
   groupId  String
   deviceId String
 
-  group    DeviceGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
-  device   Device      @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  group  DeviceGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  device Device      @relation(fields: [deviceId], references: [id], onDelete: Cascade)
 
   @@id([groupId, deviceId])
   @@index([deviceId])
 }
 
 model Message {
-  id          String   @id @default(uuid())
+  id          String      @id @default(uuid())
   tenantId    String
-
   type        MessageType
   title       String?
   fileUrl     String?
   scheduledAt DateTime?
-  targetType  TargetType
-  targetId    String? // DEVICE/GROUP/ORG_UNIT esetén
+
+  targetType TargetType
+  targetId   String? // DEVICE/GROUP/ORG_UNIT esetén
+
   createdById String
   createdAt   DateTime @default(now())
 
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  createdBy   User     @relation("CreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy User   @relation("CreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
 
-  commands    DeviceCommand[]
+  commands DeviceCommand[]
 
   @@index([tenantId])
   @@index([tenantId, scheduledAt])
@@ -193,44 +214,45 @@ model Message {
 }
 
 model DeviceCommand {
-  id          String   @id @default(uuid())
-  tenantId    String
-  deviceId    String
-  messageId   String?
+  id        String   @id @default(uuid())
+  tenantId  String
+  deviceId  String
+  messageId String?
+  payload   Json
 
-  payload     Json
-  status      CommandStatus @default(QUEUED)
+  status   CommandStatus @default(QUEUED)
+  queuedAt DateTime      @default(now())
+  sentAt   DateTime?
+  ackedAt  DateTime?
+  error    String?
 
-  queuedAt    DateTime @default(now())
-  sentAt      DateTime?
-  ackedAt     DateTime?
-  error       String?
-
-  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  device      Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
-  message     Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  message Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
 
   @@index([tenantId])
   @@index([deviceId])
   @@index([tenantId, status])
   @@index([tenantId, queuedAt])
-  
-  retryCount   Int      @default(0)
-  maxRetries   Int      @default(3)
-  lastError    String?
-}
-model DeviceProvisionSession {
-  id            String   @id @default(uuid())
-  tokenHash     String   @unique
-  deviceId      String
-  tenantId      String?
-  name          String
-  wifiSsid      String
-  wifiPassword  String
-  expiresAt     DateTime
-  createdAt     DateTime @default(now())
 
-  device        Device    @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  retryCount Int @default(0)
+  maxRetries Int @default(3)
+  lastError  String?
+}
+
+model DeviceProvisionSession {
+  id        String   @id @default(uuid())
+  tokenHash String   @unique
+  deviceId  String
+  tenantId  String?
+
+  name         String
+  wifiSsid     String
+  wifiPassword String
+  expiresAt    DateTime
+  createdAt    DateTime @default(now())
+
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
 
   @@index([deviceId])
   @@index([expiresAt])
