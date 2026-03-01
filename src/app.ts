@@ -5,6 +5,7 @@ import { devicesRouter } from "./modules/devices/devices.routes";
 import adminCommandsRouter from "./modules/devices/admin.commands";
 import deviceAdminRoutes from "./modules/devices/devices.admin.routes";
 import devicesProvisionRouter from "./modules/devices/devices.provision.routes";
+import { playerDeviceRouter } from "./modules/player/player.device.routes";
 
 export const app = express();
 
@@ -19,3 +20,6 @@ app.use("/admin/commands", adminCommandsRouter);
 app.use("/admin/devices", deviceAdminRoutes);
 
 app.use("/provision", devicesProvisionRouter);
+
+// ✅ web-player mint eszköz
+app.use("/player/device", playerDeviceRouter);
