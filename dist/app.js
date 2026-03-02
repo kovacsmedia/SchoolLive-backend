@@ -10,6 +10,7 @@ const devices_routes_1 = require("./modules/devices/devices.routes");
 const admin_commands_1 = __importDefault(require("./modules/devices/admin.commands"));
 const devices_admin_routes_1 = __importDefault(require("./modules/devices/devices.admin.routes"));
 const devices_provision_routes_1 = __importDefault(require("./modules/devices/devices.provision.routes"));
+const player_device_routes_1 = require("./modules/player/player.device.routes");
 exports.app = (0, express_1.default)();
 exports.app.use(express_1.default.json());
 exports.app.get("/health", (_req, res) => res.json({ ok: true }));
@@ -18,3 +19,6 @@ exports.app.use("/devices", devices_routes_1.devicesRouter);
 exports.app.use("/admin/commands", admin_commands_1.default);
 exports.app.use("/admin/devices", devices_admin_routes_1.default);
 exports.app.use("/provision", devices_provision_routes_1.default);
+// ✅ web-player mint eszköz
+exports.app.use("/player/device", player_device_routes_1.playerDeviceRouter);
+//end
