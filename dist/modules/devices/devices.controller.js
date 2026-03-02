@@ -9,6 +9,8 @@ exports.deviceBeacon = deviceBeacon;
 exports.createDeviceCommand = createDeviceCommand;
 exports.pollCommands = pollCommands;
 exports.ackCommand = ackCommand;
+exports.playerPollCommands = playerPollCommands;
+exports.playerAckCommand = playerAckCommand;
 const client_1 = require("../../prisma/client");
 const crypto_1 = __importDefault(require("crypto"));
 const bcrypt_1 = __importDefault(require("bcrypt"));
@@ -202,6 +204,156 @@ async function ackCommand(req, res) {
             lastError: ok ? null : (typeof error === "string" ? error : "Device reported error"),
             error: ok ? null : (typeof error === "string" ? error : "Device reported error"),
         },
+    });
+    return res.json({ ok: true, command: updated });
+}
+/**
+ * PLAYER/JWT virtual device polling
+ * POST /player/device/poll
+ * Body: { clientId: string }
+ */
+async function playerPollCommands(req, res) {
+    const user = req.user;
+    if (!user)
+        return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    if (user.role !== "PLAYER")
+        return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+    const { clientId } = req.body ?? {};
+    if (!clientId || typeof clientId !== "string") {
+        return res.status(400).json({ ok: false, error: "clientId is required" });
+    }
+    if (!user.tenantId) {
+        return res.status(400).json({ ok: false, error: "TENANT_CONTEXT_REQUIRED" });
+    }
+    const device = await client_1.prisma.device.findFirst({
+        where: {
+            tenantId: user.tenantId,
+            authType: "JWT",
+            userId: user.sub,
+            clientId,
+        },
+        select: { id: true, tenantId: true },
+    });
+    if (!device) {
+        return res.status(404).json({ ok: false, error: "DEVICE_NOT_REGISTERED" });
+    }
+    // heartbeat: legyen ONLINE és friss lastSeenAt
+    await client_1.prisma.device.update({
+        where: { id: device.id },
+        data: { online: true, lastSeenAt: new Date() },
+    });
+    // Ugyanaz a determinisztikus logika, mint a KEY-es pollnál
+    const dev = { id: device.id, tenantId: device.tenantId };
+    const now = new Date();
+    const sentList = await client_1.prisma.deviceCommand.findMany({
+        where: { tenantId: dev.tenantId, deviceId: dev.id, status: "SENT" },
+        orderBy: { queuedAt: "asc" },
+    });
+    if (sentList.length > 1) {
+        const toRequeueIds = sentList.slice(1).map((c) => c.id);
+        await client_1.prisma.deviceCommand.updateMany({
+            where: { id: { in: toRequeueIds } },
+            data: { status: "QUEUED", sentAt: null, lastError: "Superseded: another command was already in-flight" },
+        });
+    }
+    const inFlight = await client_1.prisma.deviceCommand.findFirst({
+        where: { tenantId: dev.tenantId, deviceId: dev.id, status: "SENT" },
+        orderBy: { sentAt: "asc" },
+    });
+    if (inFlight) {
+        const sentAt = inFlight.sentAt ?? new Date(0);
+        const timeoutMs = ackTimeoutMs(inFlight.retryCount);
+        const timeoutBefore = new Date(now.getTime() - timeoutMs);
+        if (sentAt > timeoutBefore) {
+            return res.json({ ok: true, command: null });
+        }
+        if (inFlight.retryCount < inFlight.maxRetries) {
+            const updated = await client_1.prisma.deviceCommand.update({
+                where: { id: inFlight.id },
+                data: { retryCount: { increment: 1 }, sentAt: now, lastError: `Timeout: ACK not received (timeoutMs=${timeoutMs})` },
+            });
+            return res.json({ ok: true, command: updated });
+        }
+        await client_1.prisma.deviceCommand.update({
+            where: { id: inFlight.id },
+            data: { status: "FAILED", ackedAt: now, lastError: "Timeout: max retries reached", error: "Timeout: max retries reached" },
+        });
+    }
+    const queued = await client_1.prisma.deviceCommand.findFirst({
+        where: { tenantId: dev.tenantId, deviceId: dev.id, status: "QUEUED" },
+        orderBy: { queuedAt: "asc" },
+    });
+    if (!queued) {
+        return res.json({ ok: true, command: null });
+    }
+    const updated = await client_1.prisma.deviceCommand.updateMany({
+        where: { id: queued.id, status: "QUEUED" },
+        data: { status: "SENT", sentAt: now },
+    });
+    if (updated.count === 0) {
+        return res.json({ ok: true, command: null });
+    }
+    const fresh = await client_1.prisma.deviceCommand.findUnique({ where: { id: queued.id } });
+    return res.json({ ok: true, command: fresh });
+}
+/**
+ * PLAYER/JWT virtual device ack
+ * POST /player/device/ack
+ * Body: { clientId: string, commandId: string, ok: boolean, error?: string }
+ */
+async function playerAckCommand(req, res) {
+    const user = req.user;
+    if (!user)
+        return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+    if (user.role !== "PLAYER")
+        return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+    const { clientId, commandId, ok, error } = req.body ?? {};
+    if (!clientId || typeof clientId !== "string") {
+        return res.status(400).json({ ok: false, error: "clientId is required" });
+    }
+    if (!commandId || typeof commandId !== "string") {
+        return res.status(400).json({ ok: false, error: "commandId is required" });
+    }
+    if (typeof ok !== "boolean") {
+        return res.status(400).json({ ok: false, error: "ok is required (boolean)" });
+    }
+    if (!user.tenantId) {
+        return res.status(400).json({ ok: false, error: "TENANT_CONTEXT_REQUIRED" });
+    }
+    const device = await client_1.prisma.device.findFirst({
+        where: {
+            tenantId: user.tenantId,
+            authType: "JWT",
+            userId: user.sub,
+            clientId,
+        },
+        select: { id: true, tenantId: true },
+    });
+    if (!device) {
+        return res.status(404).json({ ok: false, error: "DEVICE_NOT_REGISTERED" });
+    }
+    const cmd = await client_1.prisma.deviceCommand.findFirst({
+        where: { id: commandId, tenantId: device.tenantId, deviceId: device.id },
+    });
+    if (!cmd) {
+        return res.status(404).json({ ok: false, error: "COMMAND_NOT_FOUND" });
+    }
+    if (cmd.status === "ACKED" || cmd.status === "FAILED") {
+        return res.json({ ok: true, command: cmd, note: "Already finalized" });
+    }
+    const updated = await client_1.prisma.deviceCommand.update({
+        where: { id: cmd.id },
+        data: {
+            status: ok ? "ACKED" : "FAILED",
+            ackedAt: new Date(),
+            lastError: ok ? null : (typeof error === "string" ? error : "Player reported error"),
+            error: ok ? null : (typeof error === "string" ? error : "Player reported error"),
+        },
+    });
+    // heartbeat
+    await client_1.prisma.device.update({
+        where: { id: device.id },
+        data: { online: true, lastSeenAt: new Date() },
     });
     return res.json({ ok: true, command: updated });
 }
