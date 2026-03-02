@@ -5,6 +5,7 @@ exports.beaconPlayerDevice = beaconPlayerDevice;
 exports.pollPlayerCommands = pollPlayerCommands;
 exports.ackPlayerCommand = ackPlayerCommand;
 const client_1 = require("../../prisma/client");
+const devices_controller_1 = require("../devices/devices.controller");
 // PLAYER-nek csak a saját device-át engedjük kezelni (clientId alapján)
 function ensurePlayer(req, res) {
     const u = req.user;
@@ -23,9 +24,7 @@ function ensurePlayer(req, res) {
     return { userId: u.sub, tenantId: u.tenantId };
 }
 function getIp(req) {
-    return (req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
-        req.socket.remoteAddress ||
-        null);
+    return req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || null;
 }
 /**
  * POST /player/device/register
@@ -44,14 +43,12 @@ async function registerPlayerDevice(req, res) {
     if (!clientId || typeof clientId !== "string") {
         return res.status(400).json({ error: "clientId is required" });
     }
-    const safeName = typeof name === "string" && name.trim().length > 0
-        ? name.trim()
-        : `PLAYER-${clientId.slice(0, 8)}`;
+    const safeName = typeof name === "string" && name.trim().length > 0 ? name.trim() : `PLAYER-${clientId.slice(0, 8)}`;
     const ipAddress = getIp(req);
     // upsert tenant+clientId alapon
     const existing = await client_1.prisma.device.findFirst({
         where: { tenantId: ctx.tenantId, clientId },
-        select: { id: true, name: true },
+        select: { id: true },
     });
     const device = existing
         ? await client_1.prisma.device.update({
@@ -67,7 +64,15 @@ async function registerPlayerDevice(req, res) {
                 online: true,
                 lastSeenAt: new Date(),
             },
-            select: { id: true, tenantId: true, name: true, authType: true, clientId: true, userId: true, lastSeenAt: true },
+            select: {
+                id: true,
+                tenantId: true,
+                name: true,
+                authType: true,
+                clientId: true,
+                userId: true,
+                lastSeenAt: true,
+            },
         })
         : await client_1.prisma.device.create({
             data: {
@@ -84,7 +89,15 @@ async function registerPlayerDevice(req, res) {
                 volume: 5,
                 muted: false,
             },
-            select: { id: true, tenantId: true, name: true, authType: true, clientId: true, userId: true, lastSeenAt: true },
+            select: {
+                id: true,
+                tenantId: true,
+                name: true,
+                authType: true,
+                clientId: true,
+                userId: true,
+                lastSeenAt: true,
+            },
         });
     return res.json({ ok: true, device });
 }
@@ -124,88 +137,20 @@ async function beaconPlayerDevice(req, res) {
  * POST /player/device/poll
  * body: { clientId: string }
  *
- * Ugyanaz a determinisztikus logika: ha van SENT, vár; ha timeout, retry; ha van QUEUED, kiküld.
+ * Delegálás a közös, kiforrott determinisztikus logikára:
+ * - retry/backoff
+ * - max retries -> FAILED
+ * - SENT in-flight kezelése
  */
 async function pollPlayerCommands(req, res) {
-    const ctx = ensurePlayer(req, res);
-    if (!ctx)
-        return;
-    const { clientId } = req.body ?? {};
-    if (!clientId || typeof clientId !== "string") {
-        return res.status(400).json({ error: "clientId is required" });
-    }
-    const device = await client_1.prisma.device.findFirst({
-        where: { tenantId: ctx.tenantId, clientId, userId: ctx.userId, authType: "JWT" },
-        select: { id: true, tenantId: true },
-    });
-    if (!device)
-        return res.status(404).json({ error: "Device not registered" });
-    // keepalive
-    await client_1.prisma.device.update({
-        where: { id: device.id },
-        data: { online: true, lastSeenAt: new Date(), ipAddress: getIp(req) },
-    });
-    // egyszerűsített: a devices.controller.ts-ben már kiforrott a retry/backoff,
-    // itt egy MVP: ha van SENT, nem adunk újat; ha nincs, a legrégebbi QUEUED->SENT.
-    const inFlight = await client_1.prisma.deviceCommand.findFirst({
-        where: { tenantId: device.tenantId, deviceId: device.id, status: "SENT" },
-        orderBy: { sentAt: "asc" },
-    });
-    if (inFlight)
-        return res.json({ ok: true, command: null });
-    const queued = await client_1.prisma.deviceCommand.findFirst({
-        where: { tenantId: device.tenantId, deviceId: device.id, status: "QUEUED" },
-        orderBy: { queuedAt: "asc" },
-    });
-    if (!queued)
-        return res.json({ ok: true, command: null });
-    const now = new Date();
-    const updated = await client_1.prisma.deviceCommand.updateMany({
-        where: { id: queued.id, status: "QUEUED" },
-        data: { status: "SENT", sentAt: now },
-    });
-    if (updated.count === 0)
-        return res.json({ ok: true, command: null });
-    const fresh = await client_1.prisma.deviceCommand.findUnique({ where: { id: queued.id } });
-    return res.json({ ok: true, command: fresh });
+    return (0, devices_controller_1.playerPollCommands)(req, res);
 }
 /**
  * POST /player/device/ack
  * body: { clientId: string, commandId: string, ok: boolean, error?: string }
+ *
+ * Delegálás a közös ACK logikára
  */
 async function ackPlayerCommand(req, res) {
-    const ctx = ensurePlayer(req, res);
-    if (!ctx)
-        return;
-    const { clientId, commandId, ok, error } = req.body ?? {};
-    if (!clientId || typeof clientId !== "string")
-        return res.status(400).json({ error: "clientId is required" });
-    if (!commandId || typeof commandId !== "string")
-        return res.status(400).json({ error: "commandId is required" });
-    if (typeof ok !== "boolean")
-        return res.status(400).json({ error: "ok is required (boolean)" });
-    const device = await client_1.prisma.device.findFirst({
-        where: { tenantId: ctx.tenantId, clientId, userId: ctx.userId, authType: "JWT" },
-        select: { id: true, tenantId: true },
-    });
-    if (!device)
-        return res.status(404).json({ error: "Device not registered" });
-    const cmd = await client_1.prisma.deviceCommand.findFirst({
-        where: { id: commandId, tenantId: device.tenantId, deviceId: device.id },
-    });
-    if (!cmd)
-        return res.status(404).json({ error: "Command not found" });
-    if (cmd.status === "ACKED" || cmd.status === "FAILED") {
-        return res.json({ ok: true, command: cmd, note: "Already finalized" });
-    }
-    const updated = await client_1.prisma.deviceCommand.update({
-        where: { id: cmd.id },
-        data: {
-            status: ok ? "ACKED" : "FAILED",
-            ackedAt: new Date(),
-            lastError: ok ? null : (typeof error === "string" ? error : "Player reported error"),
-            error: ok ? null : (typeof error === "string" ? error : "Player reported error"),
-        },
-    });
-    return res.json({ ok: true, command: updated });
+    return (0, devices_controller_1.playerAckCommand)(req, res);
 }

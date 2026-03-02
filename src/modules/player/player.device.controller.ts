@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { prisma } from "../../prisma/client";
+import { playerPollCommands, playerAckCommand } from "../devices/devices.controller";
 
 // PLAYER-nek csak a saját device-át engedjük kezelni (clientId alapján)
 function ensurePlayer(req: Request, res: Response): { userId: string; tenantId: string } | null {
@@ -20,11 +21,7 @@ function ensurePlayer(req: Request, res: Response): { userId: string; tenantId: 
 }
 
 function getIp(req: Request): string | null {
-  return (
-    (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
-    req.socket.remoteAddress ||
-    null
-  );
+  return (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() || req.socket.remoteAddress || null;
 }
 
 /**
@@ -46,16 +43,14 @@ export async function registerPlayerDevice(req: Request, res: Response) {
   }
 
   const safeName =
-    typeof name === "string" && name.trim().length > 0
-      ? name.trim()
-      : `PLAYER-${clientId.slice(0, 8)}`;
+    typeof name === "string" && name.trim().length > 0 ? name.trim() : `PLAYER-${clientId.slice(0, 8)}`;
 
   const ipAddress = getIp(req);
 
   // upsert tenant+clientId alapon
   const existing = await prisma.device.findFirst({
     where: { tenantId: ctx.tenantId, clientId },
-    select: { id: true, name: true },
+    select: { id: true },
   });
 
   const device = existing
@@ -72,7 +67,15 @@ export async function registerPlayerDevice(req: Request, res: Response) {
           online: true,
           lastSeenAt: new Date(),
         },
-        select: { id: true, tenantId: true, name: true, authType: true, clientId: true, userId: true, lastSeenAt: true },
+        select: {
+          id: true,
+          tenantId: true,
+          name: true,
+          authType: true,
+          clientId: true,
+          userId: true,
+          lastSeenAt: true,
+        },
       })
     : await prisma.device.create({
         data: {
@@ -89,7 +92,15 @@ export async function registerPlayerDevice(req: Request, res: Response) {
           volume: 5,
           muted: false,
         },
-        select: { id: true, tenantId: true, name: true, authType: true, clientId: true, userId: true, lastSeenAt: true },
+        select: {
+          id: true,
+          tenantId: true,
+          name: true,
+          authType: true,
+          clientId: true,
+          userId: true,
+          lastSeenAt: true,
+        },
       });
 
   return res.json({ ok: true, device });
@@ -135,95 +146,21 @@ export async function beaconPlayerDevice(req: Request, res: Response) {
  * POST /player/device/poll
  * body: { clientId: string }
  *
- * Ugyanaz a determinisztikus logika: ha van SENT, vár; ha timeout, retry; ha van QUEUED, kiküld.
+ * Delegálás a közös, kiforrott determinisztikus logikára:
+ * - retry/backoff
+ * - max retries -> FAILED
+ * - SENT in-flight kezelése
  */
 export async function pollPlayerCommands(req: Request, res: Response) {
-  const ctx = ensurePlayer(req, res);
-  if (!ctx) return;
-
-  const { clientId } = req.body ?? {};
-  if (!clientId || typeof clientId !== "string") {
-    return res.status(400).json({ error: "clientId is required" });
-  }
-
-  const device = await prisma.device.findFirst({
-    where: { tenantId: ctx.tenantId, clientId, userId: ctx.userId, authType: "JWT" },
-    select: { id: true, tenantId: true },
-  });
-
-  if (!device) return res.status(404).json({ error: "Device not registered" });
-
-  // keepalive
-  await prisma.device.update({
-    where: { id: device.id },
-    data: { online: true, lastSeenAt: new Date(), ipAddress: getIp(req) },
-  });
-
-  // egyszerűsített: a devices.controller.ts-ben már kiforrott a retry/backoff,
-  // itt egy MVP: ha van SENT, nem adunk újat; ha nincs, a legrégebbi QUEUED->SENT.
-  const inFlight = await prisma.deviceCommand.findFirst({
-    where: { tenantId: device.tenantId, deviceId: device.id, status: "SENT" },
-    orderBy: { sentAt: "asc" },
-  });
-
-  if (inFlight) return res.json({ ok: true, command: null });
-
-  const queued = await prisma.deviceCommand.findFirst({
-    where: { tenantId: device.tenantId, deviceId: device.id, status: "QUEUED" },
-    orderBy: { queuedAt: "asc" },
-  });
-
-  if (!queued) return res.json({ ok: true, command: null });
-
-  const now = new Date();
-  const updated = await prisma.deviceCommand.updateMany({
-    where: { id: queued.id, status: "QUEUED" },
-    data: { status: "SENT", sentAt: now },
-  });
-
-  if (updated.count === 0) return res.json({ ok: true, command: null });
-
-  const fresh = await prisma.deviceCommand.findUnique({ where: { id: queued.id } });
-  return res.json({ ok: true, command: fresh });
+  return playerPollCommands(req, res);
 }
 
 /**
  * POST /player/device/ack
  * body: { clientId: string, commandId: string, ok: boolean, error?: string }
+ *
+ * Delegálás a közös ACK logikára
  */
 export async function ackPlayerCommand(req: Request, res: Response) {
-  const ctx = ensurePlayer(req, res);
-  if (!ctx) return;
-
-  const { clientId, commandId, ok, error } = req.body ?? {};
-  if (!clientId || typeof clientId !== "string") return res.status(400).json({ error: "clientId is required" });
-  if (!commandId || typeof commandId !== "string") return res.status(400).json({ error: "commandId is required" });
-  if (typeof ok !== "boolean") return res.status(400).json({ error: "ok is required (boolean)" });
-
-  const device = await prisma.device.findFirst({
-    where: { tenantId: ctx.tenantId, clientId, userId: ctx.userId, authType: "JWT" },
-    select: { id: true, tenantId: true },
-  });
-  if (!device) return res.status(404).json({ error: "Device not registered" });
-
-  const cmd = await prisma.deviceCommand.findFirst({
-    where: { id: commandId, tenantId: device.tenantId, deviceId: device.id },
-  });
-  if (!cmd) return res.status(404).json({ error: "Command not found" });
-
-  if (cmd.status === "ACKED" || cmd.status === "FAILED") {
-    return res.json({ ok: true, command: cmd, note: "Already finalized" });
-  }
-
-  const updated = await prisma.deviceCommand.update({
-    where: { id: cmd.id },
-    data: {
-      status: ok ? "ACKED" : "FAILED",
-      ackedAt: new Date(),
-      lastError: ok ? null : (typeof error === "string" ? error : "Player reported error"),
-      error: ok ? null : (typeof error === "string" ? error : "Player reported error"),
-    },
-  });
-
-  return res.json({ ok: true, command: updated });
+  return playerAckCommand(req, res);
 }
