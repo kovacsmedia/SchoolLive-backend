@@ -17,6 +17,83 @@ router.get("/", authJwt_1.authJwt, async (req, res) => {
         if (!user) {
             return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
         }
+        /**
+         * GET /admin/commands/by-message/:messageId
+         * Tenant-scoped device commands list for a given message.
+         */
+        router.get("/by-message/:messageId", authJwt_1.authJwt, async (req, res) => {
+            try {
+                const user = req.user;
+                if (!user?.role)
+                    return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
+                if (!["SUPER_ADMIN", "TENANT_ADMIN", "ORG_ADMIN"].includes(user.role)) {
+                    return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+                }
+                // Header is lehet string|string[]; normalizáljuk
+                const rawTenantHeader = req.header("x-tenant-id");
+                const tenantHeader = typeof rawTenantHeader === "string"
+                    ? rawTenantHeader
+                    : Array.isArray(rawTenantHeader)
+                        ? rawTenantHeader[0]
+                        : null;
+                const tenantId = user.role === "SUPER_ADMIN"
+                    ? (tenantHeader?.trim() || null)
+                    : (user.tenantId ?? null);
+                if (!tenantId) {
+                    return res.status(400).json({ ok: false, error: "TENANT_REQUIRED" });
+                }
+                // Params is lehet string|string[]; normalizáljuk
+                const rawMessageId = req?.params?.messageId;
+                const messageId = typeof rawMessageId === "string"
+                    ? rawMessageId
+                    : Array.isArray(rawMessageId)
+                        ? rawMessageId[0]
+                        : "";
+                if (!messageId.trim()) {
+                    return res.status(400).json({ ok: false, error: "messageId is required" });
+                }
+                // Opcionális: ellenőrizzük, hogy a message létezik-e ebben a tenantban
+                const msg = await client_1.prisma.message.findFirst({
+                    where: { id: messageId, tenantId },
+                    select: { id: true },
+                });
+                if (!msg) {
+                    return res.status(404).json({ ok: false, error: "MESSAGE_NOT_FOUND" });
+                }
+                const commands = await client_1.prisma.deviceCommand.findMany({
+                    where: { tenantId, messageId },
+                    orderBy: [{ queuedAt: "desc" }],
+                    take: 500,
+                    select: {
+                        id: true,
+                        deviceId: true,
+                        messageId: true,
+                        status: true,
+                        queuedAt: true,
+                        sentAt: true,
+                        ackedAt: true,
+                        error: true,
+                        retryCount: true,
+                        maxRetries: true,
+                        lastError: true,
+                        device: {
+                            select: {
+                                id: true,
+                                name: true,
+                                online: true,
+                                lastSeenAt: true,
+                                ipAddress: true,
+                            },
+                        },
+                    },
+                });
+                return res.json({ ok: true, commands });
+            }
+            catch (err) {
+                console.error(err);
+                return res.status(500).json({ ok: false, error: "FAILED_TO_FETCH_COMMANDS" });
+            }
+        });
         const deviceId = typeof req.query.deviceId === "string" ? req.query.deviceId : undefined;
         const status = typeof req.query.status === "string" ? req.query.status : undefined;
         const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
