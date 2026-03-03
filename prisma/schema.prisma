@@ -85,6 +85,7 @@ model User {
   orgUnitId String?
 
   email        String   @unique
+  displayName String?
   passwordHash String
   role         UserRole
   isActive     Boolean  @default(true)
