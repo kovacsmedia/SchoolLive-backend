@@ -23,16 +23,21 @@ function isTenantRole(x: unknown): x is TenantRole {
 }
 
 function requireAdminWriteAccess(user: JwtUser) {
-  // Írási műveletekhez:
-  // - SUPER_ADMIN: tenant contexttel dolgozhat (x-tenant-id)
-  // - TENANT_ADMIN: teljes tenant admin
-  // ORG_ADMIN csak olvas (jelenlegi döntés)
+  // Írási műveletek:
+  // - SUPER_ADMIN: tenant contexttel (x-tenant-id + requireTenant)
+  // - TENANT_ADMIN: tenant admin
   return user?.role === "SUPER_ADMIN" || user?.role === "TENANT_ADMIN";
 }
 
 function requireAdminReadAccess(user: JwtUser) {
   // Olvasáshoz:
   return user?.role === "SUPER_ADMIN" || user?.role === "TENANT_ADMIN" || user?.role === "ORG_ADMIN";
+}
+
+function getParamId(req: any): string | null {
+  const raw = req?.params?.id;
+  if (typeof raw === "string" && raw.trim()) return raw.trim();
+  return null;
 }
 
 /**
@@ -51,6 +56,7 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
     }
 
     if (!user.tenantId) {
+      // requireTenant should prevent this, but keep it defensive
       return res.status(400).json({ error: "Tenant context required" });
     }
 
@@ -59,9 +65,9 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
       select: {
         id: true,
         email: true,
-        name: true,
         role: true,
         tenantId: true,
+        orgUnitId: true,
         isActive: true,
         lastLoginAt: true,
         createdAt: true,
@@ -84,9 +90,9 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
  * {
  *   email: string,
  *   password: string,
- *   name?: string | null,
  *   role: "TENANT_ADMIN" | "ORG_ADMIN" | "TEACHER" | "OPERATOR" | "PLAYER",
- *   isActive?: boolean
+ *   isActive?: boolean,
+ *   orgUnitId?: string | null
  * }
  */
 router.post("/", authJwt, requireTenant, async (req, res) => {
@@ -101,12 +107,12 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       return res.status(400).json({ error: "Tenant context required" });
     }
 
-    const { email, password, name, role, isActive } = req.body as {
+    const { email, password, role, isActive, orgUnitId } = req.body as {
       email?: unknown;
       password?: unknown;
-      name?: unknown;
       role?: unknown;
       isActive?: unknown;
+      orgUnitId?: unknown;
     };
 
     if (typeof email !== "string" || !email.trim()) {
@@ -119,9 +125,11 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       return res.status(400).json({ error: "invalid role" });
     }
 
-    // extra: SUPER_ADMIN nem hozható létre tenant alatt
-    if (role === "SUPER_ADMIN") {
-      return res.status(400).json({ error: "invalid role" });
+    // orgUnitId opcionális (string vagy null); ha string, legyen nem üres
+    let parsedOrgUnitId: string | null | undefined = undefined;
+    if (orgUnitId === null) parsedOrgUnitId = null;
+    else if (typeof orgUnitId === "string") {
+      parsedOrgUnitId = orgUnitId.trim() ? orgUnitId.trim() : null;
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
@@ -132,15 +140,15 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
         email: email.trim().toLowerCase(),
         passwordHash,
         role: role as any,
-        name: typeof name === "string" ? name.trim() : name === null ? null : null,
         isActive: typeof isActive === "boolean" ? isActive : true,
+        ...(typeof parsedOrgUnitId !== "undefined" ? { orgUnitId: parsedOrgUnitId } : {}),
       },
       select: {
         id: true,
         email: true,
-        name: true,
         role: true,
         tenantId: true,
+        orgUnitId: true,
         isActive: true,
         lastLoginAt: true,
         createdAt: true,
@@ -149,7 +157,6 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
 
     return res.status(201).json({ ok: true, user: created });
   } catch (err: any) {
-    // Prisma unique violation (email)
     if (err?.code === "P2002") {
       return res.status(409).json({ error: "Email already exists" });
     }
@@ -165,10 +172,10 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
  * Body (partial):
  * {
  *   email?: string,
- *   name?: string | null,
  *   role?: tenant role,
  *   isActive?: boolean,
- *   password?: string   // optional password reset
+ *   password?: string,
+ *   orgUnitId?: string | null
  * }
  */
 router.patch("/:id", authJwt, requireTenant, async (req, res) => {
@@ -183,37 +190,31 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       return res.status(400).json({ error: "Tenant context required" });
     }
 
-    const id = req.params.id;
+    const id = getParamId(req);
     if (!id) return res.status(400).json({ error: "id is required" });
 
     const existing = await prisma.user.findFirst({
       where: { id, tenantId: actor.tenantId },
-      select: { id: true, tenantId: true, role: true },
+      select: { id: true },
     });
 
     if (!existing) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const { email, name, role, isActive, password } = req.body as {
+    const { email, role, isActive, password, orgUnitId } = req.body as {
       email?: unknown;
-      name?: unknown;
       role?: unknown;
       isActive?: unknown;
       password?: unknown;
+      orgUnitId?: unknown;
     };
 
-    const data: any = {};
+    const data: Record<string, unknown> = {};
 
     if (typeof email === "string") {
       if (!email.trim()) return res.status(400).json({ error: "email cannot be empty" });
       data.email = email.trim().toLowerCase();
-    }
-
-    if (name === null) {
-      data.name = null;
-    } else if (typeof name === "string") {
-      data.name = name.trim();
     }
 
     if (typeof isActive === "boolean") {
@@ -225,14 +226,22 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       data.role = role;
     }
 
-    if (typeof password === "string" && password.trim()) {
-      if (password.length < 6) {
-        return res.status(400).json({ error: "password must be at least 6 characters" });
+    if (typeof password === "string") {
+      const pw = password.trim();
+      if (pw) {
+        if (pw.length < 6) {
+          return res.status(400).json({ error: "password must be at least 6 characters" });
+        }
+        data.passwordHash = await bcrypt.hash(pw, 10);
       }
-      data.passwordHash = await bcrypt.hash(password, 10);
     }
 
-    // nincs módosítható mező
+    if (typeof orgUnitId !== "undefined") {
+      if (orgUnitId === null) data.orgUnitId = null;
+      else if (typeof orgUnitId === "string") data.orgUnitId = orgUnitId.trim() ? orgUnitId.trim() : null;
+      else return res.status(400).json({ error: "orgUnitId must be string or null" });
+    }
+
     if (Object.keys(data).length === 0) {
       return res.status(400).json({ error: "No changes provided" });
     }
@@ -243,9 +252,9 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       select: {
         id: true,
         email: true,
-        name: true,
         role: true,
         tenantId: true,
+        orgUnitId: true,
         isActive: true,
         lastLoginAt: true,
         createdAt: true,
@@ -265,8 +274,7 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
 /**
  * DELETE /admin/users/:id
  *
- * Biztonságos tenant-szintű törlés: soft delete (isActive=false),
- * mert a login is így tilt (auth.service: !user.isActive → null).
+ * Biztonságos tenant-szintű törlés: soft delete (isActive=false).
  */
 router.delete("/:id", authJwt, requireTenant, async (req, res) => {
   try {
@@ -280,7 +288,7 @@ router.delete("/:id", authJwt, requireTenant, async (req, res) => {
       return res.status(400).json({ error: "Tenant context required" });
     }
 
-    const id = req.params.id;
+    const id = getParamId(req);
     if (!id) return res.status(400).json({ error: "id is required" });
 
     const existing = await prisma.user.findFirst({
