@@ -10,6 +10,7 @@ import adminCommandsRouter from "./modules/devices/admin.commands";
 import deviceAdminRoutes from "./modules/devices/devices.admin.routes";
 import devicesProvisionRouter from "./modules/devices/devices.provision.routes";
 import { playerDeviceRouter } from "./modules/player/player.device.routes";
+import usersAdminRoutes from "./modules/users/users.admin.routes";
 
 export const app = express();
 
@@ -73,11 +74,13 @@ app.get("/admin/tenants", authJwt, async (req, res) => {
   }
 });
 
+// --- ROUTERS ---
 app.use("/auth", authRouter);
 app.use("/devices", devicesRouter);
 
 app.use("/admin/commands", adminCommandsRouter);
 app.use("/admin/devices", deviceAdminRoutes);
+app.use("/admin/users", usersAdminRoutes);
 
 app.use("/provision", devicesProvisionRouter);
 
