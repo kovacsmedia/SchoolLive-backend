@@ -40,6 +40,25 @@ function getParamId(req: any): string | null {
   return null;
 }
 
+// ✅ ÚJ: egységes “név” parse (body.name vagy body.displayName → DB.displayName)
+function parseDisplayName(raw: unknown): string | null | undefined {
+  // undefined = nincs a payloadban (nem módosítjuk)
+  // null = explicit törlés
+  // string = beállítás
+  if (typeof raw === "undefined") return undefined;
+  if (raw === null) return null;
+  if (typeof raw === "string") {
+    const v = raw.trim();
+    return v ? v : null;
+  }
+  return undefined;
+}
+
+// ✅ ÚJ: API kompatibilitás (a frontendnek legyen name is)
+function withNameAlias<T extends { displayName?: any }>(u: T) {
+  return { ...u, name: (u as any).displayName ?? null };
+}
+
 /**
  * GET /admin/users
  * Tenant-scoped user list.
@@ -64,6 +83,8 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
       select: {
         id: true,
         email: true,
+        // ✅ ÚJ: név (DB mező)
+        displayName: true,
         role: true,
         tenantId: true,
         orgUnitId: true,
@@ -74,7 +95,10 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
       orderBy: [{ role: "asc" }, { email: "asc" }],
     });
 
-    return res.json({ ok: true, users });
+    // ✅ ÚJ: válaszban legyen "name" is (alias)
+    const mapped = users.map(withNameAlias);
+
+    return res.json({ ok: true, users: mapped });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to fetch users" });
@@ -187,6 +211,8 @@ router.get("/:id/messages", authJwt, requireTenant, async (req, res) => {
  *   role: "TENANT_ADMIN" | "ORG_ADMIN" | "TEACHER" | "OPERATOR" | "PLAYER",
  *   isActive?: boolean,
  *   orgUnitId?: string | null
+ *   ✅ + name?: string | null
+ *   ✅ + displayName?: string | null
  * }
  */
 router.post("/", authJwt, requireTenant, async (req, res) => {
@@ -201,12 +227,15 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       return res.status(400).json({ error: "Tenant context required" });
     }
 
-    const { email, password, role, isActive, orgUnitId } = req.body as {
+    const { email, password, role, isActive, orgUnitId, name, displayName } = req.body as {
       email?: unknown;
       password?: unknown;
       role?: unknown;
       isActive?: unknown;
       orgUnitId?: unknown;
+      // ✅ ÚJ:
+      name?: unknown;
+      displayName?: unknown;
     };
 
     if (typeof email !== "string" || !email.trim()) {
@@ -225,6 +254,10 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       parsedOrgUnitId = orgUnitId.trim() ? orgUnitId.trim() : null;
     }
 
+    // ✅ ÚJ: név feldolgozása (name vagy displayName)
+    const parsedDisplayName =
+      typeof displayName !== "undefined" ? parseDisplayName(displayName) : parseDisplayName(name);
+
     const passwordHash = await bcrypt.hash(password, 10);
 
     const created = await prisma.user.create({
@@ -235,10 +268,13 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
         role: role as any,
         isActive: typeof isActive === "boolean" ? isActive : true,
         ...(typeof parsedOrgUnitId !== "undefined" ? { orgUnitId: parsedOrgUnitId } : {}),
+        ...(typeof parsedDisplayName !== "undefined" ? { displayName: parsedDisplayName } : {}),
       },
       select: {
         id: true,
         email: true,
+        // ✅ ÚJ:
+        displayName: true,
         role: true,
         tenantId: true,
         orgUnitId: true,
@@ -248,7 +284,8 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       },
     });
 
-    return res.status(201).json({ ok: true, user: created });
+    // ✅ ÚJ: alias
+    return res.status(201).json({ ok: true, user: withNameAlias(created) });
   } catch (err: any) {
     if (err?.code === "P2002") {
       return res.status(409).json({ error: "Email already exists" });
@@ -269,6 +306,8 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
  *   isActive?: boolean,
  *   password?: string,
  *   orgUnitId?: string | null
+ *   ✅ name?: string | null
+ *   ✅ displayName?: string | null
  * }
  */
 router.patch("/:id", authJwt, requireTenant, async (req, res) => {
@@ -295,12 +334,15 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const { email, role, isActive, password, orgUnitId } = req.body as {
+    const { email, role, isActive, password, orgUnitId, name, displayName } = req.body as {
       email?: unknown;
       role?: unknown;
       isActive?: unknown;
       password?: unknown;
       orgUnitId?: unknown;
+      // ✅ ÚJ:
+      name?: unknown;
+      displayName?: unknown;
     };
 
     const data: Record<string, unknown> = {};
@@ -335,6 +377,14 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       else return res.status(400).json({ error: "orgUnitId must be string or null" });
     }
 
+    // ✅ ÚJ: displayName kezelése (name/displayName → DB.displayName)
+    // Ha bármelyik mezőt elküldik, beállítjuk.
+    const parsedDisplayName =
+      typeof displayName !== "undefined" ? parseDisplayName(displayName) : parseDisplayName(name);
+    if (typeof parsedDisplayName !== "undefined") {
+      data.displayName = parsedDisplayName;
+    }
+
     if (Object.keys(data).length === 0) {
       return res.status(400).json({ error: "No changes provided" });
     }
@@ -345,6 +395,8 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       select: {
         id: true,
         email: true,
+        // ✅ ÚJ:
+        displayName: true,
         role: true,
         tenantId: true,
         orgUnitId: true,
@@ -354,7 +406,7 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       },
     });
 
-    return res.json({ ok: true, user: updated });
+    return res.json({ ok: true, user: withNameAlias(updated) });
   } catch (err: any) {
     if (err?.code === "P2002") {
       return res.status(409).json({ error: "Email already exists" });
