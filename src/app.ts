@@ -56,4 +56,3 @@ app.use("/provision", devicesProvisionRouter);
 
 // ✅ web-player mint eszköz
 app.use("/player/device", playerDeviceRouter);
-//end
