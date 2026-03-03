@@ -14,6 +14,7 @@ const admin_commands_1 = __importDefault(require("./modules/devices/admin.comman
 const devices_admin_routes_1 = __importDefault(require("./modules/devices/devices.admin.routes"));
 const devices_provision_routes_1 = __importDefault(require("./modules/devices/devices.provision.routes"));
 const player_device_routes_1 = require("./modules/player/player.device.routes");
+const users_admin_routes_1 = __importDefault(require("./modules/users/users.admin.routes"));
 exports.app = (0, express_1.default)();
 /**
  * CORS
@@ -65,10 +66,12 @@ exports.app.get("/admin/tenants", authJwt_1.authJwt, async (req, res) => {
         return res.status(500).json({ error: "Failed to fetch tenants" });
     }
 });
+// --- ROUTERS ---
 exports.app.use("/auth", auth_routes_1.authRouter);
 exports.app.use("/devices", devices_routes_1.devicesRouter);
 exports.app.use("/admin/commands", admin_commands_1.default);
 exports.app.use("/admin/devices", devices_admin_routes_1.default);
+exports.app.use("/admin/users", users_admin_routes_1.default);
 exports.app.use("/provision", devices_provision_routes_1.default);
 // ✅ web-player mint eszköz
 exports.app.use("/player/device", player_device_routes_1.playerDeviceRouter);
