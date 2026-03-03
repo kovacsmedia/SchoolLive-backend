@@ -27,9 +27,6 @@ router.get("/", authJwt, async (req, res) => {
 /**
  * GET /admin/commands/by-message/:messageId
  * Tenant-scoped device commands list for a given message.
- *
- * SUPER_ADMIN: x-tenant-id headerrel tenant context kell (ugyanúgy, ahogy a többi admin endpointnál).
- * TENANT_ADMIN / ORG_ADMIN: token tenantId alapján.
  */
 router.get("/by-message/:messageId", authJwt, async (req, res) => {
   try {
@@ -40,18 +37,34 @@ router.get("/by-message/:messageId", authJwt, async (req, res) => {
       return res.status(403).json({ ok: false, error: "FORBIDDEN" });
     }
 
-    // tenant scope (SUPER_ADMIN-nál headerből, másoknál tokenből)
+    // Header is lehet string|string[]; normalizáljuk
+    const rawTenantHeader = req.header("x-tenant-id");
+    const tenantHeader =
+      typeof rawTenantHeader === "string"
+        ? rawTenantHeader
+        : Array.isArray(rawTenantHeader)
+          ? rawTenantHeader[0]
+          : null;
+
     const tenantId =
       user.role === "SUPER_ADMIN"
-        ? (req.header("x-tenant-id") ?? null)
+        ? (tenantHeader?.trim() || null)
         : (user.tenantId ?? null);
 
     if (!tenantId) {
       return res.status(400).json({ ok: false, error: "TENANT_REQUIRED" });
     }
 
-    const messageId = req.params.messageId;
-    if (!messageId) {
+    // Params is lehet string|string[]; normalizáljuk
+    const rawMessageId = (req as any)?.params?.messageId as unknown;
+    const messageId =
+      typeof rawMessageId === "string"
+        ? rawMessageId
+        : Array.isArray(rawMessageId)
+          ? rawMessageId[0]
+          : "";
+
+    if (!messageId.trim()) {
       return res.status(400).json({ ok: false, error: "messageId is required" });
     }
 
