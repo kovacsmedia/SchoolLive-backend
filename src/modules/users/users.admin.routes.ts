@@ -56,7 +56,6 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
     }
 
     if (!user.tenantId) {
-      // requireTenant should prevent this, but keep it defensive
       return res.status(400).json({ error: "Tenant context required" });
     }
 
@@ -79,6 +78,101 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+/**
+ * GET /admin/users/:id/messages
+ * Tenant-scoped message list for a given user (createdById).
+ *
+ * Returns:
+ * { ok: true, messages: [{ id, createdAt, type, title, scheduledAt, targetType, targetId, status }] }
+ *
+ * status: derived from linked DeviceCommand statuses for the message:
+ *  - FAILED if any command FAILED
+ *  - ACKED if any command ACKED
+ *  - SENT if any command SENT
+ *  - QUEUED if any command QUEUED
+ *  - "-" if message has no commands
+ */
+router.get("/:id/messages", authJwt, requireTenant, async (req, res) => {
+  try {
+    const actor = (req as any).user as JwtUser;
+
+    if (!actor?.role || !requireAdminReadAccess(actor)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    if (!actor.tenantId) {
+      return res.status(400).json({ error: "Tenant context required" });
+    }
+
+    const id = getParamId(req);
+    if (!id) return res.status(400).json({ error: "id is required" });
+
+    // Ensure the target user exists in this tenant
+    const targetUser = await prisma.user.findFirst({
+      where: { id, tenantId: actor.tenantId },
+      select: { id: true },
+    });
+
+    if (!targetUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const messages = await prisma.message.findMany({
+      where: { tenantId: actor.tenantId, createdById: id },
+      select: {
+        id: true,
+        type: true,
+        title: true,
+        scheduledAt: true,
+        targetType: true,
+        targetId: true,
+        createdAt: true,
+        commands: {
+          select: { status: true },
+        },
+      },
+      orderBy: [{ createdAt: "desc" }],
+      take: 200,
+    });
+
+    const statusRank: Record<string, number> = {
+      "-": 0,
+      QUEUED: 1,
+      SENT: 2,
+      ACKED: 3,
+      FAILED: 4,
+    };
+
+    function aggregateStatus(commandStatuses: Array<{ status: string }>): string {
+      if (!commandStatuses || commandStatuses.length === 0) return "-";
+      // Pick the "worst"/most informative status by rank:
+      // FAILED > ACKED > SENT > QUEUED
+      let best = "-";
+      for (const cs of commandStatuses) {
+        const s = cs.status ?? "-";
+        if ((statusRank[s] ?? 0) > (statusRank[best] ?? 0)) best = s;
+      }
+      return best;
+    }
+
+    const mapped = messages.map((m) => ({
+      id: m.id,
+      createdAt: m.createdAt,
+      type: m.type,
+      title: m.title,
+      scheduledAt: m.scheduledAt,
+      targetType: m.targetType,
+      targetId: m.targetId,
+      status: aggregateStatus(m.commands as Array<{ status: string }>),
+    }));
+
+    return res.json({ ok: true, messages: mapped });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to fetch user messages" });
   }
 });
 
@@ -125,7 +219,6 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       return res.status(400).json({ error: "invalid role" });
     }
 
-    // orgUnitId opcionális (string vagy null); ha string, legyen nem üres
     let parsedOrgUnitId: string | null | undefined = undefined;
     if (orgUnitId === null) parsedOrgUnitId = null;
     else if (typeof orgUnitId === "string") {
