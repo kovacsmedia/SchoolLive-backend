@@ -49,4 +49,3 @@ exports.app.use("/admin/devices", devices_admin_routes_1.default);
 exports.app.use("/provision", devices_provision_routes_1.default);
 // ✅ web-player mint eszköz
 exports.app.use("/player/device", player_device_routes_1.playerDeviceRouter);
-//end
