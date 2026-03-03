@@ -24,7 +24,80 @@ router.get("/", authJwt, async (req, res) => {
     if (!user) {
       return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
     }
+/**
+ * GET /admin/commands/by-message/:messageId
+ * Tenant-scoped device commands list for a given message.
+ *
+ * SUPER_ADMIN: x-tenant-id headerrel tenant context kell (ugyanúgy, ahogy a többi admin endpointnál).
+ * TENANT_ADMIN / ORG_ADMIN: token tenantId alapján.
+ */
+router.get("/by-message/:messageId", authJwt, async (req, res) => {
+  try {
+    const user = req.user as { role?: string; tenantId?: string | null } | undefined;
+    if (!user?.role) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
 
+    if (!["SUPER_ADMIN", "TENANT_ADMIN", "ORG_ADMIN"].includes(user.role)) {
+      return res.status(403).json({ ok: false, error: "FORBIDDEN" });
+    }
+
+    // tenant scope (SUPER_ADMIN-nál headerből, másoknál tokenből)
+    const tenantId =
+      user.role === "SUPER_ADMIN"
+        ? (req.header("x-tenant-id") ?? null)
+        : (user.tenantId ?? null);
+
+    if (!tenantId) {
+      return res.status(400).json({ ok: false, error: "TENANT_REQUIRED" });
+    }
+
+    const messageId = req.params.messageId;
+    if (!messageId) {
+      return res.status(400).json({ ok: false, error: "messageId is required" });
+    }
+
+    // Opcionális: ellenőrizzük, hogy a message létezik-e ebben a tenantban
+    const msg = await prisma.message.findFirst({
+      where: { id: messageId, tenantId },
+      select: { id: true },
+    });
+    if (!msg) {
+      return res.status(404).json({ ok: false, error: "MESSAGE_NOT_FOUND" });
+    }
+
+    const commands = await prisma.deviceCommand.findMany({
+      where: { tenantId, messageId },
+      orderBy: [{ queuedAt: "desc" }],
+      take: 500,
+      select: {
+        id: true,
+        deviceId: true,
+        messageId: true,
+        status: true,
+        queuedAt: true,
+        sentAt: true,
+        ackedAt: true,
+        error: true,
+        retryCount: true,
+        maxRetries: true,
+        lastError: true,
+        device: {
+          select: {
+            id: true,
+            name: true,
+            online: true,
+            lastSeenAt: true,
+            ipAddress: true,
+          },
+        },
+      },
+    });
+
+    return res.json({ ok: true, commands });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ ok: false, error: "FAILED_TO_FETCH_COMMANDS" });
+  }
+});
     const deviceId = typeof req.query.deviceId === "string" ? req.query.deviceId : undefined;
     const status = typeof req.query.status === "string" ? (req.query.status as CommandStatus) : undefined;
     const limitRaw = typeof req.query.limit === "string" ? Number(req.query.limit) : 50;
