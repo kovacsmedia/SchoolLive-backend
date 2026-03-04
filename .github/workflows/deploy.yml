@@ -74,7 +74,7 @@ jobs:
 
             echo "== PM2 start/reload =="
             if [ -f "server.js" ]; then
-              pm2 describe schoollive-api >/dev/null || pm2 start server.js --name schoollive-api
+              pm2 describe schoollive-api >/dev/null || pm2 start dist/server.js --name schoollive-api
               pm2 reload schoollive-api
             elif [ -f "dist/main.js" ]; then
               pm2 describe schoollive-api >/dev/null || pm2 start dist/main.js --name schoollive-api
