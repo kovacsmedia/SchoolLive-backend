@@ -103,8 +103,7 @@ router.patch("/:id", authJwt, async (req, res) => {
     const user = (req as any).user as JwtUser;
     if (!requireSuperAdmin(user, res)) return;
 
-    const id = req.params.id?.trim();
-    if (!id) return res.status(400).json({ error: "id is required" });
+    const id = (Array.isArray(req.params.id) ? req.params.id[0] : req.params.id)?.trim();    if (!id) return res.status(400).json({ error: "id is required" });
 
     const existing = await prisma.tenant.findUnique({ where: { id }, select: { id: true } });
     if (!existing) return res.status(404).json({ error: "Tenant not found" });
@@ -167,8 +166,7 @@ router.delete("/:id", authJwt, async (req, res) => {
     const user = (req as any).user as JwtUser;
     if (!requireSuperAdmin(user, res)) return;
 
-    const id = req.params.id?.trim();
-    if (!id) return res.status(400).json({ error: "id is required" });
+    const id = (Array.isArray(req.params.id) ? req.params.id[0] : req.params.id)?.trim();    if (!id) return res.status(400).json({ error: "id is required" });
 
     const existing = await prisma.tenant.findUnique({ where: { id }, select: { id: true } });
     if (!existing) return res.status(404).json({ error: "Tenant not found" });
