@@ -3,7 +3,7 @@ import cors from "cors";
 
 import { prisma } from "./prisma/client";
 import { authJwt } from "./middleware/authJwt";
-
+import tenantsAdminRouter from "./modules/tenants/tenants.admin.routes";
 import { authRouter } from "./modules/auth/auth.routes";
 import { devicesRouter } from "./modules/devices/devices.routes";
 import adminCommandsRouter from "./modules/devices/admin.commands";
@@ -49,30 +49,7 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
  * SUPER_ADMIN: tenants list for tenant-switch UI
  * Response shape: [{ id, name, domain, isActive }]
  */
-app.get("/admin/tenants", authJwt, async (req, res) => {
-  try {
-    const user = (req as any).user as { role?: string };
-
-    if (user?.role !== "SUPER_ADMIN") {
-      return res.status(403).json({ error: "Forbidden" });
-    }
-
-    const tenants = await prisma.tenant.findMany({
-      select: {
-        id: true,
-        name: true,
-        domain: true,
-        isActive: true,
-      },
-      orderBy: { name: "asc" },
-    });
-
-    return res.json({ ok: true, tenants });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Failed to fetch tenants" });
-  }
-});
+app.use("/admin/tenants", tenantsAdminRouter);
 
 // --- ROUTERS ---
 app.use("/auth", authRouter);
