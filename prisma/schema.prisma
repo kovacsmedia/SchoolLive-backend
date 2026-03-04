@@ -18,6 +18,12 @@ enum UserRole {
   PLAYER
 }
 
+enum DeviceClass {
+  SPEAKER
+  DISPLAY
+  MULTI
+}
+
 enum DeviceAuthType {
   KEY
   JWT
@@ -153,6 +159,7 @@ model Device {
   statusPayload Json?
 
   createdAt DateTime @default(now())
+  deviceClass DeviceClass @default(SPEAKER)
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   orgUnit OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
@@ -264,4 +271,15 @@ model DeviceProvisionSession {
 
   @@index([deviceId])
   @@index([expiresAt])
+}
+
+model PendingDevice {
+  id              String   @id @default(uuid())
+  mac             String   @unique
+  ipAddress       String?
+  firmwareVersion String?
+  firstSeenAt     DateTime @default(now())
+  lastSeenAt      DateTime @default(now())
+
+  @@index([lastSeenAt])
 }
