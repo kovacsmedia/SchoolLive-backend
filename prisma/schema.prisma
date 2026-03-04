@@ -267,6 +267,9 @@ model DeviceProvisionSession {
   expiresAt    DateTime
   createdAt    DateTime @default(now())
 
+  // ÚJ: egyszer kiadható deviceKey (plaintext, törlődik lekérés után)
+  pendingDeviceKey String?
+
   device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
 
   @@index([deviceId])

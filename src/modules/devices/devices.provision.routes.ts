@@ -54,14 +54,11 @@ router.get("/status/:pendingId", async (req, res) => {
   try {
     const { pendingId } = req.params;
 
-    // Megnézzük hogy van-e már aktivált device ehhez a pendingId-hoz
-    // Az aktiváláskor a PendingDevice-t töröljük és a Device-on eltároljuk a pendingId-t átmenetileg
     const pending = await prisma.pendingDevice.findUnique({
       where: { id: pendingId },
     });
 
     if (pending) {
-      // Még nem aktiválták
       await prisma.pendingDevice.update({
         where: { id: pendingId },
         data: { lastSeenAt: new Date() },
@@ -69,32 +66,27 @@ router.get("/status/:pendingId", async (req, res) => {
       return res.json({ ok: true, status: "pending" });
     }
 
-    // Törölt → keressük az aktivált device-t
+    // Aktivált – keressük a device-t
     const device = await prisma.device.findFirst({
       where: { clientId: pendingId },
-      select: {
-        id: true,
-        name: true,
-        deviceKeyHash: true,
-        clientId: true,
-      },
+      select: { id: true, name: true },
     });
 
     if (!device) {
       return res.status(404).json({ error: "Not found" });
     }
 
-    // A deviceKey plaintext-et a provisionSession-ben tároljuk átmenetileg
+    // Session lekérése (tartalmazza a plaintext deviceKey-t)
     const session = await prisma.deviceProvisionSession.findFirst({
       where: { deviceId: device.id },
       orderBy: { createdAt: "desc" },
     });
 
     if (!session) {
-      return res.json({ ok: true, status: "activated", config: null });
+      return res.status(410).json({ error: "Config already consumed" });
     }
 
-    return res.json({
+    const responseData = {
       ok: true,
       status: "activated",
       config: {
@@ -102,8 +94,17 @@ router.get("/status/:pendingId", async (req, res) => {
         deviceName: device.name,
         wifiSsid: session.wifiSsid,
         wifiPassword: session.wifiPassword,
+        deviceKey: session.pendingDeviceKey ?? "",  // ← ÚJ
       },
+    };
+
+    // Session törlése – a deviceKey többet nem kérhető le
+    await prisma.deviceProvisionSession.delete({
+      where: { id: session.id },
     });
+
+    return res.json(responseData);
+
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Status check failed" });
@@ -195,6 +196,7 @@ router.post("/activate", authJwt, async (req, res) => {
     const provisioningToken = crypto.randomBytes(32).toString("hex");
     const tokenHash = await bcrypt.hash(provisioningToken, 10);
 
+    // A deviceProvisionSession.create()-ban add hozzá:
     await prisma.deviceProvisionSession.create({
       data: {
         tokenHash,
@@ -203,9 +205,10 @@ router.post("/activate", authJwt, async (req, res) => {
         name,
         wifiSsid,
         wifiPassword,
-        expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 perc
-      },
-    });
+        pendingDeviceKey: deviceKey,  // ← ÚJ
+        expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+  },
+});
 
     // PendingDevice törlése – az ESP32 status poll-nál látja hogy aktivált
     await prisma.pendingDevice.delete({ where: { id: pendingId } });
