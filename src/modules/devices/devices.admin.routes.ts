@@ -87,7 +87,7 @@ router.delete("/:id", authJwt, requireTenant, async (req, res) => {
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    const id = req.params.id?.trim();
+    const id = (Array.isArray(req.params.id) ? req.params.id[0] : req.params.id)?.trim();
     if (!id) return res.status(400).json({ error: "id is required" });
 
     const existing = await prisma.device.findFirst({
