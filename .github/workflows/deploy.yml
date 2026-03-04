@@ -76,25 +76,12 @@ jobs:
             echo "== Build (optional) =="
             npm run -s build
 
-            echo "== PM2 start/reload =="
-            if [ -f "server.js" ]; then
-              pm2 describe schoollive-api >/dev/null || pm2 start dist/server.js --name schoollive-api
-              pm2 reload schoollive-api
-            elif [ -f "dist/main.js" ]; then
-              pm2 describe schoollive-api >/dev/null || pm2 start dist/main.js --name schoollive-api
-              pm2 reload schoollive-api
-            elif [ -f "dist/server.js" ]; then
-              pm2 describe schoollive-api >/dev/null || pm2 start dist/server.js --name schoollive-api
-              pm2 reload schoollive-api
-            elif [ -f "index.js" ]; then
-              pm2 describe schoollive-api >/dev/null || pm2 start index.js --name schoollive-api
-              pm2 reload schoollive-api
+            eecho "== PM2 start/reload =="
+            if pm2 describe schoollive-api >/dev/null 2>&1; then
+            pm2 reload schoollive-api
             else
-              echo "Nem találok belépési fájlt (server.js / dist/main.js / dist/server.js / index.js)."
-              echo "Aktuális könyvtár tartalma:"
-              ls -la
-              exit 1
+            pm2 start dist/server.js --name schoollive-api
             fi
-
             echo "== PM2 save =="
             pm2 save
+
