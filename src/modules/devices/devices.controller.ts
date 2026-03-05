@@ -398,8 +398,25 @@ export async function playerAckCommand(req: Request, res: Response) {
       lastError: ok ? null : (typeof error === "string" ? error : "Player reported error"),
       error: ok ? null : (typeof error === "string" ? error : "Player reported error"),
     },
+    
+  });
+const updated = await prisma.deviceCommand.update({
+    where: { id: cmd.id },
+    data: {
+      status: ok ? "ACKED" : "FAILED",
+      ackedAt: new Date(),
+      lastError: ok ? null : (typeof error === "string" ? error : "Device reported error"),
+      error: ok ? null : (typeof error === "string" ? error : "Device reported error"),
+    },
   });
 
+  // Ha sikeres ACK és van messageId, frissítjük a Message.playedAt-et
+  if (ok && cmd.messageId) {
+    await prisma.message.update({
+      where: { id: cmd.messageId },
+      data: { playedAt: new Date() },
+    }).catch(() => { /* silent – nem kritikus */ });
+  }
   // heartbeat
   await prisma.device.update({
     where: { id: device.id },
