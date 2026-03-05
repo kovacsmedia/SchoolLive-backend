@@ -1,10 +1,7 @@
-import { execFile } from "child_process";
-import { promisify } from "util";
+import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
-
-const execFileAsync = promisify(execFile);
 
 const PIPER_BIN   = "/opt/schoollive/piper/piper";
 const MODELS_DIR  = "/opt/schoollive/piper/models";
@@ -20,25 +17,39 @@ export async function generateTTS(text: string, voice: string = "anna"): Promise
   const modelFile = VOICES[voice] ?? VOICES["anna"];
   const modelPath = path.join(MODELS_DIR, modelFile);
 
-  // Egyedi fájlnév hash alapján
   const hash = crypto.createHash("sha256").update(text + voice).digest("hex").slice(0, 16);
   const filename = `tts_${hash}.mp3`;
   const outputPath = path.join(AUDIO_DIR, filename);
 
-  // Ha már létezik, ne generáljuk újra
   if (fs.existsSync(outputPath)) {
     return filename;
   }
 
-  // Piper futtatása
-  await execFileAsync("/bin/sh", [
-    "-c",
-    `echo ${JSON.stringify(text)} | ${PIPER_BIN} --model ${modelPath} --output_file ${outputPath}`
-  ]);
+  return new Promise((resolve, reject) => {
+    const piper = spawn(PIPER_BIN, [
+      "--model", modelPath,
+      "--output_file", outputPath,
+    ]);
 
-  if (!fs.existsSync(outputPath)) {
-    throw new Error("TTS generation failed: output file not created");
-  }
+    piper.stdin.write(text);
+    piper.stdin.end();
 
-  return filename;
+    let stderr = "";
+    piper.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    piper.on("close", (code) => {
+      if (code !== 0) {
+        console.error("[TTS] piper stderr:", stderr);
+        return reject(new Error(`Piper exited with code ${code}: ${stderr}`));
+      }
+      if (!fs.existsSync(outputPath)) {
+        return reject(new Error("TTS generation failed: output file not created"));
+      }
+      resolve(filename);
+    });
+
+    piper.on("error", (err) => {
+      reject(new Error(`Failed to spawn piper: ${err.message}`));
+    });
+  });
 }
