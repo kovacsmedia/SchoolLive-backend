@@ -11,7 +11,7 @@ import deviceAdminRoutes from "./modules/devices/devices.admin.routes";
 import devicesProvisionRouter from "./modules/devices/devices.provision.routes";
 import { playerDeviceRouter } from "./modules/player/player.device.routes";
 import usersAdminRoutes from "./modules/users/users.admin.routes";
-
+import messagesRouter from "./modules/messages/messages.routes";
 export const app = express();
 
 /**
@@ -54,7 +54,8 @@ app.use("/admin/tenants", tenantsAdminRouter);
 // --- ROUTERS ---
 app.use("/auth", authRouter);
 app.use("/devices", devicesRouter);
-
+app.use("/messages", messagesRouter);
+app.use("/audio", express.static("/opt/schoollive/backend/audio"));
 app.use("/admin/commands", adminCommandsRouter);
 app.use("/admin/devices", deviceAdminRoutes);
 app.use("/admin/users", usersAdminRoutes);
