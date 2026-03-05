@@ -11,6 +11,13 @@ const router = Router();
 function tenantId(req: Request): string {
   return (req as any).tenantId as string;
 }
+router.post("/templates", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    console.log("[DEBUG] req.user:", JSON.stringify((req as any).user));
+    const tid = tenantId(req);
+    const uid = userId(req);
+    console.log("[DEBUG] uid:", uid);
+}
 function userId(req: Request): string {
   return (req as any).user?.user?.id as string;
 }
