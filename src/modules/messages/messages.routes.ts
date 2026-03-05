@@ -11,7 +11,7 @@ function tenantId(req: Request): string {
   return (req as any).tenantId as string;
 }
 function userId(req: Request): string {
-  return (req as any).user?.user?.id as string;
+  return (req as any).user?.sub as string;
 }
 
 // ─────────────────────────────────────────
