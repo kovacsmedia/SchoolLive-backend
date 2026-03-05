@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import { prisma } from "../../prisma/client";
 import { authJwt } from "../../middleware/authJwt";
-import { requireTenant } from "../../middleware/requireTenant";
+import { requireTenant } from "../../middleware/tenant";
 import { generateTTS } from "../../services/tts.service";
 import path from "path";
 
