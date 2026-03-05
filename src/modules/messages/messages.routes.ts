@@ -12,7 +12,7 @@ function tenantId(req: Request): string {
   return (req as any).tenantId as string;
 }
 function userId(req: Request): string {
-  return (req as any).user?.id as string;
+  return (req as any).user?.user?.id as string;
 }
 function userRole(req: Request): string {
   return (req as any).user?.role as string;
