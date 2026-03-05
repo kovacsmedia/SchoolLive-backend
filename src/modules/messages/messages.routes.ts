@@ -3,31 +3,19 @@ import { prisma } from "../../prisma/client";
 import { authJwt } from "../../middleware/authJwt";
 import { requireTenant } from "../../middleware/tenant";
 import { generateTTS } from "../../services/tts.service";
-import path from "path";
 
 const router = Router();
 
-// --- Segédfüggvény: tenant scope ---
+// --- Segédfüggvények ---
 function tenantId(req: Request): string {
   return (req as any).tenantId as string;
-}
-router.post("/templates", authJwt, requireTenant, async (req: Request, res: Response) => {
-  try {
-    console.log("[DEBUG] req.user:", JSON.stringify((req as any).user));
-    const tid = tenantId(req);
-    const uid = userId(req);
-    console.log("[DEBUG] uid:", uid);
 }
 function userId(req: Request): string {
   return (req as any).user?.user?.id as string;
 }
-function userRole(req: Request): string {
-  return (req as any).user?.role as string;
-}
 
 // ─────────────────────────────────────────
 // GET /messages
-// Üzenet lista (timeline) – lapozható
 // ─────────────────────────────────────────
 router.get("/", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
@@ -70,47 +58,86 @@ router.get("/", authJwt, requireTenant, async (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────
-// GET /messages/:id
-// Üzenet részletei
+// GET /messages/templates
 // ─────────────────────────────────────────
-router.get("/:id", authJwt, requireTenant, async (req: Request, res: Response) => {
+router.get("/templates", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     const tid = tenantId(req);
-    const id  = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    const uid = userId(req);
 
-    const message = await prisma.message.findFirst({
-      where: { id, tenantId: tid },
-      include: {
-        createdBy: { select: { id: true, displayName: true, email: true } },
-        commands:  { select: { id: true, deviceId: true, status: true, queuedAt: true, ackedAt: true } },
-      },
+    const templates = await prisma.messageTemplate.findMany({
+      where:   { tenantId: tid, userId: uid },
+      orderBy: { createdAt: "desc" },
+      select:  { id: true, name: true, text: true, voice: true, createdAt: true },
     });
 
-    if (!message) return res.status(404).json({ error: "Message not found" });
-
-    return res.json({ ok: true, message });
+    return res.json({ ok: true, templates });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Failed to fetch message" });
+    return res.status(500).json({ error: "Failed to fetch templates" });
+  }
+});
+
+// ─────────────────────────────────────────
+// POST /messages/templates
+// ─────────────────────────────────────────
+router.post("/templates", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    console.log("[DEBUG] req.user:", JSON.stringify((req as any).user));
+    const tid = tenantId(req);
+    const uid = userId(req);
+    console.log("[DEBUG] uid:", uid);
+
+    const { name, text, voice = "anna" } = req.body;
+
+    if (!name || !text) {
+      return res.status(400).json({ error: "name and text are required" });
+    }
+
+    const template = await prisma.messageTemplate.create({
+      data: { tenantId: tid, userId: uid, name, text, voice },
+    });
+
+    return res.status(201).json({ ok: true, template });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to save template" });
+  }
+});
+
+// ─────────────────────────────────────────
+// DELETE /messages/templates/:id
+// ─────────────────────────────────────────
+router.delete("/templates/:id", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const tid = tenantId(req);
+    const uid = userId(req);
+    const id  = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+    const template = await prisma.messageTemplate.findFirst({
+      where: { id, tenantId: tid, userId: uid },
+    });
+
+    if (!template) return res.status(404).json({ error: "Template not found" });
+
+    await prisma.messageTemplate.delete({ where: { id } });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to delete template" });
   }
 });
 
 // ─────────────────────────────────────────
 // POST /messages
-// Új TTS üzenet létrehozása + dispatch
 // ─────────────────────────────────────────
 router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     const tid = tenantId(req);
     const uid = userId(req);
 
-    const {
-      text,
-      voice = "anna",
-      targetType,
-      targetId,
-      scheduledAt,  // ISO string vagy null (azonnali)
-    } = req.body;
+    const { text, voice = "anna", targetType, targetId, scheduledAt } = req.body;
 
     if (!text || text.trim().length === 0) {
       return res.status(400).json({ error: "Text is required" });
@@ -119,11 +146,9 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
       return res.status(400).json({ error: "targetType is required" });
     }
 
-    // 1. TTS generálás
     const filename = await generateTTS(text.trim(), voice);
     const fileUrl  = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${filename}`;
 
-    // 2. Message rekord létrehozása
     const message = await prisma.message.create({
       data: {
         tenantId:    tid,
@@ -139,11 +164,7 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
       },
     });
 
-    // 3. Eszközök meghatározása
     const deviceIds = await resolveDeviceIds(tid, targetType, targetId);
-
-    // 4. Commands létrehozása
-    const isImmediate = !scheduledAt;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
 
     if (deviceIds.length > 0) {
@@ -170,74 +191,27 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
 });
 
 // ─────────────────────────────────────────
-// GET /messages/templates
-// Sablonok listája (csak saját)
+// GET /messages/:id
 // ─────────────────────────────────────────
-router.get("/templates", authJwt, requireTenant, async (req: Request, res: Response) => {
+router.get("/:id", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     const tid = tenantId(req);
-    const uid = userId(req);
-
-    const templates = await prisma.messageTemplate.findMany({
-      where:   { tenantId: tid, userId: uid },
-      orderBy: { createdAt: "desc" },
-      select:  { id: true, name: true, text: true, voice: true, createdAt: true },
-    });
-
-    return res.json({ ok: true, templates });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Failed to fetch templates" });
-  }
-});
-
-// ─────────────────────────────────────────
-// POST /messages/templates
-// Új sablon mentése
-// ─────────────────────────────────────────
-router.post("/templates", authJwt, requireTenant, async (req: Request, res: Response) => {
-  try {
-    const tid = tenantId(req);
-    const uid = userId(req);
-    const { name, text, voice = "anna" } = req.body;
-
-    if (!name || !text) {
-      return res.status(400).json({ error: "name and text are required" });
-    }
-
-    const template = await prisma.messageTemplate.create({
-      data: { tenantId: tid, userId: uid, name, text, voice },
-    });
-
-    return res.status(201).json({ ok: true, template });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Failed to save template" });
-  }
-});
-
-// ─────────────────────────────────────────
-// DELETE /messages/templates/:id
-// Sablon törlése
-// ─────────────────────────────────────────
-router.delete("/templates/:id", authJwt, requireTenant, async (req: Request, res: Response) => {
-  try {
-    const tid = tenantId(req);
-    const uid = userId(req);
     const id  = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
 
-    const template = await prisma.messageTemplate.findFirst({
-      where: { id, tenantId: tid, userId: uid },
+    const message = await prisma.message.findFirst({
+      where: { id, tenantId: tid },
+      include: {
+        createdBy: { select: { id: true, displayName: true, email: true } },
+        commands:  { select: { id: true, deviceId: true, status: true, queuedAt: true, ackedAt: true } },
+      },
     });
 
-    if (!template) return res.status(404).json({ error: "Template not found" });
+    if (!message) return res.status(404).json({ error: "Message not found" });
 
-    await prisma.messageTemplate.delete({ where: { id } });
-
-    return res.json({ ok: true });
+    return res.json({ ok: true, message });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: "Failed to delete template" });
+    return res.status(500).json({ error: "Failed to fetch message" });
   }
 });
 
