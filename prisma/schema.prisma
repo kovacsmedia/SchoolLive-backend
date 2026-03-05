@@ -63,6 +63,7 @@ model Tenant {
   directorPhone  String?
   directorEmail  String?
   eduId          String?  // oktatási azonosító
+  messageTemplates MessageTemplate[]
 
   orgUnits  OrganizationalUnit[]
   users     User[]
@@ -96,7 +97,7 @@ model User {
   id        String   @id @default(uuid())
   tenantId  String?  // SUPER_ADMIN esetén lehet null
   orgUnitId String?
-
+  messageTemplates MessageTemplate[]
   email        String   @unique
   displayName  String?
   passwordHash String
@@ -209,23 +210,41 @@ model Message {
   tenantId    String
   type        MessageType
   title       String?
-  fileUrl     String?
+  text        String?     // TTS szöveg
+  fileUrl     String?     // generált MP3 URL
+  voice       String?     // anna / berta / imre
   scheduledAt DateTime?
+  playedAt    DateTime?   // mikor játszódott le ténylegesen
 
   targetType TargetType
-  targetId   String? // DEVICE/GROUP/ORG_UNIT esetén
+  targetId   String?
 
   createdById String
   createdAt   DateTime @default(now())
 
-  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  createdBy User   @relation("CreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
-
-  commands DeviceCommand[]
+  tenant    Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy User    @relation("CreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  commands  DeviceCommand[]
 
   @@index([tenantId])
   @@index([tenantId, scheduledAt])
   @@index([tenantId, targetType])
+  @@index([tenantId, createdAt])
+}
+
+model MessageTemplate {
+  id        String   @id @default(uuid())
+  tenantId  String
+  userId    String
+  name      String
+  text      String
+  voice     String   @default("anna")
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, userId])
 }
 
 model DeviceCommand {
