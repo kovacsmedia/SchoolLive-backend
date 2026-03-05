@@ -4,8 +4,8 @@ import crypto from "crypto";
 import bcrypt from "bcrypt";
 
 // ---- Retry/Timeout config ----
-const BASE_ACK_TIMEOUT_MS = 30_000; // 30s
-const MAX_ACK_TIMEOUT_MS = 5 * 60_000; // 5 min
+const BASE_ACK_TIMEOUT_MS = 30_000;
+const MAX_ACK_TIMEOUT_MS = 5 * 60_000;
 
 function ackTimeoutMs(retryCount: number) {
   const rc = Math.max(0, Number.isFinite(retryCount) ? retryCount : 0);
@@ -54,7 +54,6 @@ export async function registerDevice(req: Request, res: Response) {
     return res.status(400).json({ error: "name is required" });
   }
 
-  // egyszer használatos device key (plaintext)
   const deviceKey = crypto.randomBytes(24).toString("hex");
   const deviceKeyHash = await bcrypt.hash(deviceKey, 10);
 
@@ -72,7 +71,6 @@ export async function registerDevice(req: Request, res: Response) {
     select: { id: true, name: true, tenantId: true, orgUnitId: true, createdAt: true },
   });
 
-  // plaintext kulcsot csak most adjuk vissza!
   res.status(201).json({ device, deviceKey });
 }
 
@@ -232,14 +230,17 @@ export async function ackCommand(req: Request, res: Response) {
     },
   });
 
+  // Ha sikeres ACK és van messageId, frissítjük a Message.playedAt-et
+  if (ok && cmd.messageId) {
+    await prisma.message.update({
+      where: { id: cmd.messageId },
+      data: { playedAt: new Date() },
+    }).catch(() => { /* silent */ });
+  }
+
   return res.json({ ok: true, command: updated });
 }
 
-/**
- * PLAYER/JWT virtual device polling
- * POST /player/device/poll
- * Body: { clientId: string }
- */
 export async function playerPollCommands(req: Request, res: Response) {
   const user = req.user;
   if (!user) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
@@ -267,13 +268,11 @@ export async function playerPollCommands(req: Request, res: Response) {
     return res.status(404).json({ ok: false, error: "DEVICE_NOT_REGISTERED" });
   }
 
-  // heartbeat: legyen ONLINE és friss lastSeenAt
   await prisma.device.update({
     where: { id: device.id },
     data: { online: true, lastSeenAt: new Date() },
   });
 
-  // Ugyanaz a determinisztikus logika, mint a KEY-es pollnál
   const dev = { id: device.id, tenantId: device.tenantId };
   const now = new Date();
 
@@ -327,12 +326,12 @@ export async function playerPollCommands(req: Request, res: Response) {
     return res.json({ ok: true, command: null });
   }
 
-  const updated = await prisma.deviceCommand.updateMany({
+  const updatedCount = await prisma.deviceCommand.updateMany({
     where: { id: queued.id, status: "QUEUED" },
     data: { status: "SENT", sentAt: now },
   });
 
-  if (updated.count === 0) {
+  if (updatedCount.count === 0) {
     return res.json({ ok: true, command: null });
   }
 
@@ -340,11 +339,6 @@ export async function playerPollCommands(req: Request, res: Response) {
   return res.json({ ok: true, command: fresh });
 }
 
-/**
- * PLAYER/JWT virtual device ack
- * POST /player/device/ack
- * Body: { clientId: string, commandId: string, ok: boolean, error?: string }
- */
 export async function playerAckCommand(req: Request, res: Response) {
   const user = req.user;
   if (!user) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
@@ -398,16 +392,6 @@ export async function playerAckCommand(req: Request, res: Response) {
       lastError: ok ? null : (typeof error === "string" ? error : "Player reported error"),
       error: ok ? null : (typeof error === "string" ? error : "Player reported error"),
     },
-    
-  });
-const updated = await prisma.deviceCommand.update({
-    where: { id: cmd.id },
-    data: {
-      status: ok ? "ACKED" : "FAILED",
-      ackedAt: new Date(),
-      lastError: ok ? null : (typeof error === "string" ? error : "Device reported error"),
-      error: ok ? null : (typeof error === "string" ? error : "Device reported error"),
-    },
   });
 
   // Ha sikeres ACK és van messageId, frissítjük a Message.playedAt-et
@@ -415,9 +399,9 @@ const updated = await prisma.deviceCommand.update({
     await prisma.message.update({
       where: { id: cmd.messageId },
       data: { playedAt: new Date() },
-    }).catch(() => { /* silent – nem kritikus */ });
+    }).catch(() => { /* silent */ });
   }
-  // heartbeat
+
   await prisma.device.update({
     where: { id: device.id },
     data: { online: true, lastSeenAt: new Date() },
