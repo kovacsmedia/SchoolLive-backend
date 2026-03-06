@@ -15,13 +15,13 @@ const DEFAULT_SOUNDS = ["jelzocsengo.mp3", "kibecsengo.mp3"];
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
-  destination: (_req: Express.Request, _file: Express.Multer.File, cb: (err: Error | null, dest: string) => void) => cb(null, AUDIO_DIR),
-  filename: (_req: Express.Request, file: Express.Multer.File, cb: (err: Error | null, name: string) => void) => cb(null, file.originalname),
+  destination: (_req, _file, cb) => cb(null, AUDIO_DIR),
+  filename: (_req, file, cb) => cb(null, file.originalname),
 });
 
 const upload = multer({
   storage,
-  fileFilter: (_req: Express.Request, file: Express.Multer.File, cb: multer.FileFilterCallback) => {
+  fileFilter: (_req, file, cb) => {
     if (file.mimetype === "audio/mpeg" || file.originalname.endsWith(".mp3")) {
       cb(null, true);
     } else {
@@ -32,12 +32,12 @@ const upload = multer({
 
 function tid(req: Request): string { return (req as any).user?.tenantId as string; }
 function uid(req: Request): string { return (req as any).user?.sub as string; }
-function role(req: Request): string { return (req as any).user?.role as string; }
+function userRole(req: Request): string { return (req as any).user?.role as string; }
 
 const ORG_ADMIN_ROLES = ["ORG_ADMIN", "TENANT_ADMIN", "SUPER_ADMIN"];
 
 function canEdit(req: Request, res: Response, next: NextFunction) {
-  if (!ORG_ADMIN_ROLES.includes(role(req))) {
+  if (!ORG_ADMIN_ROLES.includes(userRole(req))) {
     return res.status(403).json({ error: "Insufficient permissions" });
   }
   next();
@@ -83,9 +83,10 @@ bellsRouter.post("/templates", authJwt, canEdit, async (req: Request, res: Respo
 });
 
 bellsRouter.put("/templates/:id", authJwt, canEdit, async (req: Request, res: Response) => {
+  const templateId = req.params.id as string;
   const { name, bells } = req.body;
   const template = await prisma.bellScheduleTemplate.findFirst({
-    where: { id: req.params.id, tenantId: tid(req) },
+    where: { id: templateId, tenantId: tid(req) },
   });
   if (!template) return res.status(404).json({ error: "Not found" });
   if (template.isLocked) return res.status(403).json({ error: "Cannot modify locked template" });
@@ -110,8 +111,9 @@ bellsRouter.put("/templates/:id", authJwt, canEdit, async (req: Request, res: Re
 });
 
 bellsRouter.delete("/templates/:id", authJwt, canEdit, async (req: Request, res: Response) => {
+  const templateId = req.params.id as string;
   const template = await prisma.bellScheduleTemplate.findFirst({
-    where: { id: req.params.id, tenantId: tid(req) },
+    where: { id: templateId, tenantId: tid(req) },
   });
   if (!template) return res.status(404).json({ error: "Not found" });
   if (template.isLocked) return res.status(403).json({ error: "Cannot delete locked template" });
@@ -167,7 +169,7 @@ bellsRouter.post("/calendar/init", authJwt, canEdit, async (req: Request, res: R
 
 bellsRouter.put("/calendar/:date", authJwt, canEdit, async (req: Request, res: Response) => {
   const { isHoliday, templateId } = req.body;
-  const dateStr = Array.isArray(req.params.date) ? req.params.date[0] : req.params.date;
+  const dateStr = req.params.date as string;
   const date = new Date(dateStr);
 
   const day = await prisma.bellCalendarDay.upsert({
@@ -218,8 +220,9 @@ bellsRouter.post("/sounds", authJwt, canEdit, upload.single("file"), async (req:
 });
 
 bellsRouter.delete("/sounds/:id", authJwt, canEdit, async (req: Request, res: Response) => {
+  const soundId = req.params.id as string;
   const sound = await prisma.bellSoundFile.findFirst({
-    where: { id: req.params.id, tenantId: tid(req) },
+    where: { id: soundId, tenantId: tid(req) },
   });
   if (!sound) return res.status(404).json({ error: "Not found" });
   if (sound.isDefault) return res.status(403).json({ error: "Cannot delete default sound" });
@@ -291,7 +294,6 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
 
   if (calDay?.isHoliday) {
     isHoliday = true;
-    bells = [];
   } else if (calDay?.template) {
     bells = calDay.template.bells;
   } else {
