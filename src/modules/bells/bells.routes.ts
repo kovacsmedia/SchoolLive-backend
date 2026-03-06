@@ -30,8 +30,11 @@ const upload = multer({
   },
 });
 
-function tid(req: Request): string { return (req as any).user?.tenantId as string; }
-function uid(req: Request): string { return (req as any).user?.sub as string; }
+function tid(req: Request): string {
+  const fromHeader = req.headers["x-tenant-id"] as string;
+  if (fromHeader) return fromHeader;
+  return (req as any).user?.tenantId as string;
+}function uid(req: Request): string { return (req as any).user?.sub as string; }
 function userRole(req: Request): string { return (req as any).user?.role as string; }
 
 const ORG_ADMIN_ROLES = ["ORG_ADMIN", "TENANT_ADMIN", "SUPER_ADMIN"];
