@@ -40,7 +40,7 @@ jobs:
           script: |
             set -euo pipefail
             cd /opt/schoollive/backend
-
+            sudo chown -R deploy:deploy /opt/schoollive/backend || true
             echo "== Node version =="
             node -v || true
             npm -v || true
