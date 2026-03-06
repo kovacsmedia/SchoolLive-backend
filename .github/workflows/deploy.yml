@@ -88,4 +88,5 @@ jobs:
             fi
             echo "== PM2 save =="
             pm2 save
-
+            mkdir -p /opt/schoollive/backend/audio/bells
+            chmod 755 /opt/schoollive/backend/audio/bells

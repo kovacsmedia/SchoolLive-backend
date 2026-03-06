@@ -13,7 +13,8 @@ import { playerDeviceRouter } from "./modules/player/player.device.routes";
 import usersAdminRoutes from "./modules/users/users.admin.routes";
 import messagesRouter from "./modules/messages/messages.routes";
 export const app = express();
-
+import { bellsRouter } from "./modules/bells/bells.routes";
+import path from "path/win32";
 /**
  * CORS
  * Frontend domain: https://schoollive.hu
@@ -65,3 +66,5 @@ app.use("/provision", devicesProvisionRouter);
 // ✅ web-player mint eszköz
 app.use("/player/device", playerDeviceRouter);
 //end
+app.use("/bells", bellsRouter);
+app.use("/audio/bells", express.static(path.join(process.cwd(), "audio", "bells")));
