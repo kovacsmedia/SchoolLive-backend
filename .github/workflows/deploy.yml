@@ -49,12 +49,8 @@ jobs:
             pm2 start dist/server.js --name schoollive-api
             fi
             echo "== Install deps =="
-            if [ -f "package-lock.json" ]; then
-              npm ci
-            else
-              npm install
-            fi
-
+            npm install
+          
             # .env betöltése a szerveren (rsync nem írja felül)
             # Prisma migrate/generate-hez kellhet DATABASE_URL stb.
             if [ -f ".env" ]; then
