@@ -64,7 +64,10 @@ model Tenant {
   directorEmail  String?
   eduId          String?  // oktatási azonosító
   messageTemplates MessageTemplate[]
-
+  bellTemplates    BellScheduleTemplate[]
+  bellCalendar     BellCalendarDay[]
+  bellSoundFiles   BellSoundFile[]
+  bellScheduleLock BellScheduleLock?
   orgUnits  OrganizationalUnit[]
   users     User[]
   devices   Device[]
@@ -103,7 +106,7 @@ model User {
   passwordHash String
   role         UserRole
   isActive     Boolean  @default(true)
-
+  bellScheduleLock BellScheduleLock?
   // 2FA (TOTP)
   twoFactorEnabled Boolean  @default(false)
   twoFactorSecret  String?
@@ -304,4 +307,75 @@ model PendingDevice {
   lastSeenAt      DateTime @default(now())
 
   @@index([lastSeenAt])
+}
+enum BellType {
+  MAIN   // Fő csengetés
+  SIGNAL // Jelző csengetés
+}
+
+model BellScheduleTemplate {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  isDefault Boolean  @default(false)  // az alap 2 sablon
+  isLocked  Boolean  @default(false)  // nem törölhető
+  createdAt DateTime @default(now())
+
+  tenant Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  bells  BellEntry[]
+
+  @@index([tenantId])
+  @@unique([tenantId, name])
+}
+
+model BellEntry {
+  id         String   @id @default(uuid())
+  templateId String
+  hour       Int
+  minute     Int
+  type       BellType
+  soundFile  String   // pl. "jelzocsengo.mp3" vagy feltöltött fájlnév
+
+  template BellScheduleTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([templateId])
+}
+
+model BellCalendarDay {
+  id         String   @id @default(uuid())
+  tenantId   String
+  date       DateTime @db.Date
+  isHoliday  Boolean  @default(false)   // szünnap (nincs csengetés)
+  templateId String?                    // ha null, normál rend
+
+  tenant   Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  template BellScheduleTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId])
+  @@index([tenantId, date])
+  @@unique([tenantId, date])
+}
+
+model BellSoundFile {
+  id        String   @id @default(uuid())
+  tenantId  String
+  filename  String
+  sizeBytes Int
+  isDefault Boolean  @default(false)  // jelzocsengo.mp3, kibecsengo.mp3
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@unique([tenantId, filename])
+}
+
+model BellScheduleLock {
+  id        String   @id @default(uuid())
+  tenantId  String   @unique
+  userId    String
+  lockedAt  DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
