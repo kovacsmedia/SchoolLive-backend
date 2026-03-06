@@ -94,9 +94,15 @@ router.post("/templates", authJwt, requireTenant, async (req: Request, res: Resp
       return res.status(400).json({ error: "name and text are required" });
     }
 
-    const template = await prisma.messageTemplate.create({
-      data: { tenantId: tid, userId: uid, name, text, voice },
-    });
+     const template = await prisma.messageTemplate.create({
+      data: {
+        name,
+        text,
+        voice,
+        tenant: { connect: { id: tid } },
+        user:   { connect: { id: uid } },
+     },
+});
 
     return res.status(201).json({ ok: true, template });
   } catch (err) {
