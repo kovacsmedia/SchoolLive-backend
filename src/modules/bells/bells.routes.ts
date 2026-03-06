@@ -3,7 +3,7 @@ import multer from "multer";
 import path from "path";
 import fs from "fs";
 import axios from "axios";
-import { prisma } from "../../prisma";
+import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
 
 export const bellsRouter = Router();
@@ -167,7 +167,8 @@ bellsRouter.post("/calendar/init", authJwt, canEdit, async (req: Request, res: R
 
 bellsRouter.put("/calendar/:date", authJwt, canEdit, async (req: Request, res: Response) => {
   const { isHoliday, templateId } = req.body;
-  const date = new Date(req.params.date);
+  const dateStr = Array.isArray(req.params.date) ? req.params.date[0] : req.params.date;
+  const date = new Date(dateStr);
 
   const day = await prisma.bellCalendarDay.upsert({
     where: { tenantId_date: { tenantId: tid(req), date } },
