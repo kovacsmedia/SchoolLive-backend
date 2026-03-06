@@ -317,12 +317,13 @@ model BellScheduleTemplate {
   id        String   @id @default(uuid())
   tenantId  String
   name      String
-  isDefault Boolean  @default(false)  // az alap 2 sablon
-  isLocked  Boolean  @default(false)  // nem törölhető
+  isDefault Boolean  @default(false)
+  isLocked  Boolean  @default(false)
   createdAt DateTime @default(now())
 
-  tenant Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  bells  BellEntry[]
+  tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  bells        BellEntry[]
+  calendarDays BellCalendarDay[] // ← ÚJ
 
   @@index([tenantId])
   @@unique([tenantId, name])
@@ -373,7 +374,7 @@ model BellSoundFile {
 model BellScheduleLock {
   id        String   @id @default(uuid())
   tenantId  String   @unique
-  userId    String
+  userId    String   @unique  // ← ÚJ
   lockedAt  DateTime @default(now())
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
