@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import axios from "axios";
 import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
@@ -34,7 +35,8 @@ function tid(req: Request): string {
   const fromHeader = req.headers["x-tenant-id"] as string;
   if (fromHeader) return fromHeader;
   return (req as any).user?.tenantId as string;
-}function uid(req: Request): string { return (req as any).user?.sub as string; }
+}
+function uid(req: Request): string { return (req as any).user?.sub as string; }
 function userRole(req: Request): string { return (req as any).user?.role as string; }
 
 const ORG_ADMIN_ROLES = ["ORG_ADMIN", "TENANT_ADMIN", "SUPER_ADMIN"];
@@ -44,6 +46,68 @@ function canEdit(req: Request, res: Response, next: NextFunction) {
     return res.status(403).json({ error: "Insufficient permissions" });
   }
   next();
+}
+
+// Determinisztikus verzióstring generálás a schedule tartalmából
+function makeVersion(scope: string, bells: any[]): string {
+  const raw = `${scope}:${bells.map(b => `${b.hour}:${b.minute}:${b.type}:${b.soundFile}`).join(",")}`;
+  return crypto.createHash("md5").update(raw).digest("hex").slice(0, 12);
+}
+
+// Eszközhitelesítés újrafelhasználható helper
+async function authenticateDevice(req: Request): Promise<any | null> {
+  const deviceKey = req.headers["x-device-key"] as string;
+  if (!deviceKey) return null;
+
+  const bcrypt = await import("bcrypt");
+  const devices = await prisma.device.findMany({ where: { authType: "KEY" } });
+  for (const d of devices) {
+    if (d.deviceKeyHash && await bcrypt.compare(deviceKey, d.deviceKeyHash)) {
+      return d;
+    }
+  }
+  return null;
+}
+
+// Napi schedule összeállítása (calDay + default template logika)
+async function resolveTodayBells(tenantId: string, today: Date): Promise<{
+  bells: any[];
+  defaultBells: any[];
+  isHoliday: boolean;
+  todayVersion: string;
+  defaultVersion: string;
+}> {
+  const dateStr = today.toISOString().split("T")[0];
+
+  const calDay = await prisma.bellCalendarDay.findUnique({
+    where: { tenantId_date: { tenantId, date: today } },
+    include: { template: { include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } } } },
+  });
+
+  const defaultTemplate = await prisma.bellScheduleTemplate.findFirst({
+    where: { tenantId, isDefault: true },
+    include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
+  });
+
+  const defaultBells = defaultTemplate?.bells ?? [];
+  const defaultVersion = makeVersion("default", defaultBells);
+
+  let bells: any[] = [];
+  let isHoliday = false;
+
+  if (calDay?.isHoliday) {
+    isHoliday = true;
+  } else if (calDay?.template) {
+    bells = calDay.template.bells;
+  } else {
+    bells = defaultBells;
+  }
+
+  const todayVersion = isHoliday
+    ? `holiday:${dateStr}`
+    : makeVersion(dateStr, bells);
+
+  return { bells, defaultBells, isHoliday, todayVersion, defaultVersion };
 }
 
 // ─── Sablonok ──────────────────────────────────────────────────────────────
@@ -123,6 +187,36 @@ bellsRouter.delete("/templates/:id", authJwt, canEdit, async (req: Request, res:
 
   await prisma.bellScheduleTemplate.delete({ where: { id: template.id } });
   res.json({ ok: true });
+});
+
+// PUT /bells/templates/:id/set-default
+// Beállítja az adott sablont alapértelmezettként,
+// a többi sablon isDefault = false lesz (tranzakcióban).
+bellsRouter.put("/templates/:id/set-default", authJwt, canEdit, async (req: Request, res: Response) => {
+  const templateId = req.params.id as string;
+
+  const template = await prisma.bellScheduleTemplate.findFirst({
+    where: { id: templateId, tenantId: tid(req) },
+  });
+  if (!template) return res.status(404).json({ error: "Not found" });
+
+  await prisma.$transaction([
+    prisma.bellScheduleTemplate.updateMany({
+      where: { tenantId: tid(req) },
+      data: { isDefault: false },
+    }),
+    prisma.bellScheduleTemplate.update({
+      where: { id: templateId },
+      data: { isDefault: true },
+    }),
+  ]);
+
+  const updated = await prisma.bellScheduleTemplate.findUnique({
+    where: { id: templateId },
+    include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
+  });
+
+  res.json({ ok: true, template: updated });
 });
 
 // ─── Naptár ────────────────────────────────────────────────────────────────
@@ -263,55 +357,65 @@ bellsRouter.delete("/lock", authJwt, canEdit, async (req: Request, res: Response
   res.json({ ok: true });
 });
 
-// ─── Szinkronizáció eszköznek ──────────────────────────────────────────────
+// ─── Verzió lekérdezés (gyors, kis payload) ───────────────────────────────
+// GET /bells/version
+// Az eszköz percenként hívja – csak a verzióstringeket adja vissza,
+// nem tölti le a teljes schedule-t. Ha a verzió változott, hívja a /sync-et.
 
-bellsRouter.get("/sync", async (req: Request, res: Response) => {
-  const deviceKey = req.headers["x-device-key"] as string;
-  if (!deviceKey) return res.status(401).json({ error: "Missing device key" });
-
-  const bcrypt = await import("bcrypt");
-  const devices = await prisma.device.findMany({ where: { authType: "KEY" } });
-  let device: any = null;
-  for (const d of devices) {
-    if (d.deviceKeyHash && await bcrypt.compare(deviceKey, d.deviceKeyHash)) {
-      device = d; break;
-    }
-  }
-  if (!device) return res.status(401).json({ error: "Invalid device key" });
+bellsRouter.get("/version", async (req: Request, res: Response) => {
+  const device = await authenticateDevice(req);
+  if (!device) return res.status(401).json({ error: "Invalid or missing device key" });
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  const calDay = await prisma.bellCalendarDay.findUnique({
-    where: { tenantId_date: { tenantId: device.tenantId, date: today } },
-    include: { template: { include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } } } },
+  const { isHoliday, todayVersion, defaultVersion } =
+    await resolveTodayBells(device.tenantId, today);
+
+  res.json({ ok: true, todayVersion, defaultVersion, isHoliday });
+});
+
+// ─── Teljes szinkronizáció eszköznek ──────────────────────────────────────
+// GET /bells/sync
+// Az eszköz csak akkor hívja, ha a /version-tól kapott verzió eltér
+// az NVS-ben tárolt verziótól.
+
+bellsRouter.get("/sync", async (req: Request, res: Response) => {
+  const device = await authenticateDevice(req);
+  if (!device) return res.status(401).json({ error: "Invalid or missing device key" });
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  const { bells, defaultBells, isHoliday, todayVersion, defaultVersion } =
+    await resolveTodayBells(device.tenantId, today);
+
+  const sounds = await prisma.bellSoundFile.findMany({
+    where: { tenantId: device.tenantId },
   });
-
-  const defaultTemplate = await prisma.bellScheduleTemplate.findFirst({
-    where: { tenantId: device.tenantId, isDefault: true, name: "Normál csengetési rend" },
-    include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
-  });
-
-  let bells: any[] = [];
-  let isHoliday = false;
-
-  if (calDay?.isHoliday) {
-    isHoliday = true;
-  } else if (calDay?.template) {
-    bells = calDay.template.bells;
-  } else {
-    bells = defaultTemplate?.bells || [];
-  }
-
-  const sounds = await prisma.bellSoundFile.findMany({ where: { tenantId: device.tenantId } });
 
   res.json({
     ok: true,
     isHoliday,
-    bells: bells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
+    todayVersion,
+    defaultVersion,
+    // Mai napi schedule (üres ha szünnap)
+    bells: bells.map((b: any) => ({
+      hour:      b.hour,
+      minute:    b.minute,
+      type:      b.type,
+      soundFile: b.soundFile,
+    })),
+    // Az iskola default csengetési rendje – eszköz NVS-be menti offline fallbackként
+    defaultBells: defaultBells.map((b: any) => ({
+      hour:      b.hour,
+      minute:    b.minute,
+      type:      b.type,
+      soundFile: b.soundFile,
+    })),
     sounds: sounds.map((s: any) => ({
-      filename: s.filename,
-      url: `/audio/bells/${s.filename}`,
+      filename:  s.filename,
+      url:       `/audio/bells/${s.filename}`,
       sizeBytes: s.sizeBytes,
     })),
     updatedAt: new Date().toISOString(),
