@@ -50,6 +50,12 @@ enum CommandStatus {
   FAILED
 }
 
+enum RadioScheduleStatus {
+  PENDING
+  DISPATCHED
+  CANCELLED
+}
+
 model Tenant {
   id        String   @id @default(uuid())
   name      String
@@ -57,12 +63,11 @@ model Tenant {
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
 
-  // ✅ ÚJ mezők
   address        String?
   directorName   String?
   directorPhone  String?
   directorEmail  String?
-  eduId          String?  // oktatási azonosító
+  eduId          String?
   messageTemplates MessageTemplate[]
   bellTemplates    BellScheduleTemplate[]
   bellCalendar     BellCalendarDay[]
@@ -74,6 +79,8 @@ model Tenant {
   groups    DeviceGroup[]
   messages  Message[]
   commands  DeviceCommand[]
+  radioFiles     RadioFile[]
+  radioSchedules RadioSchedule[]
 
   @@index([isActive])
 }
@@ -98,7 +105,7 @@ model OrganizationalUnit {
 
 model User {
   id        String   @id @default(uuid())
-  tenantId  String?  // SUPER_ADMIN esetén lehet null
+  tenantId  String?
   orgUnitId String?
   messageTemplates MessageTemplate[]
   email        String   @unique
@@ -107,11 +114,9 @@ model User {
   role         UserRole
   isActive     Boolean  @default(true)
   bellScheduleLock BellScheduleLock?
-  // 2FA (TOTP)
   twoFactorEnabled Boolean  @default(false)
   twoFactorSecret  String?
 
-  // Trusted device (a superadmin "eszközhöz kötése")
   trustedDeviceHash  String?
   trustedDeviceSetAt DateTime?
 
@@ -122,9 +127,10 @@ model User {
   orgUnit  OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
 
   messages Message[] @relation("CreatedBy")
-
-  // ✅ web-player “device”-ok (JWT authType)
   devices  Device[]
+
+  radioFiles     RadioFile[]     @relation("RadioFileCreatedBy")
+  radioSchedules RadioSchedule[] @relation("RadioScheduleCreatedBy")
 
   @@index([tenantId])
   @@index([role])
@@ -137,29 +143,25 @@ model Device {
   orgUnitId     String?
 
   serialNumber    String? @unique
-  installCodeHash String? // bcrypt hash, mint a deviceKeyHash
+  installCodeHash String?
 
   name String
 
-  // ✅ AUTH:
   authType     DeviceAuthType @default(KEY)
-  deviceKeyHash String?       // KEY esetén kötelezően kitöltjük alkalmazás-logikával
+  deviceKeyHash String?
 
-  // ✅ JWT-es “virtual device” támogatás
   clientId String?
   userId   String?
 
   firmwareVersion String?
   ipAddress       String?
 
-  // állapot
   lastSeenAt DateTime?
   online     Boolean  @default(false)
 
-  volume Int     @default(5)  // 0..10
+  volume Int     @default(5)
   muted  Boolean @default(false)
 
-  // bővíthető státusz
   statusPayload Json?
 
   createdAt DateTime @default(now())
@@ -167,8 +169,6 @@ model Device {
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   orgUnit OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
-
-  // ✅ JWT-es device tulajdonosa (PLAYER user)
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   groupMembers     DeviceGroupMember[]
@@ -213,11 +213,11 @@ model Message {
   tenantId    String
   type        MessageType
   title       String?
-  text        String?     // TTS szöveg
-  fileUrl     String?     // generált MP3 URL
-  voice       String?     // anna / berta / imre
+  text        String?
+  fileUrl     String?
+  voice       String?
   scheduledAt DateTime?
-  playedAt    DateTime?   // mikor játszódott le ténylegesen
+  playedAt    DateTime?
 
   targetType TargetType
   targetId   String?
@@ -292,7 +292,6 @@ model DeviceProvisionSession {
   expiresAt    DateTime
   createdAt    DateTime @default(now())
 
-  // ÚJ: egyszer kiadható deviceKey (plaintext, törlődik lekérés után)
   pendingDeviceKey String?
 
   device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
@@ -311,9 +310,10 @@ model PendingDevice {
 
   @@index([lastSeenAt])
 }
+
 enum BellType {
-  MAIN   // Fő csengetés
-  SIGNAL // Jelző csengetés
+  MAIN
+  SIGNAL
 }
 
 model BellScheduleTemplate {
@@ -326,7 +326,7 @@ model BellScheduleTemplate {
 
   tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   bells        BellEntry[]
-  calendarDays BellCalendarDay[] // ← ÚJ
+  calendarDays BellCalendarDay[]
 
   @@index([tenantId])
   @@unique([tenantId, name])
@@ -338,7 +338,7 @@ model BellEntry {
   hour       Int
   minute     Int
   type       BellType
-  soundFile  String   // pl. "jelzocsengo.mp3" vagy feltöltött fájlnév
+  soundFile  String
 
   template BellScheduleTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
 
@@ -349,8 +349,8 @@ model BellCalendarDay {
   id         String   @id @default(uuid())
   tenantId   String
   date       DateTime @db.Date
-  isHoliday  Boolean  @default(false)   // szünnap (nincs csengetés)
-  templateId String?                    // ha null, normál rend
+  isHoliday  Boolean  @default(false)
+  templateId String?
 
   tenant   Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   template BellScheduleTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
@@ -365,7 +365,7 @@ model BellSoundFile {
   tenantId  String
   filename  String
   sizeBytes Int
-  isDefault Boolean  @default(false)  // jelzocsengo.mp3, kibecsengo.mp3
+  isDefault Boolean  @default(false)
   createdAt DateTime @default(now())
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -377,9 +377,50 @@ model BellSoundFile {
 model BellScheduleLock {
   id        String   @id @default(uuid())
   tenantId  String   @unique
-  userId    String   @unique  // ← ÚJ
+  userId    String   @unique
   lockedAt  DateTime @default(now())
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model RadioFile {
+  id           String   @id @default(uuid())
+  tenantId     String
+  filename     String
+  originalName String
+  sizeBytes    Int
+  durationSec  Int?
+  fileUrl      String
+  createdById  String
+  createdAt    DateTime @default(now())
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy User            @relation("RadioFileCreatedBy", fields: [createdById], references: [id])
+  schedules RadioSchedule[]
+
+  @@unique([tenantId, filename])
+  @@index([tenantId])
+  @@index([tenantId, createdAt])
+}
+
+model RadioSchedule {
+  id           String              @id @default(uuid())
+  tenantId     String
+  radioFileId  String
+  targetType   TargetType
+  targetId     String?
+  scheduledAt  DateTime
+  status       RadioScheduleStatus @default(PENDING)
+  dispatchedAt DateTime?
+  createdById  String
+  createdAt    DateTime            @default(now())
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  radioFile RadioFile @relation(fields: [radioFileId], references: [id], onDelete: Cascade)
+  createdBy User      @relation("RadioScheduleCreatedBy", fields: [createdById], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, scheduledAt])
+  @@index([status, scheduledAt])
 }
