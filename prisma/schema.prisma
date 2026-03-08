@@ -307,6 +307,11 @@ model PendingDevice {
   firmwareVersion String?
   firstSeenAt     DateTime @default(now())
   lastSeenAt      DateTime @default(now())
+  
+  // ÚJ: WebPlayer-specifikus mezők
+  clientId  String?  @unique  // localStorage UUID
+  userId    String?  @unique  // PLAYER user ID (1 user = 1 pending max)
+  userAgent String?            // böngésző azonosítás
 
   @@index([lastSeenAt])
 }
