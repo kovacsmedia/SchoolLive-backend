@@ -222,6 +222,41 @@ router.get("/:id", authJwt, requireTenant, async (req: Request, res: Response) =
 });
 
 // ─────────────────────────────────────────
+// DELETE /messages/:id
+// Csak SUPER_ADMIN és TENANT_ADMIN törölhet.
+// ─────────────────────────────────────────
+router.delete("/:id", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const tid  = tenantId(req);
+    const user = (req as any).user;
+    const id   = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+    if (user?.role !== "SUPER_ADMIN" && user?.role !== "TENANT_ADMIN") {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const message = await prisma.message.findFirst({
+      where: { id, tenantId: tid },
+      select: { id: true },
+    });
+
+    if (!message) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    // A kapcsolódó DeviceCommand-ok CASCADE-del törlődnek (schema: onDelete: Cascade nincs,
+    // ezért explicit töröljük előbb hogy ne legyen FK constraint hiba)
+    await prisma.deviceCommand.deleteMany({ where: { messageId: id } });
+    await prisma.message.delete({ where: { id } });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to delete message" });
+  }
+});
+
+// ─────────────────────────────────────────
 // Segédfüggvény: eszköz ID-k feloldása
 // ─────────────────────────────────────────
 async function resolveDeviceIds(
