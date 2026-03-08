@@ -282,6 +282,9 @@ model DeviceProvisionSession {
   tokenHash String   @unique
   deviceId  String
   tenantId  String?
+  wifiHidden   Boolean @default(false)
+  wifiSecurity String  @default("WPA2_PERSONAL")
+  wifiUser     String  @default("")
 
   name         String
   wifiSsid     String
