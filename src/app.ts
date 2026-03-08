@@ -12,6 +12,7 @@ import usersAdminRoutes from "./modules/users/users.admin.routes";
 import messagesRouter from "./modules/messages/messages.routes";
 import tenantsAdminRouter from "./modules/tenants/tenants.admin.routes";
 import { bellsRouter } from "./modules/bells/bells.routes";
+import radioRoutes from "./modules/radio/radio.routes";
 
 export const app = express();
 
@@ -33,6 +34,9 @@ app.options("*", cors(corsOptions));
 
 app.use(express.json());
 
+// Nagy fájlok feltöltéséhez (radio MP3, max 200MB)
+app.use(express.urlencoded({ extended: true, limit: "200mb" }));
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.use("/admin/tenants", tenantsAdminRouter);
@@ -41,10 +45,12 @@ app.use("/devices", devicesRouter);
 app.use("/messages", messagesRouter);
 app.use("/audio/bells", express.static(path.join(process.cwd(), "audio", "bells")));
 app.use("/audio", express.static("/opt/schoollive/backend/audio"));
+app.use("/uploads/radio", express.static(path.join(process.cwd(), "uploads", "radio")));
 app.use("/admin/commands", adminCommandsRouter);
 app.use("/admin/devices", deviceAdminRoutes);
 app.use("/admin/users", usersAdminRoutes);
 app.use("/provision", devicesProvisionRouter);
 app.use("/player/device", playerDeviceRouter);
 app.use("/bells", bellsRouter);
+app.use("/radio", radioRoutes);
 //end
