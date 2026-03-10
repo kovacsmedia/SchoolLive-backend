@@ -104,7 +104,7 @@ async function processTenant(
       arr.slice(0, 500).forEach((k) => _dispatched.delete(k));
     }
 
-    const audioUrl = `/audio/bells/${bell.soundFile}`;
+    const audioUrl = `${process.env.API_BASE_URL}/audio/bells/${bell.soundFile}`;
 
     await prisma.deviceCommand.createMany({
       data: vpDevices.map((dev) => ({
