@@ -24,7 +24,7 @@ jobs:
       - name: Upload backend to server (rsync)
         uses: burnett01/rsync-deployments@7.0.1
         with:
-          switches: -avzr --delete --exclude='.git' --exclude='node_modules' --exclude='.env'
+          switches: -avzr --delete --exclude='.git' --exclude='node_modules' --exclude='.env' --exclude='dist' --exclude='uploads' --exclude='audio'
           path: ./
           remote_path: /opt/schoollive/backend
           remote_host: ${{ secrets.DEPLOY_HOST }}
@@ -40,26 +40,22 @@ jobs:
           script: |
             set -euo pipefail
             cd /opt/schoollive/backend
+
             echo "== Node version =="
             node -v || true
             npm -v || true
-            if pm2 describe schoollive-api >/dev/null 2>&1; then
-            pm2 reload schoollive-api
-            else
-            pm2 start dist/server.js --name schoollive-api
-            fi
+
             echo "== Install deps =="
             npm install
-          
-            # .env betöltése a szerveren (rsync nem írja felül)
-            # Prisma migrate/generate-hez kellhet DATABASE_URL stb.
+
+            # .env betöltése
             if [ -f ".env" ]; then
               echo "== Loading .env =="
               set -a
               . ./.env
               set +a
             else
-              echo "WARNING: .env not found on server! Prisma may fail if DATABASE_URL is missing."
+              echo "WARNING: .env not found on server!"
             fi
 
             echo "== Prisma generate =="
@@ -68,20 +64,21 @@ jobs:
             echo "== Prisma migrate deploy =="
             npx prisma migrate deploy
 
-            echo "== Build (optional) =="
-            npm run -s build
-            
-            echo "== Create audio dir =="
-            mkdir -p /opt/schoollive/backend/audio
-            chmod 755 /opt/schoollive/backend/audio
-            
-            echo "== PM2 start/reload =="
-            if pm2 describe schoollive-api >/dev/null 2>&1; then
-            pm2 reload schoollive-api
-            else
-            pm2 start dist/server.js --name schoollive-api
-            fi
-            echo "== PM2 save =="
-            pm2 save
+            echo "== Build =="
+            npm run build
+
+            echo "== Create audio/upload dirs =="
             mkdir -p /opt/schoollive/backend/audio/bells
             chmod 755 /opt/schoollive/backend/audio/bells
+            mkdir -p /opt/schoollive/backend/uploads/radio
+            chmod 755 /opt/schoollive/backend/uploads/radio
+
+            echo "== PM2 start/reload =="
+            if pm2 describe schoollive-api >/dev/null 2>&1; then
+              pm2 reload schoollive-api
+            else
+              pm2 start dist/server.js --name schoollive-api
+            fi
+
+            echo "== PM2 save =="
+            pm2 save
