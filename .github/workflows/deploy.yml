@@ -24,7 +24,7 @@ jobs:
       - name: Upload backend to server (rsync)
         uses: burnett01/rsync-deployments@7.0.1
         with:
-          switches: -avzr --delete --exclude='.git' --exclude='node_modules' --exclude='.env' --exclude='dist' --exclude='uploads' --exclude='audio'
+          switches: -avzr --delete --ignore-errors --exclude='.git' --exclude='node_modules' --exclude='.env' --exclude='dist' --exclude='uploads' --exclude='audio'
           path: ./
           remote_path: /opt/schoollive/backend
           remote_host: ${{ secrets.DEPLOY_HOST }}
