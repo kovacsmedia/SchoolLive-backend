@@ -11,6 +11,17 @@
 
 import { prisma } from "../../prisma/client";
 
+/** UTC-éjféli Date objektum az aktuális helyi (Europe/Budapest) naptári napra */
+function todayInBudapest(): Date {
+  const now = new Date();
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Budapest",
+    year: "numeric", month: "2-digit", day: "2-digit"
+  });
+  const [year, month, day] = fmt.format(now).split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
 const TICK_INTERVAL_MS  = 60_000;  // percenként ellenőrzés
 const DISPATCH_WINDOW_S = 30;      // ±30 másodperces ablak
 
@@ -20,11 +31,16 @@ const _dispatched = new Set<string>();
 
 async function tick() {
   const now     = new Date();
-  const todayMidnight = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+  const todayMidnight = todayInBudapest();
 
-  const hour   = now.getHours();
-  const minute = now.getMinutes();
-  const sec    = now.getSeconds();
+  // Magyar helyi idő alapján döntjük el, melyik csengetést kell indítani
+  const budapestTime = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Budapest",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  }).format(now).split(":").map(Number);
+  const hour   = budapestTime[0];
+  const minute = budapestTime[1];
+  const sec    = budapestTime[2];
 
   // Csak ha az időpercen belüli ablakban vagyunk (0–30s)
   if (sec > DISPATCH_WINDOW_S) return;
