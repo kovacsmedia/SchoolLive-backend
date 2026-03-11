@@ -405,8 +405,8 @@ bellsRouter.get("/version", async (req: Request, res: Response) => {
   const device = await authenticateDevice(req);
   if (!device) return res.status(401).json({ error: "Invalid or missing device key" });
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const _n = new Date();
+  const today = new Date(Date.UTC(_n.getFullYear(), _n.getMonth(), _n.getDate()));
 
   const { isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(device.tenantId, today);
