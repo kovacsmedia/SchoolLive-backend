@@ -5,5 +5,5 @@ import { authJwt } from "../../middleware/authJwt";
 export const authRouter = Router();
 
 authRouter.post("/login",  postLogin);
-authRouter.post("/logout", authJwt, postLogout);
+authRouter.post("/logout", postLogout); // token bodyból vagy headerből
 authRouter.get("/me",      authJwt, getMeHandler);
