@@ -195,57 +195,68 @@ router.delete("/:id", authJwt, async (req, res) => {
     // ── Hard delete – teljes cascade tranzakcióban ──────────────────────────
     console.log(`[DELETE TENANT] Starting cascade delete for tenant ${id} (${existing.name})`);
 
+    // ── Helper: biztonságos törlés – szinkron TypeError-t is elnyeli ──────────
+    async function safeDelete(fn: () => Promise<any>) {
+      try { await fn(); } catch { /* modell nem létezik vagy nincs adat – OK */ }
+    }
+
     await prisma.$transaction(async (tx) => {
 
       // 1. DeviceCommand-ok törlése (Message-ekhez kapcsolva)
-      await tx.deviceCommand.deleteMany({
+      await safeDelete(() => tx.deviceCommand.deleteMany({
         where: { message: { tenantId: id } },
-      });
+      }));
 
       // 2. Üzenetek törlése
-      await tx.message.deleteMany({ where: { tenantId: id } });
+      await safeDelete(() => tx.message.deleteMany({ where: { tenantId: id } }));
 
       // 3. RadioSchedule törlése
-      await (tx as any).radioSchedule.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await safeDelete(() => (tx as any).radioSchedule.deleteMany({ where: { tenantId: id } }));
 
       // 4. RadioFile törlése
-      await (tx as any).radioFile.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await safeDelete(() => (tx as any).radioFile.deleteMany({ where: { tenantId: id } }));
 
-      // 5. DeviceCommand-ok törlése (Device-ekhez kapcsolva, ha van ilyen)
-      const devices = await (tx as any).device.findMany({
-        where: { tenantId: id },
-        select: { id: true },
-      }).catch(() => []);
-      const deviceIds = devices.map((d: any) => d.id);
-      if (deviceIds.length > 0) {
-        await tx.deviceCommand.deleteMany({
-          where: { deviceId: { in: deviceIds } },
+      // 5. DeviceCommand-ok törlése (Device-ekhez kapcsolva)
+      let deviceIds: string[] = [];
+      try {
+        const devices = await (tx as any).device.findMany({
+          where: { tenantId: id },
+          select: { id: true },
         });
+        deviceIds = devices.map((d: any) => d.id);
+      } catch {}
+      if (deviceIds.length > 0) {
+        await safeDelete(() => tx.deviceCommand.deleteMany({
+          where: { deviceId: { in: deviceIds } },
+        }));
       }
 
       // 6. Device-ok törlése
-      await (tx as any).device.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await safeDelete(() => (tx as any).device.deleteMany({ where: { tenantId: id } }));
 
       // 7. PendingDevice törlése
-      await (tx as any).pendingDevice.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await safeDelete(() => (tx as any).pendingDevice.deleteMany({ where: { tenantId: id } }));
 
       // 8. BellCalendarDay törlése
-      await (tx as any).bellCalendarDay.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await safeDelete(() => (tx as any).bellCalendarDay.deleteMany({ where: { tenantId: id } }));
 
       // 9. BellScheduleEntry törlése (template-ekhez kapcsolva)
-      const templates = await (tx as any).bellScheduleTemplate.findMany({
-        where: { tenantId: id },
-        select: { id: true },
-      }).catch(() => []);
-      const templateIds = templates.map((t: any) => t.id);
+      let templateIds: string[] = [];
+      try {
+        const templates = await (tx as any).bellScheduleTemplate.findMany({
+          where: { tenantId: id },
+          select: { id: true },
+        });
+        templateIds = templates.map((t: any) => t.id);
+      } catch {}
       if (templateIds.length > 0) {
-        await (tx as any).bellScheduleEntry.deleteMany({
+        await safeDelete(() => (tx as any).bellScheduleEntry.deleteMany({
           where: { templateId: { in: templateIds } },
-        }).catch(() => {});
+        }));
       }
 
       // 10. BellScheduleTemplate törlése
-      await (tx as any).bellScheduleTemplate.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await safeDelete(() => (tx as any).bellScheduleTemplate.deleteMany({ where: { tenantId: id } }));
 
       // 11. Userek törlése
       await tx.user.deleteMany({ where: { tenantId: id } });
@@ -254,7 +265,7 @@ router.delete("/:id", authJwt, async (req, res) => {
       await tx.tenant.delete({ where: { id } });
 
     }, {
-      timeout: 30_000, // nagy tenant esetén lehet lassabb
+      timeout: 30_000,
     });
 
     console.log(`[DELETE TENANT] Cascade delete complete for tenant ${id}`);
