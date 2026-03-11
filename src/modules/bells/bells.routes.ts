@@ -9,6 +9,17 @@ import { authJwt } from "../../middleware/authJwt";
 
 export const bellsRouter = Router();
 
+/** UTC-éjféli Date objektum az aktuális helyi (Europe/Budapest) naptári napra */
+function todayInBudapest(): Date {
+  const now = new Date();
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Budapest",
+    year: "numeric", month: "2-digit", day: "2-digit"
+  });
+  const [year, month, day] = fmt.format(now).split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
 const AUDIO_DIR = path.join(process.cwd(), "audio", "bells");
 const MAX_TOTAL_BYTES = 500 * 1024;
 const DEFAULT_SOUNDS = ["jelzocsengo.mp3", "kibecsengo.mp3"];
@@ -405,8 +416,7 @@ bellsRouter.get("/version", async (req: Request, res: Response) => {
   const device = await authenticateDevice(req);
   if (!device) return res.status(401).json({ error: "Invalid or missing device key" });
 
-  const _n = new Date();
-  const today = new Date(Date.UTC(_n.getFullYear(), _n.getMonth(), _n.getDate()));
+  const today = todayInBudapest();
 
   const { isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(device.tenantId, today);
@@ -423,8 +433,7 @@ bellsRouter.get("/today", authJwt, async (req: Request, res: Response) => {
   if (!tenantId) return res.status(400).json({ error: "Tenant required" });
 
   // UTC alapú dátum – a DB is UTC-ben tárolja
-  const now = new Date();
-  const today = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+  const today = todayInBudapest();
 
   const { bells, isHoliday } = await resolveTodayBells(tenantId, today);
 
@@ -444,8 +453,7 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
   const device = await authenticateDevice(req);
   if (!device) return res.status(401).json({ error: "Invalid or missing device key" });
 
-  const now = new Date();
-  const today = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+  const today = todayInBudapest();
 
   const { bells, defaultBells, isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(device.tenantId, today);
