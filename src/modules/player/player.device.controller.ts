@@ -35,12 +35,39 @@ export async function registerPlayerDevice(req: Request, res: Response) {
     });
 
     if (existingDevice) {
-      // Frissítsük az IP-t és online státuszt
+      const loginTime = new Date();
+
+      // Lejárt/elmulasztott QUEUED parancsok törlése bejelentkezéskor
+      // Az összes QUEUED parancsot lekérjük és azokat töröljük, amik nem jövőbeliek
+      const pendingCmds = await prisma.deviceCommand.findMany({
+        where: { deviceId: existingDevice.id, status: "QUEUED" },
+        select: { id: true, payload: true, queuedAt: true },
+      });
+
+      const staleIds: string[] = [];
+      for (const cmd of pendingCmds) {
+        const p = cmd.payload as any;
+        const scheduledAt = p?.scheduledAt ? new Date(p.scheduledAt) : null;
+        // Megtartjuk: jövőbeli scheduledAt (még nem érkezett el az ideje)
+        if (scheduledAt && scheduledAt > loginTime) continue;
+        // Töröljük: azonnali vagy már elmúlt scheduledAt → a player lemaradt róluk
+        staleIds.push(cmd.id);
+      }
+
+      if (staleIds.length > 0) {
+        await prisma.deviceCommand.updateMany({
+          where: { id: { in: staleIds } },
+          data: { status: "CANCELLED" },
+        });
+        console.log(`[PLAYER] 🗑 ${staleIds.length} elmulasztott parancs törölve (device: ${existingDevice.id})`);
+      }
+
+      // Online státusz frissítése
       await prisma.device.update({
         where: { id: existingDevice.id },
         data: {
           ipAddress:  ipAddress ?? undefined,
-          lastSeenAt: new Date(),
+          lastSeenAt: loginTime,
           online:     true,
         },
       });
@@ -157,7 +184,34 @@ export async function pollPlayerCommands(req: Request, res: Response) {
     });
 
     const now = new Date();
-    const command = queued.find(cmd => {
+    const STALE_MS = 90_000; // 90 másodpercnél régebbi azonnali parancs → elavult
+
+    // Elavult parancsok azonosítása és törlése
+    const staleInPoll: string[] = [];
+    for (const cmd of queued) {
+      const p = cmd.payload as any;
+      const scheduledAt = p?.scheduledAt ? new Date(p.scheduledAt) : null;
+      if (scheduledAt) {
+        // Jövőbeli → OK; már elmúlt scheduledAt → elavult
+        if (scheduledAt > now) continue;
+        const overdueSec = (now.getTime() - scheduledAt.getTime()) / 1000;
+        if (overdueSec > 120) { staleInPoll.push(cmd.id); } // 2 percnél régebbi időzített
+      } else {
+        // Azonnali parancs: ha több mint 90mp-je vár → elavult
+        const ageSec = (now.getTime() - cmd.queuedAt.getTime()) / 1000;
+        if (ageSec > STALE_MS / 1000) { staleInPoll.push(cmd.id); }
+      }
+    }
+    if (staleInPoll.length > 0) {
+      await prisma.deviceCommand.updateMany({
+        where: { id: { in: staleInPoll } },
+        data: { status: "CANCELLED" },
+      });
+      console.log(`[PLAYER] ⏭ ${staleInPoll.length} elavult parancs törölve poll-ban`);
+    }
+
+    const freshQueued = queued.filter(cmd => !staleInPoll.includes(cmd.id));
+    const command = freshQueued.find(cmd => {
       const p = cmd.payload as any;
       if (!p?.scheduledAt) return true; // azonnali
       return new Date(p.scheduledAt) <= now;
