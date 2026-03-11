@@ -1,4 +1,0 @@
-ALTER TABLE "PendingDevice"
-  ADD COLUMN IF NOT EXISTS "clientId"  TEXT,
-  ADD COLUMN IF NOT EXISTS "userId"    TEXT,
-  ADD COLUMN IF NOT EXISTS "userAgent" TEXT;
