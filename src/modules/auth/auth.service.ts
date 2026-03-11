@@ -21,17 +21,22 @@ export async function login(email: string, password: string) {
   const userRole        = sessionRow[0]?.role ?? user.role;
 
   if (existingSession) {
-    // Inaktivitási küszöb: PLAYER → 30mp, minden más → 60mp
-    const inactivityMs  = userRole === "PLAYER" ? 30_000 : 60_000;
-    const lastSeenMs    = lastSeenAt ? Date.now() - new Date(lastSeenAt).getTime() : Infinity;
-    const isInactive    = lastSeenMs > inactivityMs;
+    // PLAYER szerepkör: sosem tiltjuk ki inaktivitás miatt – a VP folyamatosan fut
+    if (userRole === "PLAYER") {
+      console.log(`[AUTH] PLAYER re-login allowed (always permitted, no inactivity limit)`);
+      // session frissítése folytatódik lentebb
+    } else {
+      // Inaktivitási küszöb: 60mp
+      const inactivityMs = 60_000;
+      const lastSeenMs   = lastSeenAt ? Date.now() - new Date(lastSeenAt).getTime() : Infinity;
+      const isInactive   = lastSeenMs > inactivityMs;
 
-    if (!isInactive) {
-      // Aktív session létezik → nem engedjük be
-      return { error: "already_logged_in" } as const;
+      if (!isInactive) {
+        // Aktív session létezik → nem engedjük be
+        return { error: "already_logged_in" } as const;
+      }
+      console.log(`[AUTH] Session expired for user ${user.id} (inactive ${Math.round(lastSeenMs/1000)}s) → allowing re-login`);
     }
-    // Inaktív volt → régi session törlése, új bejelentkezés engedélyezése
-    console.log(`[AUTH] Session expired for user ${user.id} (inactive ${Math.round(lastSeenMs/1000)}s) → allowing re-login`);
   }
 
   // Új session ID generálása és mentése
