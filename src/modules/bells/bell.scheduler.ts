@@ -20,8 +20,7 @@ const _dispatched = new Set<string>();
 
 async function tick() {
   const now     = new Date();
-  const todayMidnight = new Date(now);
-  todayMidnight.setHours(0, 0, 0, 0);
+  const todayMidnight = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
 
   const hour   = now.getHours();
   const minute = now.getMinutes();
@@ -104,7 +103,7 @@ async function processTenant(
       arr.slice(0, 500).forEach((k) => _dispatched.delete(k));
     }
 
-    const audioUrl = `${process.env.API_BASE_URL}/audio/bells/${bell.soundFile}`;
+    const audioUrl = `/audio/bells/${bell.soundFile}`;
 
     await prisma.deviceCommand.createMany({
       data: vpDevices.map((dev) => ({
