@@ -17,8 +17,24 @@ export async function postLogin(req: Request, res: Response) {
 }
 
 export async function postLogout(req: Request, res: Response) {
-  if (!req.user) return res.status(401).json({ error: "Unauthenticated" });
-  await authService.logout(req.user.sub);
+  // sendBeacon nem tud Authorization headert küldeni,
+  // ezért a tokent body-ból is elfogadjuk
+  let userId = req.user?.sub;
+
+  if (!userId) {
+    const bodyToken = req.body?.token ?? req.body?.accessToken ?? "";
+    if (bodyToken) {
+      try {
+        const jwt = await import("jsonwebtoken");
+        const { env } = await import("../config/env");
+        const decoded = jwt.default.verify(bodyToken, env.JWT_ACCESS_SECRET) as any;
+        userId = decoded.sub;
+      } catch {}
+    }
+  }
+
+  if (!userId) return res.status(204).send(); // silent – ne blokkoljuk
+  await authService.logout(userId);
   res.status(204).send();
 }
 
