@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { env } from "../config/env";
 import { JwtPayload } from "../modules/auth/auth.types";
+import { prisma } from "../prisma/client";
 
 declare global {
   namespace Express {
@@ -21,6 +22,12 @@ export function authJwt(req: Request, res: Response, next: NextFunction) {
   try {
     const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET) as JwtPayload;
     req.user = decoded;
+
+    // lastSeenAt frissítése – fire and forget, nem blokkoljuk a kérést
+    prisma.$executeRaw`
+      UPDATE "User" SET "lastSeenAt" = NOW() WHERE id = ${decoded.sub}
+    `.catch(() => {});
+
     next();
   } catch {
     return res.status(401).json({ error: "Invalid token" });

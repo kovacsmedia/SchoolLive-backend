@@ -12,14 +12,26 @@ export async function login(email: string, password: string) {
   if (!ok) return null;
 
   // ── Single session ellenőrzés ────────────────────────────────────────────
-  // Raw SQL: Prisma schema nem tartalmazza az activeSessionId mezőt
-  const sessionRow = await prisma.$queryRaw<{ activeSessionId: string | null }[]>`
-    SELECT "activeSessionId" FROM "User" WHERE id = ${user.id}
+  // Raw SQL: Prisma schema nem tartalmazza az activeSessionId / lastSeenAt mezőket
+  const sessionRow = await prisma.$queryRaw<{ activeSessionId: string | null; lastSeenAt: Date | null; role: string }[]>`
+    SELECT "activeSessionId", "lastSeenAt", role FROM "User" WHERE id = ${user.id}
   `;
   const existingSession = sessionRow[0]?.activeSessionId ?? null;
+  const lastSeenAt      = sessionRow[0]?.lastSeenAt ?? null;
+  const userRole        = sessionRow[0]?.role ?? user.role;
 
   if (existingSession) {
-    return { error: "already_logged_in" } as const;
+    // Inaktivitási küszöb: PLAYER → 30mp, minden más → 60mp
+    const inactivityMs  = userRole === "PLAYER" ? 30_000 : 60_000;
+    const lastSeenMs    = lastSeenAt ? Date.now() - new Date(lastSeenAt).getTime() : Infinity;
+    const isInactive    = lastSeenMs > inactivityMs;
+
+    if (!isInactive) {
+      // Aktív session létezik → nem engedjük be
+      return { error: "already_logged_in" } as const;
+    }
+    // Inaktív volt → régi session törlése, új bejelentkezés engedélyezése
+    console.log(`[AUTH] Session expired for user ${user.id} (inactive ${Math.round(lastSeenMs/1000)}s) → allowing re-login`);
   }
 
   // Új session ID generálása és mentése
