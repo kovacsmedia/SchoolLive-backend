@@ -300,7 +300,7 @@ router.patch("/groups/:id", authJwt, requireTenant, async (req, res) => {
     if (!user?.tenantId) return res.status(400).json({ error: "Tenant required" });
     const { name, deviceIds } = req.body ?? {};
     const existing = await prisma.deviceGroup.findFirst({
-      where: { id: req.params.id, tenantId: user.tenantId },
+      where: { id: String(req.params.id), tenantId: user.tenantId },
     });
     if (!existing) return res.status(404).json({ error: "Not found" });
 
@@ -339,7 +339,7 @@ router.delete("/groups/:id", authJwt, requireTenant, async (req, res) => {
     const user = (req as any).user as JwtUser;
     if (!user?.tenantId) return res.status(400).json({ error: "Tenant required" });
     const existing = await prisma.deviceGroup.findFirst({
-      where: { id: req.params.id, tenantId: user.tenantId },
+      where: { id: String(req.params.id), tenantId: user.tenantId },
     });
     if (!existing) return res.status(404).json({ error: "Not found" });
     await prisma.deviceGroup.delete({ where: { id: existing.id } });
