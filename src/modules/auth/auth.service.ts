@@ -12,19 +12,21 @@ export async function login(email: string, password: string) {
   if (!ok) return null;
 
   // ── Single session ellenőrzés ────────────────────────────────────────────
-  // Ha már van aktív session ID, visszautasítjuk a bejelentkezést
-  if ((user as any).activeSessionId) {
+  // Raw SQL: Prisma schema nem tartalmazza az activeSessionId mezőt
+  const sessionRow = await prisma.$queryRaw<{ activeSessionId: string | null }[]>`
+    SELECT "activeSessionId" FROM "User" WHERE id = ${user.id}
+  `;
+  const existingSession = sessionRow[0]?.activeSessionId ?? null;
+
+  if (existingSession) {
     return { error: "already_logged_in" } as const;
   }
 
-  // Új session ID generálása
+  // Új session ID generálása és mentése
   const sessionId = crypto.randomUUID();
-
-  // Session ID mentése a userhez
-  await prisma.user.update({
-    where: { id: user.id },
-    data: { activeSessionId: sessionId } as any,
-  });
+  await prisma.$executeRaw`
+    UPDATE "User" SET "activeSessionId" = ${sessionId} WHERE id = ${user.id}
+  `;
 
   const payload: JwtPayload = {
     sub:      user.id,
@@ -46,10 +48,9 @@ export async function login(email: string, password: string) {
 }
 
 export async function logout(userId: string) {
-  await prisma.user.update({
-    where: { id: userId },
-    data: { activeSessionId: null } as any,
-  });
+  await prisma.$executeRaw`
+    UPDATE "User" SET "activeSessionId" = NULL WHERE id = ${userId}
+  `;
 }
 
 export async function getMe(userId: string) {
