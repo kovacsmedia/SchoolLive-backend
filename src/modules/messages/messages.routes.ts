@@ -181,8 +181,10 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
           messageId: message.id,
           status:    "QUEUED",
           payload: {
-            action:      "PLAY_URL",
+            action:      "TTS",
             url:         fileUrl,
+            text:        text.trim(),
+            title:       text.trim().substring(0, 64),
             scheduledAt: scheduledTime?.toISOString() ?? null,
           },
         })),
