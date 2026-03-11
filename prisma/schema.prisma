@@ -309,6 +309,9 @@ model PendingDevice {
   firmwareVersion String?
   firstSeenAt     DateTime @default(now())
   lastSeenAt      DateTime @default(now())
+  clientId        String?
+  userId          String?
+  userAgent       String?
 
   @@index([lastSeenAt])
 }
