@@ -1,6 +1,5 @@
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import { v4 as uuidv4 } from "uuid";
 import { prisma } from "../../prisma/client";
 import { env } from "../../config/env";
 import { JwtPayload } from "./auth.types";
@@ -19,7 +18,7 @@ export async function login(email: string, password: string) {
   }
 
   // Új session ID generálása
-  const sessionId = uuidv4();
+  const sessionId = crypto.randomUUID();
 
   // Session ID mentése a userhez
   await prisma.user.update({
