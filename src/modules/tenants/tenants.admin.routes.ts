@@ -158,8 +158,13 @@ router.patch("/:id", authJwt, async (req, res) => {
 /**
  * DELETE /admin/tenants/:id
  *
- * ?permanent=true → hard delete (cascade: DeviceCommand, Message, Device, PendingDevice, User, RadioFile, RadioSchedule, BellScheduleTemplate stb.)
- * alapértelmezett  → soft delete (isActive=false)
+ * ?permanent=true → hard delete cascade sorrendben:
+ *   DeviceCommand → Message → RadioSchedule → RadioFile →
+ *   DeviceCommand (device-hoz) → Device → PendingDevice →
+ *   BellCalendarDay → BellScheduleEntry → BellScheduleTemplate →
+ *   User → Tenant
+ *
+ * alapértelmezett → soft delete (isActive=false)
  */
 router.delete("/:id", authJwt, async (req, res) => {
   try {
@@ -169,7 +174,10 @@ router.delete("/:id", authJwt, async (req, res) => {
     const id = (Array.isArray(req.params.id) ? req.params.id[0] : req.params.id)?.trim();
     if (!id) return res.status(400).json({ error: "id is required" });
 
-    const existing = await prisma.tenant.findUnique({ where: { id }, select: { id: true } });
+    const existing = await prisma.tenant.findUnique({
+      where: { id },
+      select: { id: true, name: true },
+    });
     if (!existing) return res.status(404).json({ error: "Tenant not found" });
 
     const permanent = req.query.permanent === "true";
@@ -177,37 +185,86 @@ router.delete("/:id", authJwt, async (req, res) => {
     if (!permanent) {
       // Soft delete
       await prisma.tenant.update({ where: { id }, data: { isActive: false } });
+      // Userek session-jeit is töröljük
+      await prisma.$executeRaw`
+        UPDATE "User" SET "activeSessionId" = NULL WHERE "tenantId" = ${id}
+      `.catch(() => {});
       return res.json({ ok: true, deleted: false, deactivated: true });
     }
 
-    // Hard delete – cascade sorrendben tranzakcióban
+    // ── Hard delete – teljes cascade tranzakcióban ──────────────────────────
+    console.log(`[DELETE TENANT] Starting cascade delete for tenant ${id} (${existing.name})`);
+
     await prisma.$transaction(async (tx) => {
-      // 1. DeviceCommand-ok (Message-eken keresztül)
-      await tx.deviceCommand.deleteMany({ where: { message: { tenantId: id } } });
-      // 2. Üzenetek
+
+      // 1. DeviceCommand-ok törlése (Message-ekhez kapcsolva)
+      await tx.deviceCommand.deleteMany({
+        where: { message: { tenantId: id } },
+      });
+
+      // 2. Üzenetek törlése
       await tx.message.deleteMany({ where: { tenantId: id } });
-      // 3. Radio schedules + files
+
+      // 3. RadioSchedule törlése
       await (tx as any).radioSchedule.deleteMany({ where: { tenantId: id } }).catch(() => {});
+
+      // 4. RadioFile törlése
       await (tx as any).radioFile.deleteMany({ where: { tenantId: id } }).catch(() => {});
-      // 4. Bell templates + calendar days + bells
-      await (tx as any).bellCalendarDay.deleteMany({ where: { tenantId: id } }).catch(() => {});
-      await (tx as any).bell.deleteMany({ where: { template: { tenantId: id } } }).catch(() => {});
-      await (tx as any).bellScheduleTemplate.deleteMany({ where: { tenantId: id } }).catch(() => {});
-      // 5. Pending devices + devices
-      await (tx as any).pendingDevice.deleteMany({ where: { tenantId: id } }).catch(() => {});
+
+      // 5. DeviceCommand-ok törlése (Device-ekhez kapcsolva, ha van ilyen)
+      const devices = await (tx as any).device.findMany({
+        where: { tenantId: id },
+        select: { id: true },
+      }).catch(() => []);
+      const deviceIds = devices.map((d: any) => d.id);
+      if (deviceIds.length > 0) {
+        await tx.deviceCommand.deleteMany({
+          where: { deviceId: { in: deviceIds } },
+        });
+      }
+
+      // 6. Device-ok törlése
       await (tx as any).device.deleteMany({ where: { tenantId: id } }).catch(() => {});
-      // 6. Users
+
+      // 7. PendingDevice törlése
+      await (tx as any).pendingDevice.deleteMany({ where: { tenantId: id } }).catch(() => {});
+
+      // 8. BellCalendarDay törlése
+      await (tx as any).bellCalendarDay.deleteMany({ where: { tenantId: id } }).catch(() => {});
+
+      // 9. BellScheduleEntry törlése (template-ekhez kapcsolva)
+      const templates = await (tx as any).bellScheduleTemplate.findMany({
+        where: { tenantId: id },
+        select: { id: true },
+      }).catch(() => []);
+      const templateIds = templates.map((t: any) => t.id);
+      if (templateIds.length > 0) {
+        await (tx as any).bellScheduleEntry.deleteMany({
+          where: { templateId: { in: templateIds } },
+        }).catch(() => {});
+      }
+
+      // 10. BellScheduleTemplate törlése
+      await (tx as any).bellScheduleTemplate.deleteMany({ where: { tenantId: id } }).catch(() => {});
+
+      // 11. Userek törlése
       await tx.user.deleteMany({ where: { tenantId: id } });
-      // 7. Maga a tenant
+
+      // 12. Maga a Tenant
       await tx.tenant.delete({ where: { id } });
+
+    }, {
+      timeout: 30_000, // nagy tenant esetén lehet lassabb
     });
 
+    console.log(`[DELETE TENANT] Cascade delete complete for tenant ${id}`);
     return res.json({ ok: true, deleted: true });
+
   } catch (err: any) {
     console.error("[DELETE TENANT]", err);
     if (err?.code === "P2003" || err?.code === "P2014") {
       return res.status(409).json({
-        error: "Az intézményhez kapcsolódó adatok miatt nem törölhető. Előbb deaktiváld.",
+        error: "Kapcsolódó adatok miatt nem törölhető. Próbáld újra, vagy keresd fel a fejlesztőt.",
       });
     }
     return res.status(500).json({ error: "Failed to delete tenant" });
