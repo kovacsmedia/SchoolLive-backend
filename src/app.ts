@@ -53,4 +53,46 @@ app.use("/provision", devicesProvisionRouter);
 app.use("/player/device", playerDeviceRouter);
 app.use("/bells", bellsRouter);
 app.use("/radio", radioRoutes);
+app.use("/bells", bellsRouter);
+app.use("/radio", radioRoutes);
+
+// ── /bells/today – VP csengetési rend ──
+import { authJwt } from "./middleware/authJwt";
+import { requireTenant } from "./middleware/tenant";
+import prisma from "./prisma";
+
+app.get("/bells/today", authJwt, requireTenant, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const calDay = await (prisma as any).bellCalendarDay.findUnique({
+      where: { tenantId_date: { tenantId, date: today } },
+      include: { template: { include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } } } },
+    }).catch(() => null);
+
+    if (calDay?.isHoliday) return res.json({ ok: true, bells: [], isHoliday: true });
+
+    let bells: any[] = [];
+    if (calDay?.template?.bells?.length) {
+      bells = calDay.template.bells;
+    } else {
+      const def = await (prisma as any).bellScheduleTemplate.findFirst({
+        where: { tenantId, isDefault: true },
+        include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
+      }).catch(() => null);
+      bells = def?.bells ?? [];
+    }
+
+    return res.json({
+      ok: true,
+      isHoliday: false,
+      bells: bells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
+    });
+  } catch (err) {
+    console.error("/bells/today error:", err);
+    return res.status(500).json({ error: "Failed to fetch today bells" });
+  }
+});
 //end
