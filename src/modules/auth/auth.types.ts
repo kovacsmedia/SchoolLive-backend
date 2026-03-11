@@ -1,5 +1,6 @@
-export type JwtPayload = {
-  sub: string;          // userId
-  role: string;
-  tenantId: string | null;
-};
+export interface JwtPayload {
+  sub:        string;
+  role:       string;
+  tenantId:   string | null;
+  sessionId?: string;
+}
