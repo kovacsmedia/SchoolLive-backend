@@ -149,11 +149,19 @@ export async function pollPlayerCommands(req: Request, res: Response) {
       data: { online: true, lastSeenAt: new Date() },
     });
 
-    // Következő QUEUED parancs lekérése
-    const command = await prisma.deviceCommand.findFirst({
+    // Következő QUEUED parancs lekérése – scheduledAt-et tiszteljük
+    const queued = await prisma.deviceCommand.findMany({
       where: { deviceId: device.id, status: "QUEUED" },
       orderBy: { queuedAt: "asc" },
+      take: 20,
     });
+
+    const now = new Date();
+    const command = queued.find(cmd => {
+      const p = cmd.payload as any;
+      if (!p?.scheduledAt) return true; // azonnali
+      return new Date(p.scheduledAt) <= now;
+    }) ?? null;
 
     if (command) {
       await prisma.deviceCommand.update({

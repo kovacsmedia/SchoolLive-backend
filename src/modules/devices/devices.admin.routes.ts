@@ -253,4 +253,98 @@ router.delete("/:id", authJwt, requireTenant, async (req, res) => {
   }
 });
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ESZKÖZ CSOPORTOK
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /admin/devices/groups
+router.get("/groups", authJwt, requireTenant, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!user?.tenantId) return res.status(400).json({ error: "Tenant required" });
+    const groups = await prisma.deviceGroup.findMany({
+      where: { tenantId: user.tenantId },
+      include: { members: { select: { deviceId: true } } },
+      orderBy: { name: "asc" },
+    });
+    return res.json({ ok: true, groups: groups.map(g => ({
+      id: g.id, name: g.name, createdAt: g.createdAt,
+      deviceIds: g.members.map(m => m.deviceId),
+    }))});
+  } catch (err) { console.error(err); return res.status(500).json({ error: "Failed" }); }
+});
+
+// POST /admin/devices/groups
+router.post("/groups", authJwt, requireTenant, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!user?.tenantId) return res.status(400).json({ error: "Tenant required" });
+    const { name } = req.body ?? {};
+    if (!name?.trim()) return res.status(400).json({ error: "name is required" });
+    const group = await prisma.deviceGroup.create({
+      data: { tenantId: user.tenantId, name: name.trim() },
+      include: { members: { select: { deviceId: true } } },
+    });
+    return res.status(201).json({ ok: true, group: { id: group.id, name: group.name, deviceIds: [] } });
+  } catch (err: any) {
+    if (err?.code === "P2002") return res.status(409).json({ error: "Ilyen nevű csoport már létezik" });
+    console.error(err); return res.status(500).json({ error: "Failed" });
+  }
+});
+
+// PATCH /admin/devices/groups/:id
+router.patch("/groups/:id", authJwt, requireTenant, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!user?.tenantId) return res.status(400).json({ error: "Tenant required" });
+    const { name, deviceIds } = req.body ?? {};
+    const existing = await prisma.deviceGroup.findFirst({
+      where: { id: req.params.id, tenantId: user.tenantId },
+    });
+    if (!existing) return res.status(404).json({ error: "Not found" });
+
+    await prisma.$transaction(async (tx) => {
+      if (name?.trim()) {
+        await tx.deviceGroup.update({ where: { id: existing.id }, data: { name: name.trim() } });
+      }
+      if (Array.isArray(deviceIds)) {
+        await tx.deviceGroupMember.deleteMany({ where: { groupId: existing.id } });
+        if (deviceIds.length > 0) {
+          await tx.deviceGroupMember.createMany({
+            data: deviceIds.map((deviceId: string) => ({ groupId: existing.id, deviceId })),
+            skipDuplicates: true,
+          });
+        }
+      }
+    });
+
+    const updated = await prisma.deviceGroup.findFirst({
+      where: { id: existing.id },
+      include: { members: { select: { deviceId: true } } },
+    });
+    return res.json({ ok: true, group: {
+      id: updated!.id, name: updated!.name,
+      deviceIds: updated!.members.map(m => m.deviceId),
+    }});
+  } catch (err: any) {
+    if (err?.code === "P2002") return res.status(409).json({ error: "Ilyen nevű csoport már létezik" });
+    console.error(err); return res.status(500).json({ error: "Failed" });
+  }
+});
+
+// DELETE /admin/devices/groups/:id
+router.delete("/groups/:id", authJwt, requireTenant, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!user?.tenantId) return res.status(400).json({ error: "Tenant required" });
+    const existing = await prisma.deviceGroup.findFirst({
+      where: { id: req.params.id, tenantId: user.tenantId },
+    });
+    if (!existing) return res.status(404).json({ error: "Not found" });
+    await prisma.deviceGroup.delete({ where: { id: existing.id } });
+    return res.json({ ok: true });
+  } catch (err) { console.error(err); return res.status(500).json({ error: "Failed" }); }
+});
+
 export default router;

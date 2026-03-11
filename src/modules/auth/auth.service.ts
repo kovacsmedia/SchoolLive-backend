@@ -11,6 +11,13 @@ export async function login(email: string, password: string) {
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return null;
 
+  // Intézmény neve a tokenbe (AppShell megjelenítéshez)
+  let tenantName: string | null = null;
+  if (user.tenantId) {
+    const tenant = await prisma.tenant.findUnique({ where: { id: user.tenantId }, select: { name: true } });
+    tenantName = tenant?.name ?? null;
+  }
+
   // ── Single session ellenőrzés ────────────────────────────────────────────
   // Raw SQL: Prisma schema nem tartalmazza az activeSessionId / lastSeenAt mezőket
   const sessionRow = await prisma.$queryRaw<{ activeSessionId: string | null; lastSeenAt: Date | null; role: string }[]>`
@@ -46,9 +53,10 @@ export async function login(email: string, password: string) {
   `;
 
   const payload: JwtPayload = {
-    sub:      user.id,
-    role:     user.role,
-    tenantId: user.tenantId ?? null,
+    sub:        user.id,
+    role:       user.role,
+    tenantId:   user.tenantId ?? null,
+    tenantName: tenantName,
     sessionId,
   };
 
