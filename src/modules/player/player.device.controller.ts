@@ -2,7 +2,6 @@
 
 import { Request, Response } from "express";
 import { prisma } from "../../prisma/client";
-import { CommandStatus } from "@prisma/client";
 
 type JwtUser = { sub?: string; role?: string; tenantId?: string | null };
 
@@ -56,9 +55,8 @@ export async function registerPlayerDevice(req: Request, res: Response) {
       }
 
       if (staleIds.length > 0) {
-        await prisma.deviceCommand.updateMany({
+        await prisma.deviceCommand.deleteMany({
           where: { id: { in: staleIds } },
-          data: { status: CommandStatus.CANCELLED },
         });
         console.log(`[PLAYER] 🗑 ${staleIds.length} elmulasztott parancs törölve (device: ${existingDevice.id})`);
       }
@@ -204,9 +202,8 @@ export async function pollPlayerCommands(req: Request, res: Response) {
       }
     }
     if (staleInPoll.length > 0) {
-      await prisma.deviceCommand.updateMany({
+      await prisma.deviceCommand.deleteMany({
         where: { id: { in: staleInPoll } },
-        data: { status: CommandStatus.CANCELLED },
       });
       console.log(`[PLAYER] ⏭ ${staleInPoll.length} elavult parancs törölve poll-ban`);
     }
