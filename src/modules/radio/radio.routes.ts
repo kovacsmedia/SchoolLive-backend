@@ -2,6 +2,7 @@
 
 import { Router, Request, Response } from "express";
 import { spawn as _spawn } from "child_process";
+import { spawn as _spawn } from "child_process";
 import { prisma } from "../../prisma/client";
 import { authJwt } from "../../middleware/authJwt";
 import { requireTenant } from "../../middleware/tenant";
@@ -645,3 +646,113 @@ async function buildYoutubePlaylist(
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VÉSZLEÁLLÍTÓ + NOW PLAYING
+// ═══════════════════════════════════════════════════════════════════════════
+
+// POST /radio/stop-all
+// Minden VP eszközre (authType: JWT) STOP_PLAYBACK parancsot küld.
+router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+
+    const vpDevices = await prisma.device.findMany({
+      where: { tenantId: tid(req), authType: "JWT" },
+      select: { id: true },
+    });
+
+    if (vpDevices.length === 0) {
+      return res.json({ ok: true, sent: 0 });
+    }
+
+    await prisma.deviceCommand.createMany({
+      data: vpDevices.map(d => ({
+        tenantId: tid(req),
+        deviceId: d.id,
+        status:   "QUEUED",
+        payload:  { action: "STOP_PLAYBACK" },
+      })),
+    });
+
+    console.log(`[RADIO] STOP_PLAYBACK sent to ${vpDevices.length} VP device(s)`);
+    return res.json({ ok: true, sent: vpDevices.length });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to stop playback" });
+  }
+});
+
+// GET /radio/now-playing
+// Visszaadja az összes VP eszköz utolsó SENT/ACKED PLAY_URL/TTS parancsát
+// (azaz amit éppen játszanak – heurisztika: legutóbbi dispatched command).
+router.get("/now-playing", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const vpDevices = await prisma.device.findMany({
+      where:  { tenantId: tid(req), authType: "JWT" },
+      select: { id: true, name: true, online: true, lastSeenAt: true },
+    });
+
+    if (vpDevices.length === 0) {
+      return res.json({ ok: true, nowPlaying: null, devices: [] });
+    }
+
+    const deviceIds = vpDevices.map(d => d.id);
+
+    // Legutóbbi PLAY_URL vagy TTS parancs (SENT vagy ACKED), ami az utóbbi 6 órában volt
+    const since = new Date(Date.now() - 6 * 60 * 60 * 1000);
+    const cmd = await prisma.deviceCommand.findFirst({
+      where: {
+        deviceId: { in: deviceIds },
+        status:   { in: ["SENT", "ACKED"] },
+        queuedAt: { gte: since },
+        payload:  { path: ["action"], array_contains: undefined } as any,
+      },
+      orderBy: { queuedAt: "desc" },
+    });
+
+    // Payload action szűrés JS-ben (JSON path query nem mindenhol megbízható)
+    let nowPlaying: { name: string; durationSec: number | null; queuedAt: string } | null = null;
+
+    if (cmd) {
+      const payload = cmd.payload as any;
+      if (payload?.action === "PLAY_URL" || payload?.action === "TTS") {
+        // Megkeressük a RadioFile-t ha van messageId vagy payload.url alapján
+        let name: string = payload?.title ?? payload?.url?.split("/").pop() ?? "Ismeretlen";
+        let durationSec: number | null = null;
+
+        if (cmd.messageId) {
+          const msg = await prisma.message.findUnique({
+            where:  { id: cmd.messageId },
+            select: { title: true },
+          });
+          if (msg?.title) name = msg.title;
+        } else if (payload?.url) {
+          // URL-ből próbáljuk megtalálni a RadioFile-t
+          const filename = payload.url.split("/").pop()?.split("?")[0] ?? "";
+          if (filename) {
+            const rf = await prisma.radioFile.findFirst({
+              where:  { tenantId: tid(req), filename },
+              select: { originalName: true, durationSec: true },
+            });
+            if (rf) {
+              name = rf.originalName;
+              durationSec = rf.durationSec;
+            }
+          }
+        }
+
+        nowPlaying = {
+          name,
+          durationSec,
+          queuedAt: cmd.queuedAt.toISOString(),
+        };
+      }
+    }
+
+    return res.json({ ok: true, nowPlaying });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to fetch now playing" });
+  }
+});
