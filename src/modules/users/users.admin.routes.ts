@@ -40,7 +40,7 @@ function getParamId(req: any): string | null {
   return null;
 }
 
-// ✅ ÚJ: egységes “név” parse (body.name vagy body.displayName → DB.displayName)
+// ✅ egységes "név" parse (body.name vagy body.displayName → DB.displayName)
 function parseDisplayName(raw: unknown): string | null | undefined {
   // undefined = nincs a payloadban (nem módosítjuk)
   // null = explicit törlés
@@ -54,7 +54,7 @@ function parseDisplayName(raw: unknown): string | null | undefined {
   return undefined;
 }
 
-// ✅ ÚJ: API kompatibilitás (a frontendnek legyen name is)
+// ✅ API kompatibilitás (a frontendnek legyen name is)
 function withNameAlias<T extends { displayName?: any }>(u: T) {
   return { ...u, name: (u as any).displayName ?? null };
 }
@@ -83,7 +83,6 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
       select: {
         id: true,
         email: true,
-        // ✅ ÚJ: név (DB mező)
         displayName: true,
         role: true,
         tenantId: true,
@@ -95,7 +94,6 @@ router.get("/", authJwt, requireTenant, async (req, res) => {
       orderBy: [{ role: "asc" }, { email: "asc" }],
     });
 
-    // ✅ ÚJ: válaszban legyen "name" is (alias)
     const mapped = users.map(withNameAlias);
 
     return res.json({ ok: true, users: mapped });
@@ -172,8 +170,6 @@ router.get("/:id/messages", authJwt, requireTenant, async (req, res) => {
 
     function aggregateStatus(commandStatuses: Array<{ status: string }>): string {
       if (!commandStatuses || commandStatuses.length === 0) return "-";
-      // Pick the "worst"/most informative status by rank:
-      // FAILED > ACKED > SENT > QUEUED
       let best = "-";
       for (const cs of commandStatuses) {
         const s = cs.status ?? "-";
@@ -210,9 +206,9 @@ router.get("/:id/messages", authJwt, requireTenant, async (req, res) => {
  *   password: string,
  *   role: "TENANT_ADMIN" | "ORG_ADMIN" | "TEACHER" | "OPERATOR" | "PLAYER",
  *   isActive?: boolean,
- *   orgUnitId?: string | null
- *   ✅ + name?: string | null
- *   ✅ + displayName?: string | null
+ *   orgUnitId?: string | null,
+ *   name?: string | null,
+ *   displayName?: string | null
  * }
  */
 router.post("/", authJwt, requireTenant, async (req, res) => {
@@ -233,7 +229,6 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       role?: unknown;
       isActive?: unknown;
       orgUnitId?: unknown;
-      // ✅ ÚJ:
       name?: unknown;
       displayName?: unknown;
     };
@@ -254,7 +249,6 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       parsedOrgUnitId = orgUnitId.trim() ? orgUnitId.trim() : null;
     }
 
-    // ✅ ÚJ: név feldolgozása (name vagy displayName)
     const parsedDisplayName =
       typeof displayName !== "undefined" ? parseDisplayName(displayName) : parseDisplayName(name);
 
@@ -273,7 +267,6 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       select: {
         id: true,
         email: true,
-        // ✅ ÚJ:
         displayName: true,
         role: true,
         tenantId: true,
@@ -284,7 +277,6 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
       },
     });
 
-    // ✅ ÚJ: alias
     return res.status(201).json({ ok: true, user: withNameAlias(created) });
   } catch (err: any) {
     if (err?.code === "P2002") {
@@ -305,9 +297,9 @@ router.post("/", authJwt, requireTenant, async (req, res) => {
  *   role?: tenant role,
  *   isActive?: boolean,
  *   password?: string,
- *   orgUnitId?: string | null
- *   ✅ name?: string | null
- *   ✅ displayName?: string | null
+ *   orgUnitId?: string | null,
+ *   name?: string | null,
+ *   displayName?: string | null
  * }
  */
 router.patch("/:id", authJwt, requireTenant, async (req, res) => {
@@ -340,7 +332,6 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       isActive?: unknown;
       password?: unknown;
       orgUnitId?: unknown;
-      // ✅ ÚJ:
       name?: unknown;
       displayName?: unknown;
     };
@@ -377,8 +368,6 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       else return res.status(400).json({ error: "orgUnitId must be string or null" });
     }
 
-    // ✅ ÚJ: displayName kezelése (name/displayName → DB.displayName)
-    // Ha bármelyik mezőt elküldik, beállítjuk.
     const parsedDisplayName =
       typeof displayName !== "undefined" ? parseDisplayName(displayName) : parseDisplayName(name);
     if (typeof parsedDisplayName !== "undefined") {
@@ -395,7 +384,6 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       select: {
         id: true,
         email: true,
-        // ✅ ÚJ:
         displayName: true,
         role: true,
         tenantId: true,
@@ -419,7 +407,10 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
 /**
  * DELETE /admin/users/:id
  *
- * Biztonságos tenant-szintű törlés: soft delete (isActive=false).
+ * ?permanent=true → valódi hard delete (cascade: DeviceCommand, Message, Device userId nullázás)
+ * alapértelmezett  → soft delete (isActive=false)
+ *
+ * SUPER_ADMIN nem törölhető.
  */
 router.delete("/:id", authJwt, requireTenant, async (req, res) => {
   try {
@@ -438,21 +429,61 @@ router.delete("/:id", authJwt, requireTenant, async (req, res) => {
 
     const existing = await prisma.user.findFirst({
       where: { id, tenantId: actor.tenantId },
-      select: { id: true },
+      select: { id: true, role: true },
     });
 
     if (!existing) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    await prisma.user.update({
-      where: { id },
-      data: { isActive: false },
+    // SUPER_ADMIN-t nem lehet törölni
+    if ((existing as any).role === "SUPER_ADMIN") {
+      return res.status(403).json({ error: "Cannot delete SUPER_ADMIN" });
+    }
+
+    const permanent = req.query.permanent === "true";
+
+    if (!permanent) {
+      // Soft delete – isActive=false, session törlése
+      await prisma.user.update({
+        where: { id },
+        data: { isActive: false },
+      });
+      // Session törlése hogy ne tudjon visszajelentkezni
+      await prisma.$executeRaw`
+        UPDATE "User" SET "activeSessionId" = NULL WHERE id = ${id}
+      `.catch(() => {});
+      return res.json({ ok: true, deleted: false, deactivated: true });
+    }
+
+    // Hard delete – cascade sorrendben tranzakcióban
+    await prisma.$transaction(async (tx) => {
+      // 1. DeviceCommand-ok törlése a user üzeneteihez
+      await tx.deviceCommand.deleteMany({
+        where: { message: { createdById: id } },
+      });
+      // 2. Üzenetek törlése
+      await tx.message.deleteMany({ where: { createdById: id } });
+      // 3. PendingDevice törlése ha van (catch: ha nem létezik a tábla/mező)
+      await (tx as any).pendingDevice.deleteMany({ where: { userId: id } }).catch(() => {});
+      // 4. Device-ok userId mezőjének nullázása (fizikai eszközt nem töröljük)
+      await (tx as any).device.updateMany({
+        where: { userId: id },
+        data: { userId: null },
+      }).catch(() => {});
+      // 5. Maga a user
+      await tx.user.delete({ where: { id } });
     });
 
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
+    return res.json({ ok: true, deleted: true });
+  } catch (err: any) {
+    console.error("[DELETE USER]", err);
+    // Idegen kulcs constraint hiba – még van kapcsolódó adat
+    if (err?.code === "P2003" || err?.code === "P2014") {
+      return res.status(409).json({
+        error: "A felhasználóhoz kapcsolódó adatok miatt nem törölhető. Előbb deaktiváld.",
+      });
+    }
     return res.status(500).json({ error: "Failed to delete user" });
   }
 });
