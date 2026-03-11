@@ -35,7 +35,6 @@ const SELECT = {
 
 /**
  * GET /admin/tenants
- * Lista – már létezett az app.ts-ben, azt kiváltja ez a router
  */
 router.get("/", authJwt, async (req, res) => {
   try {
@@ -56,7 +55,6 @@ router.get("/", authJwt, async (req, res) => {
 
 /**
  * POST /admin/tenants
- * Új tenant létrehozása
  */
 router.post("/", authJwt, async (req, res) => {
   try {
@@ -96,14 +94,14 @@ router.post("/", authJwt, async (req, res) => {
 
 /**
  * PATCH /admin/tenants/:id
- * Tenant módosítása
  */
 router.patch("/:id", authJwt, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
     if (!requireSuperAdmin(user, res)) return;
 
-    const id = (Array.isArray(req.params.id) ? req.params.id[0] : req.params.id)?.trim();    if (!id) return res.status(400).json({ error: "id is required" });
+    const id = (Array.isArray(req.params.id) ? req.params.id[0] : req.params.id)?.trim();
+    if (!id) return res.status(400).json({ error: "id is required" });
 
     const existing = await prisma.tenant.findUnique({ where: { id }, select: { id: true } });
     if (!existing) return res.status(404).json({ error: "Tenant not found" });
@@ -159,24 +157,60 @@ router.patch("/:id", authJwt, async (req, res) => {
 
 /**
  * DELETE /admin/tenants/:id
- * Soft delete: isActive = false
+ *
+ * ?permanent=true → hard delete (cascade: DeviceCommand, Message, Device, PendingDevice, User, RadioFile, RadioSchedule, BellScheduleTemplate stb.)
+ * alapértelmezett  → soft delete (isActive=false)
  */
 router.delete("/:id", authJwt, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
     if (!requireSuperAdmin(user, res)) return;
 
-    const id = (Array.isArray(req.params.id) ? req.params.id[0] : req.params.id)?.trim();    if (!id) return res.status(400).json({ error: "id is required" });
+    const id = (Array.isArray(req.params.id) ? req.params.id[0] : req.params.id)?.trim();
+    if (!id) return res.status(400).json({ error: "id is required" });
 
     const existing = await prisma.tenant.findUnique({ where: { id }, select: { id: true } });
     if (!existing) return res.status(404).json({ error: "Tenant not found" });
 
-    await prisma.tenant.update({ where: { id }, data: { isActive: false } });
+    const permanent = req.query.permanent === "true";
 
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Failed to deactivate tenant" });
+    if (!permanent) {
+      // Soft delete
+      await prisma.tenant.update({ where: { id }, data: { isActive: false } });
+      return res.json({ ok: true, deleted: false, deactivated: true });
+    }
+
+    // Hard delete – cascade sorrendben tranzakcióban
+    await prisma.$transaction(async (tx) => {
+      // 1. DeviceCommand-ok (Message-eken keresztül)
+      await tx.deviceCommand.deleteMany({ where: { message: { tenantId: id } } });
+      // 2. Üzenetek
+      await tx.message.deleteMany({ where: { tenantId: id } });
+      // 3. Radio schedules + files
+      await (tx as any).radioSchedule.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await (tx as any).radioFile.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      // 4. Bell templates + calendar days + bells
+      await (tx as any).bellCalendarDay.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await (tx as any).bell.deleteMany({ where: { template: { tenantId: id } } }).catch(() => {});
+      await (tx as any).bellScheduleTemplate.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      // 5. Pending devices + devices
+      await (tx as any).pendingDevice.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      await (tx as any).device.deleteMany({ where: { tenantId: id } }).catch(() => {});
+      // 6. Users
+      await tx.user.deleteMany({ where: { tenantId: id } });
+      // 7. Maga a tenant
+      await tx.tenant.delete({ where: { id } });
+    });
+
+    return res.json({ ok: true, deleted: true });
+  } catch (err: any) {
+    console.error("[DELETE TENANT]", err);
+    if (err?.code === "P2003" || err?.code === "P2014") {
+      return res.status(409).json({
+        error: "Az intézményhez kapcsolódó adatok miatt nem törölhető. Előbb deaktiváld.",
+      });
+    }
+    return res.status(500).json({ error: "Failed to delete tenant" });
   }
 });
 
