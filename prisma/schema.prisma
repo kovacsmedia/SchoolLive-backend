@@ -307,11 +307,6 @@ model PendingDevice {
   firmwareVersion String?
   firstSeenAt     DateTime @default(now())
   lastSeenAt      DateTime @default(now())
-  
-  // ÚJ: WebPlayer-specifikus mezők
-  clientId  String?  @unique  // localStorage UUID
-  userId    String?  @unique  // PLAYER user ID (1 user = 1 pending max)
-  userAgent String?            // böngésző azonosítás
 
   @@index([lastSeenAt])
 }
@@ -428,4 +423,42 @@ model RadioSchedule {
   @@index([tenantId])
   @@index([tenantId, scheduledAt])
   @@index([status, scheduledAt])
+}
+
+enum YoutubePlaylistStatus {
+  IDLE
+  BUILDING
+  DONE
+  ERROR
+}
+
+model YoutubePlaylist {
+  id          String                 @id @default(uuid())
+  tenantId    String
+  name        String
+  status      YoutubePlaylistStatus  @default(IDLE)
+  errorMsg    String?
+  radioFileId String?                @unique
+  createdById String
+  createdAt   DateTime               @default(now())
+  updatedAt   DateTime               @updatedAt
+
+  tenant    Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy User                    @relation("YoutubePlaylistCreatedBy", fields: [createdById], references: [id])
+  radioFile RadioFile?              @relation(fields: [radioFileId], references: [id])
+  items     YoutubePlaylistItem[]
+
+  @@index([tenantId])
+}
+
+model YoutubePlaylistItem {
+  id         String @id @default(uuid())
+  playlistId String
+  youtubeUrl String
+  title      String?
+  sortOrder  Int
+
+  playlist YoutubePlaylist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+
+  @@index([playlistId])
 }
