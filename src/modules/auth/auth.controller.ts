@@ -26,7 +26,7 @@ export async function postLogout(req: Request, res: Response) {
     if (bodyToken) {
       try {
         const jwt = await import("jsonwebtoken");
-        const { env } = await import("../config/env");
+        const { env } = await import("../../config/env");
         const decoded = jwt.default.verify(bodyToken, env.JWT_ACCESS_SECRET) as any;
         userId = decoded.sub;
       } catch {}
