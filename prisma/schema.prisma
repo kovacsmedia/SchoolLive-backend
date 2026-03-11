@@ -79,8 +79,9 @@ model Tenant {
   groups    DeviceGroup[]
   messages  Message[]
   commands  DeviceCommand[]
-  radioFiles     RadioFile[]
-  radioSchedules RadioSchedule[]
+  radioFiles       RadioFile[]
+  radioSchedules   RadioSchedule[]
+  youtubePlaylists YoutubePlaylist[]
 
   @@index([isActive])
 }
@@ -131,6 +132,7 @@ model User {
 
   radioFiles     RadioFile[]     @relation("RadioFileCreatedBy")
   radioSchedules RadioSchedule[] @relation("RadioScheduleCreatedBy")
+  youtubePlaylists YoutubePlaylist[] @relation("YoutubePlaylistCreatedBy")
 
   @@index([tenantId])
   @@index([role])
@@ -398,6 +400,7 @@ model RadioFile {
   tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   createdBy User            @relation("RadioFileCreatedBy", fields: [createdById], references: [id])
   schedules RadioSchedule[]
+  youtubePlaylists YoutubePlaylist[]
 
   @@unique([tenantId, filename])
   @@index([tenantId])
