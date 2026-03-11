@@ -422,8 +422,9 @@ bellsRouter.get("/today", authJwt, async (req: Request, res: Response) => {
   const tenantId = tid(req);
   if (!tenantId) return res.status(400).json({ error: "Tenant required" });
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  // UTC alapú dátum – a DB is UTC-ben tárolja
+  const now = new Date();
+  const today = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
 
   const { bells, isHoliday } = await resolveTodayBells(tenantId, today);
 
@@ -443,8 +444,8 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
   const device = await authenticateDevice(req);
   if (!device) return res.status(401).json({ error: "Invalid or missing device key" });
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
+  const now = new Date();
+  const today = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
 
   const { bells, defaultBells, isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(device.tenantId, today);
