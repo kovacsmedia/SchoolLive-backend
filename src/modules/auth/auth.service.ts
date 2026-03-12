@@ -68,7 +68,7 @@ export async function login(email: string, password: string) {
 
   return {
     accessToken: token,
-    user: { id: user.id, email: user.email, role: user.role, tenantId: user.tenantId ?? null }
+    user: { id: user.id, email: user.email, role: user.role, tenantId: user.tenantId ?? null, tenantName: tenantName ?? null }
   };
 }
 
