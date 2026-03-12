@@ -1043,7 +1043,7 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
 
 // ── GET /radio/ytplaylists/build-status/:fileId ───────────────────────────
 router.get("/ytplaylists/build-status/:fileId", authJwt, requireTenant, async (req: Request, res: Response) => {
-  const buildId = req.params.fileId;
+  const buildId = String(req.params.fileId);
   const status  = buildStatusMap.get(buildId);
   if (!status) return res.status(404).json({ ok: false, error: "Nincs ilyen build" });
 
