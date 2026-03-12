@@ -446,6 +446,8 @@ bellsRouter.get("/today", authJwt, async (req: Request, res: Response) => {
       type:      b.type,
       soundFile: b.soundFile,
     })),
+    // Default sablon hangjai – mindig letöltjük offline napokra
+    defaultSounds: Array.from(new Set(defaultBells.map((b: any) => b.soundFile as string))),
   });
 });
 
