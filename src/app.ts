@@ -13,6 +13,7 @@ import messagesRouter from "./modules/messages/messages.routes";
 import tenantsAdminRouter from "./modules/tenants/tenants.admin.routes";
 import { bellsRouter } from "./modules/bells/bells.routes";
 import radioRoutes from "./modules/radio/radio.routes";
+import contactRouter from "./modules/contact/contact.routes";
 
 export const app = express();
 
@@ -53,10 +54,10 @@ app.use("/provision", devicesProvisionRouter);
 app.use("/player/device", playerDeviceRouter);
 app.use("/bells", bellsRouter);
 app.use("/radio", radioRoutes);
-app.use("/bells", bellsRouter);
-app.use("/radio", radioRoutes);
+app.use("/contact", contactRouter);
 
-// ── /bells/today – VP csengetési rend ──
+// ── /bells/today – VP-nek: mai csengetési rend JWT auth nélkül is ──────────
+// (a VP bearer tokennel hívja, de elég a tenantId-t a tokenből kiolvasni)
 import { authJwt } from "./middleware/authJwt";
 import { requireTenant } from "./middleware/tenant";
 import prisma from "./prisma";
