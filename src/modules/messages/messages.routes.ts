@@ -24,9 +24,12 @@ router.get("/", authJwt, requireTenant, async (req: Request, res: Response) => {
     const limit = Math.min(50, parseInt(req.query.limit as string) || 20);
     const skip  = (page - 1) * limit;
 
+    const createdBy = req.query.createdBy as string | undefined;
+    const where = { tenantId: tid, ...(createdBy ? { createdById: createdBy } : {}) };
+
     const [messages, total] = await Promise.all([
       prisma.message.findMany({
-        where: { tenantId: tid },
+        where,
         orderBy: { createdAt: "desc" },
         skip,
         take: limit,
@@ -47,7 +50,7 @@ router.get("/", authJwt, requireTenant, async (req: Request, res: Response) => {
           },
         },
       }),
-      prisma.message.count({ where: { tenantId: tid } }),
+      prisma.message.count({ where }),
     ]);
 
     return res.json({ ok: true, messages, total, page, limit });
