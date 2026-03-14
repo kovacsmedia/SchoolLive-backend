@@ -25,7 +25,7 @@ if (!fs.existsSync(FIRMWARE_DIR)) fs.mkdirSync(FIRMWARE_DIR, { recursive: true }
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, FIRMWARE_DIR),
   filename:    (_req, file, cb) => {
-    const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    const safe = String(file.originalname).replace(/[^a-zA-Z0-9._-]/g, "_");
     cb(null, safe);
   },
 });
@@ -115,14 +115,15 @@ router.get("/releases", authJwt, requireTenant, async (req: Request, res: Respon
 // Query:  ?version=S3.4&deviceClass=SPEAKER
 router.get("/check", async (req: Request, res: Response) => {
   try {
-    const deviceKey   = req.headers["x-device-key"] as string;
+    const deviceKey   = Array.isArray(req.headers["x-device-key"]) ? req.headers["x-device-key"][0] : req.headers["x-device-key"] as string | undefined;
     const curVersion  = req.query.version     as string ?? "";
     const deviceClass = req.query.deviceClass as string ?? "SPEAKER";
 
     if (!deviceKey) return res.status(401).json({ error: "x-device-key kötelező" });
+    const safeKey = deviceKey as string;
 
     // Eszköz azonosítása
-    const keyHash = crypto.createHash("sha256").update(deviceKey).digest("hex");
+    const keyHash = crypto.createHash("sha256").update(safeKey).digest("hex");
     // bcrypt a szkémában – keressük az összes eszközt (kis szám)
     const bcrypt = require("bcrypt");
     const devices = await prisma.device.findMany({
@@ -132,7 +133,7 @@ router.get("/check", async (req: Request, res: Response) => {
     let device: { id: string; tenantId: string } | null = null;
     for (const d of devices) {
       if (!d.deviceKeyHash) continue;
-      if (await bcrypt.compare(deviceKey, d.deviceKeyHash)) { device = d; break; }
+      if (await bcrypt.compare(safeKey, d.deviceKeyHash)) { device = d; break; }
     }
     if (!device) return res.status(401).json({ error: "Ismeretlen eszköz" });
 
@@ -186,8 +187,9 @@ router.get("/check", async (req: Request, res: Response) => {
 // Body: { version, status: "DOWNLOADING"|"INSTALLING"|"SUCCESS"|"FAILED"|"ROLLBACK", progress?, error? }
 router.post("/ota-status", async (req: Request, res: Response) => {
   try {
-    const deviceKey = req.headers["x-device-key"] as string;
+    const deviceKey = Array.isArray(req.headers["x-device-key"]) ? req.headers["x-device-key"][0] : req.headers["x-device-key"] as string | undefined;
     if (!deviceKey) return res.status(401).json({ error: "x-device-key kötelező" });
+    const safeKey2 = deviceKey as string;
 
     const { version, status, progress, error: errMsg } = req.body;
 
@@ -199,7 +201,7 @@ router.post("/ota-status", async (req: Request, res: Response) => {
     let deviceId: string | null = null;
     for (const d of devices) {
       if (!d.deviceKeyHash) continue;
-      if (await bcrypt.compare(deviceKey, d.deviceKeyHash)) { deviceId = d.id; break; }
+      if (await bcrypt.compare(safeKey2, d.deviceKeyHash)) { deviceId = d.id; break; }
     }
     if (!deviceId) return res.status(401).json({ error: "Ismeretlen eszköz" });
 
