@@ -1,7 +1,7 @@
 // src/server.ts
 import "dotenv/config";
 import http from "http";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 
 import { app }                  from "./app";
 import { env }                  from "./config/env";
