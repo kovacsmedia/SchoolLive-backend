@@ -5,8 +5,9 @@
 //  Fázis 2: PLAY     → abszolút UTC timestamp, mindenki egyszerre indul
 // ─────────────────────────────────────────────────────────────────────────────
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const { WebSocketServer, WebSocket } = require("ws") as typeof import("ws");
+import WS from "ws";
+const { WebSocketServer } = WS;
+type WebSocket = WS;
 import type { IncomingMessage }        from "http";
 import jwt                             from "jsonwebtoken";
 import { env }                         from "../config/env";
@@ -72,7 +73,7 @@ interface DeviceProfile {
 // ── SyncEngine ────────────────────────────────────────────────────────────────
 
 class SyncEngineClass {
-  private wss:      WebSocketServer | null = null;
+  private wss:      InstanceType<typeof WebSocketServer> | null = null;
   private clients:  Map<string, ConnectedClient> = new Map(); // deviceId → client
   private pending:  Map<string, PendingSync>     = new Map(); // commandId → sync
   private profiles: Map<string, DeviceProfile>   = new Map(); // deviceId → profile
@@ -86,7 +87,7 @@ class SyncEngineClass {
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
-  init(wss: WebSocketServer): void {
+  init(wss: InstanceType<typeof WebSocketServer>): void {
     this.wss = wss;
     console.log("[SyncEngine] ✅ Inicializálva");
 
