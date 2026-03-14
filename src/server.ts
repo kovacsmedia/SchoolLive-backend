@@ -1,9 +1,8 @@
 // src/server.ts
 import "dotenv/config";
 import http from "http";
-import * as WebSocketLib from "ws";
-const { WebSocketServer } = WebSocketLib;
-type WebSocket = WebSocketLib.WebSocket;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { WebSocketServer, WebSocket } = require("ws") as typeof import("ws");
 
 import { app }                  from "./app";
 import { env }                  from "./config/env";
