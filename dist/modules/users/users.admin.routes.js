@@ -31,6 +31,25 @@ function getParamId(req) {
         return raw.trim();
     return null;
 }
+// ✅ egységes "név" parse (body.name vagy body.displayName → DB.displayName)
+function parseDisplayName(raw) {
+    // undefined = nincs a payloadban (nem módosítjuk)
+    // null = explicit törlés
+    // string = beállítás
+    if (typeof raw === "undefined")
+        return undefined;
+    if (raw === null)
+        return null;
+    if (typeof raw === "string") {
+        const v = raw.trim();
+        return v ? v : null;
+    }
+    return undefined;
+}
+// ✅ API kompatibilitás (a frontendnek legyen name is)
+function withNameAlias(u) {
+    return { ...u, name: u.displayName ?? null };
+}
 /**
  * GET /admin/users
  * Tenant-scoped user list.
@@ -52,6 +71,7 @@ router.get("/", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => {
             select: {
                 id: true,
                 email: true,
+                displayName: true,
                 role: true,
                 tenantId: true,
                 orgUnitId: true,
@@ -61,7 +81,8 @@ router.get("/", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => {
             },
             orderBy: [{ role: "asc" }, { email: "asc" }],
         });
-        return res.json({ ok: true, users });
+        const mapped = users.map(withNameAlias);
+        return res.json({ ok: true, users: mapped });
     }
     catch (err) {
         console.error(err);
@@ -129,8 +150,6 @@ router.get("/:id/messages", authJwt_1.authJwt, tenant_1.requireTenant, async (re
         function aggregateStatus(commandStatuses) {
             if (!commandStatuses || commandStatuses.length === 0)
                 return "-";
-            // Pick the "worst"/most informative status by rank:
-            // FAILED > ACKED > SENT > QUEUED
             let best = "-";
             for (const cs of commandStatuses) {
                 const s = cs.status ?? "-";
@@ -166,7 +185,9 @@ router.get("/:id/messages", authJwt_1.authJwt, tenant_1.requireTenant, async (re
  *   password: string,
  *   role: "TENANT_ADMIN" | "ORG_ADMIN" | "TEACHER" | "OPERATOR" | "PLAYER",
  *   isActive?: boolean,
- *   orgUnitId?: string | null
+ *   orgUnitId?: string | null,
+ *   name?: string | null,
+ *   displayName?: string | null
  * }
  */
 router.post("/", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => {
@@ -178,7 +199,7 @@ router.post("/", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => 
         if (!actor.tenantId) {
             return res.status(400).json({ error: "Tenant context required" });
         }
-        const { email, password, role, isActive, orgUnitId } = req.body;
+        const { email, password, role, isActive, orgUnitId, name, displayName } = req.body;
         if (typeof email !== "string" || !email.trim()) {
             return res.status(400).json({ error: "email is required" });
         }
@@ -194,6 +215,7 @@ router.post("/", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => 
         else if (typeof orgUnitId === "string") {
             parsedOrgUnitId = orgUnitId.trim() ? orgUnitId.trim() : null;
         }
+        const parsedDisplayName = typeof displayName !== "undefined" ? parseDisplayName(displayName) : parseDisplayName(name);
         const passwordHash = await bcrypt_1.default.hash(password, 10);
         const created = await client_1.prisma.user.create({
             data: {
@@ -203,10 +225,12 @@ router.post("/", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => 
                 role: role,
                 isActive: typeof isActive === "boolean" ? isActive : true,
                 ...(typeof parsedOrgUnitId !== "undefined" ? { orgUnitId: parsedOrgUnitId } : {}),
+                ...(typeof parsedDisplayName !== "undefined" ? { displayName: parsedDisplayName } : {}),
             },
             select: {
                 id: true,
                 email: true,
+                displayName: true,
                 role: true,
                 tenantId: true,
                 orgUnitId: true,
@@ -215,7 +239,7 @@ router.post("/", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => 
                 createdAt: true,
             },
         });
-        return res.status(201).json({ ok: true, user: created });
+        return res.status(201).json({ ok: true, user: withNameAlias(created) });
     }
     catch (err) {
         if (err?.code === "P2002") {
@@ -235,7 +259,9 @@ router.post("/", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => 
  *   role?: tenant role,
  *   isActive?: boolean,
  *   password?: string,
- *   orgUnitId?: string | null
+ *   orgUnitId?: string | null,
+ *   name?: string | null,
+ *   displayName?: string | null
  * }
  */
 router.patch("/:id", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => {
@@ -257,7 +283,7 @@ router.patch("/:id", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res)
         if (!existing) {
             return res.status(404).json({ error: "User not found" });
         }
-        const { email, role, isActive, password, orgUnitId } = req.body;
+        const { email, role, isActive, password, orgUnitId, name, displayName } = req.body;
         const data = {};
         if (typeof email === "string") {
             if (!email.trim())
@@ -289,6 +315,10 @@ router.patch("/:id", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res)
             else
                 return res.status(400).json({ error: "orgUnitId must be string or null" });
         }
+        const parsedDisplayName = typeof displayName !== "undefined" ? parseDisplayName(displayName) : parseDisplayName(name);
+        if (typeof parsedDisplayName !== "undefined") {
+            data.displayName = parsedDisplayName;
+        }
         if (Object.keys(data).length === 0) {
             return res.status(400).json({ error: "No changes provided" });
         }
@@ -298,6 +328,7 @@ router.patch("/:id", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res)
             select: {
                 id: true,
                 email: true,
+                displayName: true,
                 role: true,
                 tenantId: true,
                 orgUnitId: true,
@@ -306,7 +337,7 @@ router.patch("/:id", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res)
                 createdAt: true,
             },
         });
-        return res.json({ ok: true, user: updated });
+        return res.json({ ok: true, user: withNameAlias(updated) });
     }
     catch (err) {
         if (err?.code === "P2002") {
@@ -319,7 +350,10 @@ router.patch("/:id", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res)
 /**
  * DELETE /admin/users/:id
  *
- * Biztonságos tenant-szintű törlés: soft delete (isActive=false).
+ * ?permanent=true → valódi hard delete (cascade: DeviceCommand, Message, Device userId nullázás)
+ * alapértelmezett  → soft delete (isActive=false)
+ *
+ * SUPER_ADMIN nem törölhető.
  */
 router.delete("/:id", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res) => {
     try {
@@ -335,19 +369,56 @@ router.delete("/:id", authJwt_1.authJwt, tenant_1.requireTenant, async (req, res
             return res.status(400).json({ error: "id is required" });
         const existing = await client_1.prisma.user.findFirst({
             where: { id, tenantId: actor.tenantId },
-            select: { id: true },
+            select: { id: true, role: true },
         });
         if (!existing) {
             return res.status(404).json({ error: "User not found" });
         }
-        await client_1.prisma.user.update({
-            where: { id },
-            data: { isActive: false },
+        // SUPER_ADMIN-t nem lehet törölni
+        if (existing.role === "SUPER_ADMIN") {
+            return res.status(403).json({ error: "Cannot delete SUPER_ADMIN" });
+        }
+        const permanent = req.query.permanent === "true";
+        if (!permanent) {
+            // Soft delete – isActive=false, session törlése
+            await client_1.prisma.user.update({
+                where: { id },
+                data: { isActive: false },
+            });
+            // Session törlése hogy ne tudjon visszajelentkezni
+            await client_1.prisma.$executeRaw `
+        UPDATE "User" SET "activeSessionId" = NULL WHERE id = ${id}
+      `.catch(() => { });
+            return res.json({ ok: true, deleted: false, deactivated: true });
+        }
+        // Hard delete – cascade sorrendben tranzakcióban
+        await client_1.prisma.$transaction(async (tx) => {
+            // 1. DeviceCommand-ok törlése a user üzeneteihez
+            await tx.deviceCommand.deleteMany({
+                where: { message: { createdById: id } },
+            });
+            // 2. Üzenetek törlése
+            await tx.message.deleteMany({ where: { createdById: id } });
+            // 3. PendingDevice törlése ha van (catch: ha nem létezik a tábla/mező)
+            await tx.pendingDevice.deleteMany({ where: { userId: id } }).catch(() => { });
+            // 4. Device-ok userId mezőjének nullázása (fizikai eszközt nem töröljük)
+            await tx.device.updateMany({
+                where: { userId: id },
+                data: { userId: null },
+            }).catch(() => { });
+            // 5. Maga a user
+            await tx.user.delete({ where: { id } });
         });
-        return res.json({ ok: true });
+        return res.json({ ok: true, deleted: true });
     }
     catch (err) {
-        console.error(err);
+        console.error("[DELETE USER]", err);
+        // Idegen kulcs constraint hiba – még van kapcsolódó adat
+        if (err?.code === "P2003" || err?.code === "P2014") {
+            return res.status(409).json({
+                error: "A felhasználóhoz kapcsolódó adatok miatt nem törölhető. Előbb deaktiváld.",
+            });
+        }
         return res.status(500).json({ error: "Failed to delete user" });
     }
 });

@@ -15,8 +15,8 @@ const client_1 = require("../../prisma/client");
 const crypto_1 = __importDefault(require("crypto"));
 const bcrypt_1 = __importDefault(require("bcrypt"));
 // ---- Retry/Timeout config ----
-const BASE_ACK_TIMEOUT_MS = 30_000; // 30s
-const MAX_ACK_TIMEOUT_MS = 5 * 60_000; // 5 min
+const BASE_ACK_TIMEOUT_MS = 30_000;
+const MAX_ACK_TIMEOUT_MS = 5 * 60_000;
 function ackTimeoutMs(retryCount) {
     const rc = Math.max(0, Number.isFinite(retryCount) ? retryCount : 0);
     const ms = BASE_ACK_TIMEOUT_MS * (rc + 1);
@@ -58,7 +58,6 @@ async function registerDevice(req, res) {
     if (!name || typeof name !== "string") {
         return res.status(400).json({ error: "name is required" });
     }
-    // egyszer használatos device key (plaintext)
     const deviceKey = crypto_1.default.randomBytes(24).toString("hex");
     const deviceKeyHash = await bcrypt_1.default.hash(deviceKey, 10);
     const device = await client_1.prisma.device.create({
@@ -74,7 +73,6 @@ async function registerDevice(req, res) {
         },
         select: { id: true, name: true, tenantId: true, orgUnitId: true, createdAt: true },
     });
-    // plaintext kulcsot csak most adjuk vissza!
     res.status(201).json({ device, deviceKey });
 }
 async function deviceBeacon(req, res) {
@@ -205,13 +203,15 @@ async function ackCommand(req, res) {
             error: ok ? null : (typeof error === "string" ? error : "Device reported error"),
         },
     });
+    // Ha sikeres ACK és van messageId, frissítjük a Message.playedAt-et
+    if (ok && cmd.messageId) {
+        await client_1.prisma.message.update({
+            where: { id: cmd.messageId },
+            data: { playedAt: new Date() },
+        }).catch(() => { });
+    }
     return res.json({ ok: true, command: updated });
 }
-/**
- * PLAYER/JWT virtual device polling
- * POST /player/device/poll
- * Body: { clientId: string }
- */
 async function playerPollCommands(req, res) {
     const user = req.user;
     if (!user)
@@ -237,12 +237,10 @@ async function playerPollCommands(req, res) {
     if (!device) {
         return res.status(404).json({ ok: false, error: "DEVICE_NOT_REGISTERED" });
     }
-    // heartbeat: legyen ONLINE és friss lastSeenAt
     await client_1.prisma.device.update({
         where: { id: device.id },
         data: { online: true, lastSeenAt: new Date() },
     });
-    // Ugyanaz a determinisztikus logika, mint a KEY-es pollnál
     const dev = { id: device.id, tenantId: device.tenantId };
     const now = new Date();
     const sentList = await client_1.prisma.deviceCommand.findMany({
@@ -286,21 +284,16 @@ async function playerPollCommands(req, res) {
     if (!queued) {
         return res.json({ ok: true, command: null });
     }
-    const updated = await client_1.prisma.deviceCommand.updateMany({
+    const updatedCount = await client_1.prisma.deviceCommand.updateMany({
         where: { id: queued.id, status: "QUEUED" },
         data: { status: "SENT", sentAt: now },
     });
-    if (updated.count === 0) {
+    if (updatedCount.count === 0) {
         return res.json({ ok: true, command: null });
     }
     const fresh = await client_1.prisma.deviceCommand.findUnique({ where: { id: queued.id } });
     return res.json({ ok: true, command: fresh });
 }
-/**
- * PLAYER/JWT virtual device ack
- * POST /player/device/ack
- * Body: { clientId: string, commandId: string, ok: boolean, error?: string }
- */
 async function playerAckCommand(req, res) {
     const user = req.user;
     if (!user)
@@ -350,7 +343,13 @@ async function playerAckCommand(req, res) {
             error: ok ? null : (typeof error === "string" ? error : "Player reported error"),
         },
     });
-    // heartbeat
+    // Ha sikeres ACK és van messageId, frissítjük a Message.playedAt-et
+    if (ok && cmd.messageId) {
+        await client_1.prisma.message.update({
+            where: { id: cmd.messageId },
+            data: { playedAt: new Date() },
+        }).catch(() => { });
+    }
     await client_1.prisma.device.update({
         where: { id: device.id },
         data: { online: true, lastSeenAt: new Date() },

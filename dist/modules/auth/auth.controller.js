@@ -34,6 +34,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.postLogin = postLogin;
+exports.postLogout = postLogout;
 exports.getMeHandler = getMeHandler;
 const authService = __importStar(require("./auth.service"));
 async function postLogin(req, res) {
@@ -43,7 +44,32 @@ async function postLogin(req, res) {
     const result = await authService.login(String(email), String(password));
     if (!result)
         return res.status(401).json({ error: "Invalid credentials" });
+    // Single session: a felhasználó már be van jelentkezve másik eszközön
+    if ("error" in result && result.error === "already_logged_in") {
+        return res.status(409).json({ error: "already_logged_in", message: "Ez a felhasználó már be van jelentkezve egy másik eszközön." });
+    }
     res.json(result);
+}
+async function postLogout(req, res) {
+    // sendBeacon nem tud Authorization headert küldeni,
+    // ezért a tokent body-ból is elfogadjuk
+    let userId = req.user?.sub;
+    if (!userId) {
+        const bodyToken = req.body?.token ?? req.body?.accessToken ?? "";
+        if (bodyToken) {
+            try {
+                const jwt = await Promise.resolve().then(() => __importStar(require("jsonwebtoken")));
+                const { env } = await Promise.resolve().then(() => __importStar(require("../../config/env")));
+                const decoded = jwt.default.verify(bodyToken, env.JWT_ACCESS_SECRET);
+                userId = decoded.sub;
+            }
+            catch { }
+        }
+    }
+    if (!userId)
+        return res.status(204).send(); // silent – ne blokkoljuk
+    await authService.logout(userId);
+    res.status(204).send();
 }
 async function getMeHandler(req, res) {
     if (!req.user)
