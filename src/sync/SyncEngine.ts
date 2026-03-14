@@ -5,9 +5,8 @@
 //  Fázis 2: PLAY     → abszolút UTC timestamp, mindenki egyszerre indul
 // ─────────────────────────────────────────────────────────────────────────────
 
-import * as WebSocketLib from "ws";
-const { WebSocketServer } = WebSocketLib;
-type WebSocket = WebSocketLib.WebSocket;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { WebSocketServer, WebSocket } = require("ws") as typeof import("ws");
 import type { IncomingMessage }        from "http";
 import jwt                             from "jsonwebtoken";
 import { env }                         from "../config/env";
@@ -126,7 +125,7 @@ class SyncEngineClass {
 
     // Ha ugyanaz az eszköz újracsatlakozik, leváltja a régit
     const existing = this.clients.get(deviceId);
-    if (existing && existing.ws.readyState === WebSocket.OPEN) {
+    if (existing && existing.ws.readyState === 1) {
       existing.ws.close(4010, "Replaced by new connection");
     }
 
@@ -141,14 +140,14 @@ class SyncEngineClass {
 
     // Ping-pong keepalive
     const pingInterval = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
+      if (ws.readyState === 1) {
         ws.ping();
       } else {
         clearInterval(pingInterval);
       }
     }, 25_000);
 
-    ws.on("message", (data: WebSocket.RawData) => {
+    ws.on("message", (data: Buffer | ArrayBuffer | Buffer[]) => {
       try {
         const msg = JSON.parse(data.toString());
         this.handleMessage(deviceId, tenantId, msg);
@@ -331,7 +330,7 @@ class SyncEngineClass {
     const result: ConnectedClient[] = [];
     for (const client of this.clients.values()) {
       if (client.tenantId !== tenantId) continue;
-      if (client.ws.readyState !== WebSocket.OPEN) continue;
+      if (client.ws.readyState !== 1) continue;
       if (deviceIds && !deviceIds.includes(client.deviceId)) continue;
       result.push(client);
     }
@@ -339,7 +338,7 @@ class SyncEngineClass {
   }
 
   private send(ws: WebSocket, payload: object): void {
-    if (ws.readyState === WebSocket.OPEN) {
+    if (ws.readyState === 1) {
       ws.send(JSON.stringify(payload));
     }
   }
@@ -382,7 +381,7 @@ class SyncEngineClass {
 
   isDeviceOnline(deviceId: string): boolean {
     const client = this.clients.get(deviceId);
-    return !!client && client.ws.readyState === WebSocket.OPEN;
+    return !!client && client.ws.readyState === 1;
   }
 }
 
