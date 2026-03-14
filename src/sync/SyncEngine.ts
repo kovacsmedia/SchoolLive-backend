@@ -16,7 +16,7 @@ import { env }                         from "../config/env";
 
 // ── Típusok ──────────────────────────────────────────────────────────────────
 
-export type SyncAction = "BELL" | "TTS" | "PLAY_URL" | "STOP_PLAYBACK" | "SYNC_BELLS";
+export type SyncAction = "BELL" | "TTS" | "PLAY_URL" | "STOP_PLAYBACK" | "SYNC_BELLS" | "OTA_UPDATE";
 
 export interface PreparePayload {
   phase:           "PREPARE";

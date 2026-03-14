@@ -56,6 +56,15 @@ enum RadioScheduleStatus {
   CANCELLED
 }
 
+enum OtaStatus {
+  UP_TO_DATE
+  PENDING
+  DOWNLOADING
+  INSTALLING
+  FAILED
+  ROLLBACK
+}
+
 model Tenant {
   id        String   @id @default(uuid())
   name      String
@@ -133,6 +142,7 @@ model User {
   radioFiles     RadioFile[]     @relation("RadioFileCreatedBy")
   radioSchedules RadioSchedule[] @relation("RadioScheduleCreatedBy")
   youtubePlaylists YoutubePlaylist[] @relation("YoutubePlaylistCreatedBy")
+  firmwareReleases FirmwareRelease[] @relation("FirmwareCreatedBy")
 
   @@index([tenantId])
   @@index([role])
@@ -149,7 +159,7 @@ model Device {
 
   name String
 
-  authType     DeviceAuthType @default(KEY)
+  authType      DeviceAuthType @default(KEY)
   deviceKeyHash String?
 
   clientId String?
@@ -169,19 +179,24 @@ model Device {
   createdAt DateTime @default(now())
   deviceClass DeviceClass @default(SPEAKER)
 
+  // OTA frissítési állapot
+  otaStatus    OtaStatus @default(UP_TO_DATE)
+  otaProgress  Int       @default(0)
+  otaVersion   String?
+  otaUpdatedAt DateTime?
+
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   orgUnit OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
 
-  groupMembers     DeviceGroupMember[]
-  commands         DeviceCommand[]
+  groupMembers      DeviceGroupMember[]
+  commands          DeviceCommand[]
   provisionSessions DeviceProvisionSession[]
 
   @@index([tenantId])
   @@index([tenantId, online])
   @@index([tenantId, lastSeenAt])
   @@index([userId])
-
   @@unique([tenantId, name])
   @@unique([tenantId, clientId])
 }
@@ -265,8 +280,8 @@ model DeviceCommand {
   ackedAt  DateTime?
   error    String?
 
-  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  tenant  Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  device  Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
   message Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
 
   @@index([tenantId])
@@ -439,19 +454,19 @@ enum YoutubePlaylistStatus {
 }
 
 model YoutubePlaylist {
-  id          String                 @id @default(uuid())
+  id          String                @id @default(uuid())
   tenantId    String
   name        String
-  status      YoutubePlaylistStatus  @default(IDLE)
+  status      YoutubePlaylistStatus @default(IDLE)
   errorMsg    String?
-  radioFileId String?                @unique
+  radioFileId String?               @unique
   createdById String
-  createdAt   DateTime               @default(now())
-  updatedAt   DateTime               @updatedAt
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
 
-  tenant    Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  createdBy User                    @relation("YoutubePlaylistCreatedBy", fields: [createdById], references: [id])
-  radioFile RadioFile?              @relation(fields: [radioFileId], references: [id])
+  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  createdBy User                @relation("YoutubePlaylistCreatedBy", fields: [createdById], references: [id])
+  radioFile RadioFile?          @relation(fields: [radioFileId], references: [id])
   items     YoutubePlaylistItem[]
 
   @@index([tenantId])
@@ -467,4 +482,22 @@ model YoutubePlaylistItem {
   playlist YoutubePlaylist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
 
   @@index([playlistId])
+}
+
+model FirmwareRelease {
+  id          String   @id @default(uuid())
+  version     String   @unique
+  filename    String
+  fileUrl     String
+  sizeBytes   Int
+  sha256      String
+  notes       String?
+  mandatory   Boolean  @default(false)
+  targetClass String   @default("ALL")
+  createdAt   DateTime @default(now())
+  createdById String
+
+  createdBy User @relation("FirmwareCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+
+  @@index([createdAt])
 }
