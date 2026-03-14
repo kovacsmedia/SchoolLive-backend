@@ -31,7 +31,8 @@ export interface PreparePayload {
 export interface PlayPayload {
   phase:     "PLAY";
   commandId: string;
-  playAt:    string;         // ISO – pontosan ekkor indíts
+  playAt:    string;         // ISO
+  playAtMs?: number;         // Unix ms – ESP32 közvetlenül használja
 }
 
 export interface ReadyAck {
@@ -217,9 +218,11 @@ class SyncEngineClass {
     });
 
     // Üdvözlő üzenet – időszinkronhoz
+    const nowMs = Date.now();
     this.send(ws, {
-      type:      "HELLO",
-      serverNow: new Date().toISOString(),
+      type:        "HELLO",
+      serverNow:   new Date(nowMs).toISOString(),
+      serverNowMs: nowMs,   // numerikus ms – ESP32 közvetlenül használja
       deviceId,
     });
   }
@@ -345,9 +348,10 @@ class SyncEngineClass {
 
     const playAt = new Date(Date.now() + leadMs);
     const playMsg: PlayPayload = {
-      phase:     "PLAY",
-      commandId: syncState.commandId,
-      playAt:    playAt.toISOString(),
+      phase:      "PLAY",
+      commandId:  syncState.commandId,
+      playAt:     playAt.toISOString(),
+      playAtMs:   playAt.getTime(),   // numerikus ms – ESP32 közvetlenül használja
     };
 
     const targets = this.getOnlineClients(syncState.tenantId);
