@@ -82,11 +82,11 @@ class SyncEngineClass {
   private profiles: Map<string, DeviceProfile>   = new Map(); // deviceId → profile
 
   // Konfig
-  private readonly PREPARE_WINDOW_MS  = 2000;  // ennyi idő a prefetchre
-  private readonly SAFETY_MARGIN_MS   = 300;   // playAt buffer a p95 felett
-  private readonly FALLBACK_LEAD_MS   = 2500;  // ha nincs ACK sem, ennyi múlva játszik
-  private readonly MIN_LEAD_MS        = 800;   // minimum lead time
-  private readonly ACK_WAIT_MS        = 1800;  // ennyi ms-ig várunk ACK-okra
+  private readonly PREPARE_WINDOW_MS  = 4000;  // ennyi idő a prefetchre (ESP32 ~2s kell)
+  private readonly SAFETY_MARGIN_MS   = 500;   // playAt buffer a p95 felett
+  private readonly FALLBACK_LEAD_MS   = 4500;  // ha nincs ACK sem, ennyi múlva játszik
+  private readonly MIN_LEAD_MS        = 1500;  // minimum lead time
+  private readonly ACK_WAIT_MS        = 3500;  // ennyi ms-ig várunk ACK-okra (ESP32 ~2s)
 
   // ── Init ──────────────────────────────────────────────────────────────────
 
