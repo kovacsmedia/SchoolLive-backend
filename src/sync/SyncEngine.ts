@@ -11,6 +11,7 @@ type WebSocket = WS;
 import type { IncomingMessage }        from "http";
 import jwt                             from "jsonwebtoken";
 import { createHash }                  from "crypto";
+import bcrypt                          from "bcrypt";
 import { env }                         from "../config/env";
 
 // ── Típusok ──────────────────────────────────────────────────────────────────
@@ -132,22 +133,29 @@ class SyncEngineClass {
       return;
     }
 
-    // Device key auth (ESP32) – deviceKeyHash = SHA-256(deviceKey)
+    // Device key auth (ESP32) – deviceKeyHash = bcrypt(deviceKey)
     if (deviceKey && !token) {
       try {
         const { prisma } = await import("../prisma/client");
-        const keyHash = createHash("sha256").update(deviceKey).digest("hex");
-        const device = await prisma.device.findFirst({
-          where:  { deviceKeyHash: keyHash },
-          select: { id: true, tenantId: true },
+        // bcrypt: az összes eszközt le kell kérni majd compare-elni
+        // (bcrypt nem kereshető direktben, de az eszközök száma kicsi)
+        const devices = await prisma.device.findMany({
+          where:  { deviceKeyHash: { not: null } },
+          select: { id: true, tenantId: true, deviceKeyHash: true },
         });
-        if (!device) {
-          console.warn("[SyncEngine] Ismeretlen device key hash:", keyHash.slice(0,16)+"...");
+        let matched: { id: string; tenantId: string } | null = null;
+        for (const d of devices) {
+          if (!d.deviceKeyHash) continue;
+          const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
+          if (ok) { matched = d; break; }
+        }
+        if (!matched) {
+          console.warn("[SyncEngine] Ismeretlen device key (bcrypt)");
           ws.close(4004, "Invalid device key");
           return;
         }
-        deviceId   = device.id;
-        tenantId   = device.tenantId;
+        deviceId   = matched.id;
+        tenantId   = matched.tenantId;
         clientType = "esp32";
         console.log(`[SyncEngine] ESP32 auth OK: ${deviceId} tenant=${tenantId}`);
       } catch (e) {
