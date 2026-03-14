@@ -5,7 +5,9 @@
 //  Fázis 2: PLAY     → abszolút UTC timestamp, mindenki egyszerre indul
 // ─────────────────────────────────────────────────────────────────────────────
 
-import WebSocket, { WebSocketServer } from "ws";
+import * as WebSocketLib from "ws";
+const { WebSocketServer } = WebSocketLib;
+type WebSocket = WebSocketLib.WebSocket;
 import type { IncomingMessage }        from "http";
 import jwt                             from "jsonwebtoken";
 import { env }                         from "../config/env";
