@@ -5,10 +5,10 @@
 //  Fázis 2: PLAY     → abszolút UTC timestamp, mindenki egyszerre indul
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { WebSocketServer, WebSocket } from "ws";
-import { IncomingMessage }            from "http";
-import jwt                            from "jsonwebtoken";
-import { env }                        from "../config/env";
+import WebSocket, { WebSocketServer } from "ws";
+import type { IncomingMessage }        from "http";
+import jwt                             from "jsonwebtoken";
+import { env }                         from "../config/env";
 
 // ── Típusok ──────────────────────────────────────────────────────────────────
 
@@ -108,7 +108,7 @@ class SyncEngineClass {
 
     let payload: any;
     try {
-      payload = jwt.verify(token, env.JWT_SECRET);
+      payload = jwt.verify(token, env.JWT_ACCESS_SECRET);
     } catch {
       ws.close(4002, "Invalid token");
       return;
@@ -146,7 +146,7 @@ class SyncEngineClass {
       }
     }, 25_000);
 
-    ws.on("message", (data) => {
+    ws.on("message", (data: WebSocket.RawData) => {
       try {
         const msg = JSON.parse(data.toString());
         this.handleMessage(deviceId, tenantId, msg);
@@ -164,7 +164,7 @@ class SyncEngineClass {
       }
     });
 
-    ws.on("error", (err) => {
+    ws.on("error", (err: Error) => {
       console.error(`[SyncEngine] WS hiba: ${deviceId}`, err.message);
     });
 
