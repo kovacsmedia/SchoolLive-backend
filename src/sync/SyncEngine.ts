@@ -108,16 +108,43 @@ class SyncEngineClass {
       return;
     }
 
-    let payload: any;
-    try {
-      payload = jwt.verify(token, env.JWT_ACCESS_SECRET);
-    } catch {
-      ws.close(4002, "Invalid token");
-      return;
+    let deviceId = "unknown";
+    let tenantId  = "";
+    let clientType: "browser" | "esp32" = "browser";
+
+    // JWT auth (browser VirtualPlayer)
+    if (token) {
+      let payload: any;
+      try {
+        payload = jwt.verify(token, env.JWT_ACCESS_SECRET);
+      } catch {
+        ws.close(4002, "Invalid token");
+        return;
+      }
+      deviceId   = payload.deviceId ?? payload.sub ?? "unknown";
+      tenantId   = payload.tenantId ?? payload.tid ?? "";
+      clientType = "browser";
     }
 
-    const deviceId = payload.deviceId ?? payload.sub ?? "unknown";
-    const tenantId = payload.tenantId ?? payload.tid ?? "";
+    // Device key auth (ESP32)
+    const deviceKey = url.searchParams.get("deviceKey");
+    if (deviceKey && !token) {
+      try {
+        const { prisma } = await import("../prisma/client");
+        const device = await prisma.device.findFirst({
+          where:  { deviceKey },
+          select: { id: true, tenantId: true },
+        });
+        if (!device) { ws.close(4004, "Invalid device key"); return; }
+        deviceId   = device.id;
+        tenantId   = device.tenantId;
+        clientType = "esp32";
+      } catch (e) {
+        console.error("[SyncEngine] Device key lookup hiba:", e);
+        ws.close(4005, "Auth error");
+        return;
+      }
+    }
 
     if (!tenantId) {
       ws.close(4003, "Missing tenantId");
@@ -132,7 +159,7 @@ class SyncEngineClass {
 
     const client: ConnectedClient = {
       ws, deviceId, tenantId,
-      type: payload.authType === "JWT" ? "browser" : "esp32",
+      type: clientType,
       connectedAt: new Date(),
     };
     this.clients.set(deviceId, client);

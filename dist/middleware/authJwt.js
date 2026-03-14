@@ -6,6 +6,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.authJwt = authJwt;
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const env_1 = require("../config/env");
+const client_1 = require("../prisma/client");
 function authJwt(req, res, next) {
     const auth = req.headers.authorization ?? "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
@@ -16,6 +17,10 @@ function authJwt(req, res, next) {
     try {
         const decoded = jsonwebtoken_1.default.verify(token, env_1.env.JWT_ACCESS_SECRET);
         req.user = decoded;
+        // lastSeenAt frissítése – fire and forget, nem blokkoljuk a kérést
+        client_1.prisma.$executeRaw `
+      UPDATE "User" SET "lastSeenAt" = NOW() WHERE id = ${decoded.sub}
+    `.catch(() => { });
         next();
     }
     catch {
