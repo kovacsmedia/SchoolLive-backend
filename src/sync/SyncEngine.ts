@@ -98,15 +98,10 @@ class SyncEngineClass {
 
   // ── WebSocket kapcsolat kezelése ──────────────────────────────────────────
 
-  private handleConnection(ws: WebSocket, req: IncomingMessage): void {
+  private async handleConnection(ws: WebSocket, req: IncomingMessage): Promise<void> {
     // JWT auth az URL query stringből: ws://api.../sync?token=xxx
     const url    = new URL(req.url ?? "/", "http://localhost");
     const token  = url.searchParams.get("token");
-
-    if (!token) {
-      ws.close(4001, "Missing token");
-      return;
-    }
 
     let deviceId = "unknown";
     let tenantId  = "";
@@ -126,13 +121,19 @@ class SyncEngineClass {
       clientType = "browser";
     }
 
-    // Device key auth (ESP32)
+    // Ha sem token sem deviceKey → elutasítás
     const deviceKey = url.searchParams.get("deviceKey");
+    if (!token && !deviceKey) {
+      ws.close(4001, "Missing auth");
+      return;
+    }
+
+    // Device key auth (ESP32)
     if (deviceKey && !token) {
       try {
         const { prisma } = await import("../prisma/client");
         const device = await prisma.device.findFirst({
-          where:  { deviceKey },
+          where:  { deviceKey: deviceKey } as any,
           select: { id: true, tenantId: true },
         });
         if (!device) { ws.close(4004, "Invalid device key"); return; }
