@@ -10,6 +10,7 @@ const { WebSocketServer } = WS;
 type WebSocket = WS;
 import type { IncomingMessage }        from "http";
 import jwt                             from "jsonwebtoken";
+import { createHash }                  from "crypto";
 import { env }                         from "../config/env";
 
 // ── Típusok ──────────────────────────────────────────────────────────────────
@@ -92,7 +93,10 @@ class SyncEngineClass {
     console.log("[SyncEngine] ✅ Inicializálva");
 
     wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
-      this.handleConnection(ws, req);
+      this.handleConnection(ws, req).catch(err => {
+        console.error("[SyncEngine] handleConnection hiba:", err);
+        try { ws.close(4500, "Internal error"); } catch {}
+      });
     });
   }
 
@@ -128,18 +132,24 @@ class SyncEngineClass {
       return;
     }
 
-    // Device key auth (ESP32)
+    // Device key auth (ESP32) – deviceKeyHash = SHA-256(deviceKey)
     if (deviceKey && !token) {
       try {
         const { prisma } = await import("../prisma/client");
+        const keyHash = createHash("sha256").update(deviceKey).digest("hex");
         const device = await prisma.device.findFirst({
-          where:  { deviceKey: deviceKey } as any,
+          where:  { deviceKeyHash: keyHash },
           select: { id: true, tenantId: true },
         });
-        if (!device) { ws.close(4004, "Invalid device key"); return; }
+        if (!device) {
+          console.warn("[SyncEngine] Ismeretlen device key hash:", keyHash.slice(0,16)+"...");
+          ws.close(4004, "Invalid device key");
+          return;
+        }
         deviceId   = device.id;
         tenantId   = device.tenantId;
         clientType = "esp32";
+        console.log(`[SyncEngine] ESP32 auth OK: ${deviceId} tenant=${tenantId}`);
       } catch (e) {
         console.error("[SyncEngine] Device key lookup hiba:", e);
         ws.close(4005, "Auth error");
