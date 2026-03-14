@@ -88,7 +88,7 @@ router.post("/upload", authJwt, requireTenant, upload.single("file"),
 // ── GET /firmware/files/:filename – statikus .bin kiszolgálás ─────────────────
 router.get("/files/:filename", async (req: Request, res: Response) => {
   // Device key auth vagy admin JWT
-  const filename = req.params.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const filename = (Array.isArray(req.params.filename) ? req.params.filename[0] : req.params.filename).replace(/[^a-zA-Z0-9._-]/g, "_");
   const filePath = path.join(FIRMWARE_DIR, filename);
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Nem található" });
   res.setHeader("Content-Type", "application/octet-stream");
@@ -239,7 +239,7 @@ router.delete("/releases/:id", authJwt, requireTenant, async (req: Request, res:
       return res.status(403).json({ error: "Csak admin törölhet" });
     }
     const release = await prisma.firmwareRelease.findUnique({
-      where: { id: req.params.id },
+      where: { id: Array.isArray(req.params.id) ? req.params.id[0] : req.params.id },
     });
     if (!release) return res.status(404).json({ error: "Nem található" });
 
@@ -247,7 +247,7 @@ router.delete("/releases/:id", authJwt, requireTenant, async (req: Request, res:
     const filePath = path.join(FIRMWARE_DIR, release.filename);
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
-    await prisma.firmwareRelease.delete({ where: { id: req.params.id } });
+    await prisma.firmwareRelease.delete({ where: { id: Array.isArray(req.params.id) ? req.params.id[0] : req.params.id } });
     return res.json({ ok: true });
   } catch (e) {
     console.error(e);
