@@ -118,6 +118,7 @@ router.get("/check", async (req: Request, res: Response) => {
     const deviceKey   = Array.isArray(req.headers["x-device-key"]) ? req.headers["x-device-key"][0] : req.headers["x-device-key"] as string | undefined;
     const curVersion  = req.query.version     as string ?? "";
     const deviceClass = req.query.deviceClass as string ?? "SPEAKER";
+    const hwModel     = req.query.hwModel     as string ?? "";
 
     if (!deviceKey) return res.status(401).json({ error: "x-device-key kötelező" });
     const safeKey = deviceKey as string;
@@ -137,12 +138,13 @@ router.get("/check", async (req: Request, res: Response) => {
     }
     if (!device) return res.status(401).json({ error: "Ismeretlen eszköz" });
 
-    // Legújabb kompatibilis firmware lekérése
+    // Legújabb kompatibilis firmware lekérése – hwModel > deviceClass > ALL prioritás
     const latest = await prisma.firmwareRelease.findFirst({
       where: {
         OR: [
           { targetClass: "ALL" },
           { targetClass: deviceClass },
+          ...(hwModel ? [{ targetClass: hwModel }] : []),
         ],
       },
       orderBy: { createdAt: "desc" },

@@ -179,6 +179,10 @@ model Device {
   createdAt DateTime @default(now())
   deviceClass DeviceClass @default(SPEAKER)
 
+  // Hardver modell – firmware célzáshoz
+  hwModel      String?   @default("ESP32_S3")
+  // pl: ESP32_WROOM, ESP32_S3, ESP32_S3_N16R8, DISPLAY_S3, MULTI_S3
+
   // OTA frissítési állapot
   otaStatus    OtaStatus @default(UP_TO_DATE)
   otaProgress  Int       @default(0)

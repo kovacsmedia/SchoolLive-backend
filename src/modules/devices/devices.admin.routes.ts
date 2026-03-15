@@ -29,6 +29,10 @@ const DEVICE_SELECT = {
   serialNumber: true,
   clientId: true,
   userId: true,
+  hwModel: true,
+  otaStatus: true,
+  otaProgress: true,
+  otaVersion: true,
 } as const;
 
 // ─── GET /admin/devices/health ────────────────────────────────────────────
@@ -59,6 +63,10 @@ router.get("/health", authJwt, requireTenant, async (req, res) => {
       orgUnitId:   d.orgUnitId,
       serialNumber: d.serialNumber,
       authType:    d.authType,
+      hwModel:     d.hwModel,
+      otaStatus:   d.otaStatus,
+      otaProgress: d.otaProgress,
+      otaVersion:  d.otaVersion,
       isVirtualPlayer: d.authType === "JWT" && !!d.userId,
     }));
 
@@ -74,7 +82,6 @@ router.get("/health", authJwt, requireTenant, async (req, res) => {
 });
 
 // ─── GET /admin/devices/pending-web ──────────────────────────────────────
-// Aktiválásra váró WebPlayer eszközök listája
 router.get("/pending-web", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
@@ -82,20 +89,12 @@ router.get("/pending-web", authJwt, requireTenant, async (req, res) => {
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    // PendingDevice-ok ahol van clientId (WebPlayer) és nincs még Device
     const pending = await prisma.pendingDevice.findMany({
-      where: {
-        clientId: { not: null },
-        mac:      { startsWith: "WP-" },
-      },
+      where: { clientId: { not: null }, mac: { startsWith: "WP-" } },
       orderBy: { lastSeenAt: "desc" },
     });
 
-    // Szűrjük ki azokat ahol már van aktív Device (userId alapján)
-    const userIds = pending
-      .map(p => p.userId)
-      .filter((id): id is string => !!id);
-
+    const userIds = pending.map(p => p.userId).filter((id): id is string => !!id);
     const activatedUserIds = userIds.length > 0
       ? (await prisma.device.findMany({
           where: { userId: { in: userIds }, tenantId: user.tenantId! },
@@ -106,14 +105,9 @@ router.get("/pending-web", authJwt, requireTenant, async (req, res) => {
     const result = pending
       .filter(p => !activatedUserIds.includes(p.userId))
       .map(p => ({
-        id:          p.id,
-        mac:         p.mac,
-        clientId:    p.clientId,
-        userId:      p.userId,
-        ipAddress:   p.ipAddress,
-        userAgent:   p.userAgent,
-        firstSeenAt: p.firstSeenAt,
-        lastSeenAt:  p.lastSeenAt,
+        id: p.id, mac: p.mac, clientId: p.clientId, userId: p.userId,
+        ipAddress: p.ipAddress, userAgent: p.userAgent,
+        firstSeenAt: p.firstSeenAt, lastSeenAt: p.lastSeenAt,
       }));
 
     return res.json({ ok: true, pendingWeb: result });
@@ -124,7 +118,6 @@ router.get("/pending-web", authJwt, requireTenant, async (req, res) => {
 });
 
 // ─── POST /admin/devices/activate-web/:pendingId ─────────────────────────
-// WebPlayer aktiválása: PendingDevice → Device
 router.post("/activate-web/:pendingId", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
@@ -135,53 +128,38 @@ router.post("/activate-web/:pendingId", authJwt, requireTenant, async (req, res)
     const pendingId = String(req.params.pendingId);
     const { name } = req.body ?? {};
 
-    const pending = await prisma.pendingDevice.findUnique({
-      where: { id: pendingId },
-    });
-
+    const pending = await prisma.pendingDevice.findUnique({ where: { id: pendingId } });
     if (!pending || !pending.clientId || !pending.userId) {
       return res.status(404).json({ error: "Pending web player not found" });
     }
 
-    // Ellenőrzés: nincs-e már aktív Device ehhez a userId-hoz
     const existing = await prisma.device.findFirst({
       where: { userId: pending.userId, tenantId: user.tenantId! },
     });
-    if (existing) {
-      return res.status(409).json({ error: "This user already has an active device" });
-    }
+    if (existing) return res.status(409).json({ error: "This user already has an active device" });
 
-    // PLAYER user adatai
     const playerUser = await prisma.user.findUnique({
       where: { id: pending.userId },
       select: { id: true, displayName: true, email: true, tenantId: true },
     });
-
     if (!playerUser || playerUser.tenantId !== user.tenantId) {
       return res.status(404).json({ error: "Player user not found or wrong tenant" });
     }
 
     const deviceName = name?.trim() || playerUser.displayName || playerUser.email || "Web Player";
 
-    // Device létrehozása
     const device = await prisma.device.create({
       data: {
-        tenantId:        user.tenantId!,
-        name:            deviceName,
-        authType:        "JWT",
-        deviceClass:     "MULTI",
-        clientId:        pending.clientId,
-        userId:          pending.userId,
-        ipAddress:       pending.ipAddress,
-        firmwareVersion: "WP",
-        online:          false,
-        volume:          7,
+        tenantId: user.tenantId!, name: deviceName,
+        authType: "JWT", deviceClass: "MULTI",
+        clientId: pending.clientId, userId: pending.userId,
+        ipAddress: pending.ipAddress,
+        firmwareVersion: "WP", hwModel: "VIRTUAL",
+        online: false, volume: 7,
       },
     });
 
-    // PendingDevice törlése
     await prisma.pendingDevice.delete({ where: { id: pendingId } });
-
     return res.status(201).json({ ok: true, device });
   } catch (err) {
     console.error(err);
@@ -190,7 +168,6 @@ router.post("/activate-web/:pendingId", authJwt, requireTenant, async (req, res)
 });
 
 // ─── PATCH /admin/devices/:id ─────────────────────────────────────────────
-// Eszköz szerkesztése (név, orgUnit)
 router.patch("/:id", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
@@ -199,7 +176,7 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
     }
 
     const id = String(req.params.id).trim();
-    const { name, orgUnitId, volume, muted } = req.body ?? {};
+    const { name, orgUnitId, volume, muted, hwModel } = req.body ?? {};
 
     const existing = await prisma.device.findFirst({
       where: { id, tenantId: user.tenantId! },
@@ -207,17 +184,13 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
     if (!existing) return res.status(404).json({ error: "Device not found" });
 
     const data: Record<string, unknown> = {};
-    if (name?.trim())              data.name      = name.trim();
+    if (name?.trim())                    data.name      = name.trim();
     if (typeof orgUnitId !== "undefined") data.orgUnitId = orgUnitId ?? null;
-    if (typeof volume    !== "undefined") data.volume    = Math.min(10, Math.max(0, Number(volume)));
-    if (typeof muted     !== "undefined") data.muted     = Boolean(muted);
+    if (typeof volume !== "undefined")    data.volume    = Math.min(10, Math.max(0, Number(volume)));
+    if (typeof muted !== "undefined")     data.muted     = Boolean(muted);
+    if (hwModel?.trim())                  data.hwModel   = hwModel.trim();
 
-    const updated = await prisma.device.update({
-      where: { id },
-      data,
-      select: DEVICE_SELECT,
-    });
-
+    const updated = await prisma.device.update({ where: { id }, data, select: DEVICE_SELECT });
     return res.json({ ok: true, device: updated });
   } catch (err) {
     console.error(err);
@@ -226,26 +199,19 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
 });
 
 // ─── DELETE /admin/devices/:id ────────────────────────────────────────────
-// PLAYER (JWT) eszköz NEM törölhető – csak az ESP32-k
 router.delete("/:id", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
     if (user.role !== "SUPER_ADMIN" && user.role !== "TENANT_ADMIN") {
       return res.status(403).json({ error: "Forbidden" });
     }
-
     const id = String(req.params.id).trim();
     if (!id) return res.status(400).json({ error: "id is required" });
-
     const existing = await prisma.device.findFirst({
-      where: { id, tenantId: user.tenantId! },
-      select: { id: true },
+      where: { id, tenantId: user.tenantId! }, select: { id: true },
     });
-
     if (!existing) return res.status(404).json({ error: "Device not found" });
-
     await prisma.device.delete({ where: { id } });
-
     return res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -253,12 +219,8 @@ router.delete("/:id", authJwt, requireTenant, async (req, res) => {
   }
 });
 
+// ═══ CSOPORTOK ═══════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ESZKÖZ CSOPORTOK
-// ═══════════════════════════════════════════════════════════════════════════
-
-// GET /admin/devices/groups
 router.get("/groups", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
@@ -275,7 +237,6 @@ router.get("/groups", authJwt, requireTenant, async (req, res) => {
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed" }); }
 });
 
-// POST /admin/devices/groups
 router.post("/groups", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
@@ -293,7 +254,6 @@ router.post("/groups", authJwt, requireTenant, async (req, res) => {
   }
 });
 
-// PATCH /admin/devices/groups/:id
 router.patch("/groups/:id", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
@@ -303,11 +263,8 @@ router.patch("/groups/:id", authJwt, requireTenant, async (req, res) => {
       where: { id: String(req.params.id), tenantId: user.tenantId },
     });
     if (!existing) return res.status(404).json({ error: "Not found" });
-
     await prisma.$transaction(async (tx) => {
-      if (name?.trim()) {
-        await tx.deviceGroup.update({ where: { id: existing.id }, data: { name: name.trim() } });
-      }
+      if (name?.trim()) await tx.deviceGroup.update({ where: { id: existing.id }, data: { name: name.trim() } });
       if (Array.isArray(deviceIds)) {
         await tx.deviceGroupMember.deleteMany({ where: { groupId: existing.id } });
         if (deviceIds.length > 0) {
@@ -318,7 +275,6 @@ router.patch("/groups/:id", authJwt, requireTenant, async (req, res) => {
         }
       }
     });
-
     const updated = await prisma.deviceGroup.findFirst({
       where: { id: existing.id },
       include: { members: { select: { deviceId: true } } },
@@ -333,7 +289,6 @@ router.patch("/groups/:id", authJwt, requireTenant, async (req, res) => {
   }
 });
 
-// DELETE /admin/devices/groups/:id
 router.delete("/groups/:id", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
