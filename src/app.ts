@@ -15,6 +15,7 @@ import tenantsAdminRouter       from "./modules/tenants/tenants.admin.routes";
 import { bellsRouter }          from "./modules/bells/bells.routes";
 import radioRoutes              from "./modules/radio/radio.routes";
 import contactRouter            from "./modules/contact/contact.routes";
+import firmwareRouter           from "./modules/firmware/firmware.routes";
 import { authJwt }              from "./middleware/authJwt";
 import { requireTenant }        from "./middleware/tenant";
 import prisma                   from "./prisma";
@@ -44,21 +45,11 @@ app.use(express.urlencoded({ extended: true, limit: "200mb" }));
 
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-/**
- * GET /time
- * Pontos szerveridő visszaadása – a VirtualPlayer Crystal Clock Sync-hez használja.
- * Nincs auth – a minimális válasz késleltetés a cél.
- */
 app.get("/time", (_req, res) => {
-  // process.hrtime.bigint() nanomásodperces pontossággal
   const now = Date.now();
   res.json({ now, iso: new Date(now).toISOString() });
 });
 
-/**
- * GET /sync/status
- * SyncEngine státusz – debug célra, admin auth kell
- */
 app.get("/sync/status", authJwt, (_req, res) => {
   res.json(SyncEngine.getStatus());
 });
@@ -77,11 +68,13 @@ app.use("/player/device",  playerDeviceRouter);
 app.use("/bells",          bellsRouter);
 app.use("/radio",          radioRoutes);
 app.use("/contact",        contactRouter);
+app.use("/firmware",       firmwareRouter);
 
 // Statikus fájlok
 app.use("/audio/bells",  express.static(path.join(process.cwd(), "audio", "bells")));
 app.use("/audio",        express.static("/opt/schoollive/backend/audio"));
 app.use("/uploads/radio", express.static(path.join(process.cwd(), "uploads", "radio")));
+app.use("/firmware/files", express.static(path.join(process.cwd(), "uploads", "firmware")));
 
 // ── /bells/today ──────────────────────────────────────────────────────────────
 
