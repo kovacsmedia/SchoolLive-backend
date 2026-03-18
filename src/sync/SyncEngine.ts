@@ -85,7 +85,7 @@ class SyncEngineClass {
   private readonly PREPARE_WINDOW_MS  = 4000;  // ennyi idő a prefetchre
   private readonly SAFETY_MARGIN_MS   = 500;   // playAt buffer a p95 felett
   private readonly FALLBACK_LEAD_MS   = 5000;  // ha nincs minden ACK: 5s múlva játszik
-  private readonly MIN_LEAD_MS        = 2000;  // minimum lead time (ESP32 startup ~1s)
+  private readonly MIN_LEAD_MS        = 2000;  // minimum lead time (ESP32 startup ~350ms + margin)
   private readonly ACK_WAIT_MS        = 3800;  // ennyi ms-ig várunk ACK-okra
 
   // ── Init ──────────────────────────────────────────────────────────────────
@@ -333,9 +333,15 @@ class SyncEngineClass {
     // Ha mindenki ACK-olt → azonnal PLAY
     if (syncState.acks.size >= syncState.expectedDevices.size) {
       if (syncState.playAtTimer) clearTimeout(syncState.playAtTimer);
-      const maxBufferMs = Math.max(...Array.from(syncState.acks.values()).map(a => a.bufferMs));
-      const leadMs      = Math.max(this.MIN_LEAD_MS, maxBufferMs + this.SAFETY_MARGIN_MS);
-      console.log(`[SyncEngine] 🎯 Minden ACK megérkezett – PLAY leadMs=${leadMs}`);
+
+      // JAVÍTÁS: a bufferMs a LETÖLTÉSI idő – az már KÉSZ.
+      // A playFile() startup overhead-et az ESP32 maga kompenzálja (SyncClient.cpp).
+      // Elég MIN_LEAD_MS (2000ms) a PLAY broadcast propagációjához + biztonságra.
+      // Ez kisebb lead time-ot eredményez mint a korábbi maxBufferMs + margin,
+      // ami feleslegesen nagy késleltetést okozott.
+      const leadMs = this.MIN_LEAD_MS;
+
+      console.log(`[SyncEngine] 🎯 Minden ACK megérkezett (${syncState.acks.size} db) – PLAY leadMs=${leadMs}`);
       this.sendPlay(syncState, leadMs);
     }
   }
