@@ -154,8 +154,7 @@ async function updateYtDlp() {
     proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
     proc.on("close", (code: number) => {
-      console.log(`[YT-UPDATE] Kész (code=${code}): ${out.trim().split("
-").pop() ?? ""}`);
+      console.log(`[YT-UPDATE] Kész (code=${code}): ${out.trim().split("\n").pop() ?? ""}`);
       resolve();
     });
     proc.on("error", (e: Error) => {
