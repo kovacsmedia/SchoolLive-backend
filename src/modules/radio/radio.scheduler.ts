@@ -135,10 +135,57 @@ async function resolveDeviceIds(
   return [];
 }
 
+// ── yt-dlp napi frissítés ─────────────────────────────────────────────────
+async function updateYtDlp() {
+  const { spawn } = await import("child_process");
+  const { existsSync } = await import("fs");
+
+  const candidates = [
+    "/home/balazs/.local/bin/yt-dlp",
+    "/usr/local/bin/yt-dlp",
+    "/usr/bin/yt-dlp",
+  ];
+  const bin = candidates.find(p => existsSync(p)) ?? "yt-dlp";
+
+  console.log(`[YT-UPDATE] yt-dlp frissítés indítása: ${bin}`);
+  return new Promise<void>((resolve) => {
+    const proc = spawn(bin, ["--update"], { stdio: "pipe" });
+    let out = "";
+    proc.stdout?.on("data", (d: Buffer) => { out += d.toString(); });
+    proc.stderr?.on("data", (d: Buffer) => { out += d.toString(); });
+    proc.on("close", (code: number) => {
+      console.log(`[YT-UPDATE] Kész (code=${code}): ${out.trim().split("
+").pop() ?? ""}`);
+      resolve();
+    });
+    proc.on("error", (e: Error) => {
+      console.warn("[YT-UPDATE] Hiba:", e.message);
+      resolve();
+    });
+  });
+}
+
+function scheduleYtDlpUpdate() {
+  // Éjjel 3:00-kor frissít naponta
+  function msUntilNextUpdate(): number {
+    const now  = new Date();
+    const next = new Date(now);
+    next.setHours(3, 0, 0, 0);
+    if (next <= now) next.setDate(next.getDate() + 1);
+    return next.getTime() - now.getTime();
+  }
+  setTimeout(function run() {
+    void updateYtDlp();
+    setTimeout(run, 24 * 60 * 60 * 1000);  // következő nap
+  }, msUntilNextUpdate());
+  console.log(`[YT-UPDATE] Következő frissítés: ${Math.round(msUntilNextUpdate()/1000/60)} perc múlva`);
+}
+
 export function startRadioScheduler() {
   if (_running) return;
   _running = true;
   console.log("[RADIO-SCHEDULER] Started (tick every 30s, lookahead 60s)");
   tick();
   setInterval(tick, TICK_INTERVAL_MS);
+  scheduleYtDlpUpdate();
 }

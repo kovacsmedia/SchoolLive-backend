@@ -231,24 +231,27 @@ router.post("/schedules", authJwt, requireTenant, async (req: Request, res: Resp
     });
     if (!file) return res.status(404).json({ error: "Radio file not found" });
 
-    // Ütközésdetekció
+    // Ütközésdetekció – PENDING + éppen játszó DISPATCHED
     if (file.durationSec) {
       const endTime = new Date(scheduledDate.getTime() + file.durationSec * 1000);
-      const conflict = await prisma.radioSchedule.findFirst({
+      const candidates = await prisma.radioSchedule.findMany({
         where: {
-          tenantId: tid(req),
-          status: "PENDING",
+          tenantId:   tid(req),
+          status:     { in: ["PENDING", "DISPATCHED"] },
           targetType: targetType as any,
           ...(targetId ? { targetId: String(targetId) } : {}),
           scheduledAt: { lt: endTime },
         },
         include: { radioFile: { select: { durationSec: true, originalName: true } } },
+        orderBy: { scheduledAt: "asc" },
       });
 
-      if (conflict) {
+      for (const conflict of candidates) {
         const conflictEnd = conflict.radioFile.durationSec
           ? new Date(conflict.scheduledAt.getTime() + conflict.radioFile.durationSec * 1000)
           : null;
+        // DISPATCHED: csak ha még ténylegesen játszik
+        if (conflict.status === "DISPATCHED" && conflictEnd && conflictEnd < new Date()) continue;
         if (!conflictEnd || conflictEnd > scheduledDate) {
           return res.status(409).json({
             error: "Időütközés",
@@ -256,6 +259,7 @@ router.post("/schedules", authJwt, requireTenant, async (req: Request, res: Resp
               id:           conflict.id,
               scheduledAt:  conflict.scheduledAt,
               originalName: conflict.radioFile.originalName,
+              status:       conflict.status,
             },
           });
         }
@@ -375,7 +379,17 @@ export default router;
 // ═══════════════════════════════════════════════════════════════════════════
 
 
-const YT_DLP_BIN = process.env.YT_DLP_BIN ?? "yt-dlp";
+// yt-dlp teljes elérési út – deploy user PATH-ján nincs benne a ~/.local/bin
+const YT_DLP_BIN = process.env.YT_DLP_BIN
+  ?? (() => {
+    const candidates = [
+      "/home/balazs/.local/bin/yt-dlp",
+      "/usr/local/bin/yt-dlp",
+      "/usr/bin/yt-dlp",
+    ];
+    const { existsSync } = require("fs");
+    return candidates.find((p: string) => existsSync(p)) ?? "yt-dlp";
+  })();
 
 function runCmd(bin: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -650,32 +664,62 @@ async function buildYoutubePlaylist(
 // VÉSZLEÁLLÍTÓ + NOW PLAYING
 // ═══════════════════════════════════════════════════════════════════════════
 
-// POST /radio/stop-all
-// Minden VP eszközre (authType: JWT) STOP_PLAYBACK parancsot küld.
+// POST /radio/stop-all – MINDEN eszköz: VP (JWT) + ESP32 (KEY)
 router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
 
-    const vpDevices = await prisma.device.findMany({
-      where: { tenantId: tid(req), authType: "JWT" },
+    const allDevices = await prisma.device.findMany({
+      where:  { tenantId: tid(req) },
       select: { id: true },
     });
 
-    if (vpDevices.length === 0) {
-      return res.json({ ok: true, sent: 0 });
+    if (allDevices.length === 0) return res.json({ ok: true, sent: 0 });
+
+    const { SyncEngine } = await import("../../sync/SyncEngine");
+
+    // Online eszközök → SyncEngine azonnali broadcast
+    const onlineIds  = allDevices.map(d => d.id).filter(id => SyncEngine.isDeviceOnline(id));
+    const offlineIds = allDevices.map(d => d.id).filter(id => !SyncEngine.isDeviceOnline(id));
+
+    if (onlineIds.length > 0) {
+      SyncEngine.broadcastImmediate(tid(req), {
+        action:    "STOP_PLAYBACK",
+        commandId: `stop-${Date.now()}`,
+      });
     }
 
-    await prisma.deviceCommand.createMany({
-      data: vpDevices.map(d => ({
-        tenantId: tid(req),
-        deviceId: d.id,
-        status:   "QUEUED",
-        payload:  { action: "STOP_PLAYBACK" },
-      })),
-    });
+    // Offline eszközök → DB queue
+    if (offlineIds.length > 0) {
+      await prisma.deviceCommand.createMany({
+        data: offlineIds.map(deviceId => ({
+          tenantId: tid(req),
+          deviceId,
+          status:   "QUEUED" as const,
+          payload:  { action: "STOP_PLAYBACK" },
+        })),
+      });
+    }
 
-    console.log(`[RADIO] STOP_PLAYBACK sent to ${vpDevices.length} VP device(s)`);
-    return res.json({ ok: true, sent: vpDevices.length });
+    // Éppen játszó DISPATCHED ütemezések → CANCELLED
+    const now = new Date();
+    const dispatched = await prisma.radioSchedule.findMany({
+      where:   { tenantId: tid(req), status: "DISPATCHED", dispatchedAt: { not: null } },
+      include: { radioFile: { select: { durationSec: true } } },
+    });
+    const stillPlaying = dispatched.filter(s => {
+      if (!s.dispatchedAt) return false;
+      return now < new Date(s.dispatchedAt.getTime() + (s.radioFile.durationSec ?? 0) * 1000);
+    });
+    if (stillPlaying.length > 0) {
+      await prisma.radioSchedule.updateMany({
+        where: { id: { in: stillPlaying.map(s => s.id) } },
+        data:  { status: "CANCELLED" },
+      });
+    }
+
+    console.log(`[RADIO] STOP → ${onlineIds.length} online, ${offlineIds.length} offline`);
+    return res.json({ ok: true, sent: allDevices.length });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to stop playback" });
