@@ -29,6 +29,15 @@ const storage = multer.diskStorage({
   },
 });
 
+// multer Latin-1 → UTF-8 dekódolás (böngésző sokszor latin-1-ként küldi a fájlneveket)
+function fixEncoding(name: string): string {
+  try {
+    return Buffer.from(name, "latin1").toString("utf8");
+  } catch {
+    return name;
+  }
+}
+
 const upload = multer({
   storage,
   limits: { fileSize: 200 * 1024 * 1024 },
@@ -126,7 +135,7 @@ router.post(
           tenantId:    tid(req),
           createdById: uid(req),
           filename:    req.file.filename,
-          originalName: req.file.originalname,
+          originalName: fixEncoding(req.file.originalname),
           sizeBytes:   req.file.size,
           durationSec,
           fileUrl,
@@ -946,7 +955,7 @@ router.post("/files/trim", authJwt, requireTenant, async (req: Request, res: Res
 
     // Eredeti fájlnév alapú -edited név
     const baseName     = radioFile.originalName.replace(/\.mp3$/i, "");
-    const editedName   = `${baseName}-edited.mp3`;
+    const editedName   = fixEncoding(`${baseName}-edited.mp3`);
 
     const newFile = await prisma.radioFile.create({
       data: { tenantId: tid(req), createdById: uid(req), filename, originalName: editedName, sizeBytes, durationSec, fileUrl },
@@ -1065,7 +1074,7 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
       const fileUrl     = `${baseUrl()}/uploads/radio/${filename}`;
 
       const radioFile = await prisma.radioFile.create({
-        data: { tenantId, createdById, filename, originalName: `${name.trim()}.mp3`, sizeBytes, durationSec, fileUrl },
+        data: { tenantId, createdById, filename, originalName: fixEncoding(`${name.trim()}.mp3`), sizeBytes, durationSec, fileUrl },
       });
 
       buildStatusMap.set(buildId, { status: "DONE", fileUrl, name: radioFile.originalName });
