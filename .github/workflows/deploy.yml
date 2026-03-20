@@ -79,13 +79,7 @@ jobs:
             chmod 755 /opt/schoollive/backend/uploads/radio
 
             echo "== yt-dlp frissítés =="
-            if command -v yt-dlp &>/dev/null; then
-              yt-dlp -U || true
-            else
-              pip install yt-dlp --break-system-packages --quiet || \
-              curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-                -o /usr/local/bin/yt-dlp && chmod +x /usr/local/bin/yt-dlp || true
-            fi
+            /home/deploy/.local/bin/yt-dlp -U || true
 
             echo "== PM2 start/reload =="
             if pm2 describe schoollive-api >/dev/null 2>&1; then
