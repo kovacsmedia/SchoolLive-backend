@@ -26,7 +26,6 @@ export interface PreparePayload {
   text?:           string;
   title?:          string;
   prepareDeadline: string;   // ISO – ennyi időd van a prefetchre
-  snapcastActive?: boolean;
 }
 
 export interface PlayPayload {
@@ -260,8 +259,9 @@ class SyncEngineClass {
     text?:       string;
     title?:      string;
     targetDeviceIds?: string[];  // ha null → tenant összes online eszköze
+    snapcastActive?:  boolean;   // VP csak overlayt mutat, hangot Snapcast adja
   }): Promise<void> {
-    const { tenantId, commandId, action, url, text, title, targetDeviceIds } = params;
+    const { tenantId, commandId, action, url, text, title, targetDeviceIds, snapcastActive } = params;
 
     // Online eszközök szűrése
     const targets = this.getOnlineClients(tenantId, targetDeviceIds);
@@ -294,6 +294,7 @@ class SyncEngineClass {
       text,
       title,
       prepareDeadline: deadline.toISOString(),
+      snapcastActive,
     };
 
     console.log(`[SyncEngine] 📤 PREPARE → ${targets.length} eszköz, leadMs=${leadMs}, commandId=${commandId}`);
