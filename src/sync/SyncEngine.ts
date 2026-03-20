@@ -26,6 +26,7 @@ export interface PreparePayload {
   text?:           string;
   title?:          string;
   prepareDeadline: string;   // ISO – ennyi időd van a prefetchre
+  snapcastActive?: boolean;
 }
 
 export interface PlayPayload {
