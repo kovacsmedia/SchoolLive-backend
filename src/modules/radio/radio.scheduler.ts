@@ -1,11 +1,13 @@
 // src/modules/radio/radio.scheduler.ts
 //
-// Dispatch stratégia:
-//   1. SyncEngine.dispatchSync() → online WebSocket VP eszközök (szinkron)
-//   2. DeviceCommand DB queue    → offline / poll-alapú eszközök (fallback)
+// Dispatch stratégia (Snapcast alapú):
+//   1. SnapcastService → PCM stream (elsődleges, online mód)
+//   2. SyncEngine.dispatchSync() → overlay VP eszközökre + snapcastActive flag
+//   3. DeviceCommand DB queue → offline eszközök fallback
 
-import { prisma }     from "../../prisma/client";
-import { SyncEngine } from "../../sync/SyncEngine";
+import { prisma }          from "../../prisma/client";
+import { SyncEngine }      from "../../sync/SyncEngine";
+import { SnapcastService } from "../snapcast/snapcast.service";
 
 const TICK_INTERVAL_MS   = 30_000;
 const LOOKAHEAD_MS       = 60_000;
@@ -60,40 +62,57 @@ async function dispatchSchedule(schedule: {
   );
 
   if (allDeviceIds.length === 0) {
-    console.warn(`[RADIO-SCHEDULER] Nincs online eszköz: ${schedule.id} – DISPATCHED státusz beállítva`);
+    console.warn(`[RADIO-SCHEDULER] Nincs eszköz: ${schedule.id} – DISPATCHED státusz beállítva`);
   } else {
-    const commandId  = `radio-${schedule.id}`;
+    const commandId = `radio-${schedule.id}`;
+
+    // ── 1. Snapcast: audio stream indítása ───────────────────────────────────
+    const snapOnline = await SnapcastService.isSnapserverOnline();
+    if (snapOnline) {
+      SnapcastService.play({
+        type:       "RADIO",
+        source:     { type: "url", url: schedule.radioFile.fileUrl },
+        tenantId:   schedule.tenantId,
+        title:      schedule.radioFile.originalName,
+        persistent: false,  // ütemezett rádió – nem indul újra automatikusan
+      });
+      console.log(
+        `[RADIO-SCHEDULER] 📻 Snapcast: "${schedule.radioFile.originalName}" | tenant: ${schedule.tenantId}`,
+      );
+    } else {
+      console.warn(`[RADIO-SCHEDULER] ⚠️ Snapserver offline – csak SyncEngine fallback | tenant: ${schedule.tenantId}`);
+    }
+
+    // ── 2. SyncEngine: overlay VP eszközökre + offline ESP32 fallback ────────
     const onlineIds  = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
     const offlineIds = allDeviceIds.filter(id => !SyncEngine.isDeviceOnline(id));
 
-    const payload = {
-      action:      "PLAY_URL",
-      url:         schedule.radioFile.fileUrl,
-      durationSec: schedule.radioFile.durationSec,
-      radioFileId: schedule.radioFile.id,
-      title:       schedule.radioFile.originalName,
-      scheduledAt: schedule.scheduledAt.toISOString(),
-      source:      "RADIO",
-    };
-
-    // ── 1. SyncEngine → online WebSocket eszközök ────────────────────────────
     if (onlineIds.length > 0) {
       await SyncEngine.dispatchSync({
         tenantId:        schedule.tenantId,
         commandId,
         action:          "PLAY_URL",
-        url:             schedule.radioFile.fileUrl,
+        url:             snapOnline ? undefined : schedule.radioFile.fileUrl,
         title:           schedule.radioFile.originalName,
         targetDeviceIds: onlineIds,
+        snapcastActive:  snapOnline,
       });
       console.log(
-        `[RADIO-SCHEDULER] 📻 SyncCast: "${schedule.radioFile.originalName}"` +
-        ` → ${onlineIds.length} online | tenant: ${schedule.tenantId}`,
+        `[RADIO-SCHEDULER] 📻 SyncEngine overlay → ${onlineIds.length} online | tenant: ${schedule.tenantId}`,
       );
     }
 
-    // ── 2. DB queue → offline eszközök ───────────────────────────────────────
+    // ── 3. DB queue: offline eszközök fallback ───────────────────────────────
     if (offlineIds.length > 0) {
+      const payload = {
+        action:      "PLAY_URL",
+        url:         schedule.radioFile.fileUrl,
+        durationSec: schedule.radioFile.durationSec,
+        radioFileId: schedule.radioFile.id,
+        title:       schedule.radioFile.originalName,
+        scheduledAt: schedule.scheduledAt.toISOString(),
+        source:      "RADIO",
+      };
       await prisma.deviceCommand.createMany({
         data: offlineIds.map(deviceId => ({
           tenantId:  schedule.tenantId,
@@ -104,13 +123,11 @@ async function dispatchSchedule(schedule: {
         })),
       });
       console.log(
-        `[RADIO-SCHEDULER] 📻 DB queue: "${schedule.radioFile.originalName}"` +
-        ` → ${offlineIds.length} offline | tenant: ${schedule.tenantId}`,
+        `[RADIO-SCHEDULER] 📻 DB queue → ${offlineIds.length} offline | tenant: ${schedule.tenantId}`,
       );
     }
   }
 
-  // Ütemezés státusz frissítése
   await prisma.radioSchedule.update({
     where: { id: schedule.id },
     data:  { status: "DISPATCHED", dispatchedAt: new Date() },
@@ -141,6 +158,7 @@ async function updateYtDlp() {
   const { existsSync } = await import("fs");
 
   const candidates = [
+    "/home/deploy/.local/bin/yt-dlp",   // elsődleges – deploy user saját telepítés
     "/home/balazs/.local/bin/yt-dlp",
     "/usr/local/bin/yt-dlp",
     "/usr/bin/yt-dlp",
@@ -165,7 +183,6 @@ async function updateYtDlp() {
 }
 
 function scheduleYtDlpUpdate() {
-  // Éjjel 3:00-kor frissít naponta
   function msUntilNextUpdate(): number {
     const now  = new Date();
     const next = new Date(now);
@@ -175,7 +192,7 @@ function scheduleYtDlpUpdate() {
   }
   setTimeout(function run() {
     void updateYtDlp();
-    setTimeout(run, 24 * 60 * 60 * 1000);  // következő nap
+    setTimeout(run, 24 * 60 * 60 * 1000);
   }, msUntilNextUpdate());
   console.log(`[YT-UPDATE] Következő frissítés: ${Math.round(msUntilNextUpdate()/1000/60)} perc múlva`);
 }

@@ -173,6 +173,13 @@ router.delete("/files/:id", authJwt, requireTenant, async (req: Request, res: Re
       }
     }
 
+    // JAVÍTÁS: YoutubePlaylist foreign key constraint megelőzése –
+    // a radioFileId hivatkozást null-ra állítjuk törlés előtt
+    await (prisma as any).youtubePlaylist.updateMany({
+      where: { radioFileId: file.id },
+      data:  { radioFileId: null, status: "IDLE" },
+    });
+
     await prisma.radioFile.delete({ where: { id: file.id } });
 
     return res.json({ ok: true, deletedSchedules: schedCount });
@@ -259,7 +266,6 @@ router.post("/schedules", authJwt, requireTenant, async (req: Request, res: Resp
         const conflictEnd = conflict.radioFile.durationSec
           ? new Date(conflict.scheduledAt.getTime() + conflict.radioFile.durationSec * 1000)
           : null;
-        // DISPATCHED: csak ha még ténylegesen játszik
         if (conflict.status === "DISPATCHED" && conflictEnd && conflictEnd < new Date()) continue;
         if (!conflictEnd || conflictEnd > scheduledDate) {
           return res.status(409).json({
@@ -392,6 +398,7 @@ export default router;
 const YT_DLP_BIN = process.env.YT_DLP_BIN
   ?? (() => {
     const candidates = [
+      "/home/deploy/.local/bin/yt-dlp",   // elsődleges – deploy user saját telepítés
       "/home/balazs/.local/bin/yt-dlp",
       "/usr/local/bin/yt-dlp",
       "/usr/bin/yt-dlp",
@@ -527,7 +534,6 @@ router.delete("/ytplaylists/:id", authJwt, requireTenant, async (req: Request, r
 });
 
 // POST /radio/ytplaylists/:id/build
-// Aszinkron build – azonnal visszatér, háttérben fut
 router.post("/ytplaylists/:id/build", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
@@ -540,13 +546,11 @@ router.post("/ytplaylists/:id/build", authJwt, requireTenant, async (req: Reques
     if (playlist.status === "BUILDING") return res.status(409).json({ error: "Már folyamatban van a build" });
     if (playlist.items.length === 0) return res.status(400).json({ error: "Nincs elem a listában" });
 
-    // BUILDING státusz beállítása
     await (prisma as any).youtubePlaylist.update({
       where: { id },
       data: { status: "BUILDING", errorMsg: null, updatedAt: new Date() },
     });
 
-    // Aszinkron build indítása
     buildYoutubePlaylist(id, playlist, tid(req), uid(req)).catch(async (err) => {
       console.error(`[YT-BUILD] Fatal error for playlist ${id}:`, err);
       await (prisma as any).youtubePlaylist.update({
@@ -594,7 +598,6 @@ async function buildYoutubePlaylist(
 
     const downloadedFiles: string[] = [];
 
-    // ── 1. Minden URL letöltése yt-dlp-vel ──────────────────────────────────
     for (let i = 0; i < playlist.items.length; i++) {
       const item     = playlist.items[i];
       const outTmpl  = path.join(tmpDir, `track_${String(i).padStart(3,"0")}.%(ext)s`);
@@ -610,17 +613,14 @@ async function buildYoutubePlaylist(
         item.youtubeUrl,
       ]);
 
-      // Megkeressük a letöltött fájlt
       const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(`track_${String(i).padStart(3,"0")}`));
       if (files.length === 0) throw new Error(`yt-dlp: letöltés sikertelen: ${item.youtubeUrl}`);
       downloadedFiles.push(path.join(tmpDir, files[0]));
     }
 
-    // ── 2. Concat fájl elkészítése ───────────────────────────────────────────
     const concatContent = downloadedFiles.map(f => `file '${f}'`).join("\n");
     fs.writeFileSync(concatFile, concatContent);
 
-    // ── 3. ffmpeg: összefűzés 128kbps MP3-ba ────────────────────────────────
     const hash      = crypto.randomBytes(12).toString("hex");
     const filename  = `radio_yt_${hash}.mp3`;
     const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
@@ -642,7 +642,6 @@ async function buildYoutubePlaylist(
     const durationSec = await getAudioDurationSec(outputPath);
     const fileUrl = `${baseUrl()}/uploads/radio/${filename}`;
 
-    // ── 4. RadioFile rekord létrehozása ─────────────────────────────────────
     const radioFile = await prisma.radioFile.create({
       data: {
         tenantId,
@@ -655,7 +654,6 @@ async function buildYoutubePlaylist(
       },
     });
 
-    // ── 5. Playlist frissítése ───────────────────────────────────────────────
     await (prisma as any).youtubePlaylist.update({
       where: { id: playlistId },
       data: { status: "DONE", radioFileId: radioFile.id, updatedAt: new Date() },
@@ -664,7 +662,6 @@ async function buildYoutubePlaylist(
     console.log(`[YT-BUILD] ✅ Done! RadioFile: ${filename} (${(sizeBytes/1024/1024).toFixed(1)} MB, ${durationSec}s)`);
 
   } finally {
-    // Ideiglenes könyvtár törlése
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
@@ -673,7 +670,7 @@ async function buildYoutubePlaylist(
 // VÉSZLEÁLLÍTÓ + NOW PLAYING
 // ═══════════════════════════════════════════════════════════════════════════
 
-// POST /radio/stop-all – MINDEN eszköz: VP (JWT) + ESP32 (KEY)
+// POST /radio/stop-all
 router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
@@ -685,9 +682,12 @@ router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Respo
 
     if (allDevices.length === 0) return res.json({ ok: true, sent: 0 });
 
-    const { SyncEngine } = await import("../../sync/SyncEngine");
+    const { SyncEngine }      = await import("../../sync/SyncEngine");
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
 
-    // Online eszközök → SyncEngine azonnali broadcast
+    // Snapcast leállítása
+    SnapcastService.stop();
+
     const onlineIds  = allDevices.map(d => d.id).filter(id => SyncEngine.isDeviceOnline(id));
     const offlineIds = allDevices.map(d => d.id).filter(id => !SyncEngine.isDeviceOnline(id));
 
@@ -698,7 +698,6 @@ router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Respo
       });
     }
 
-    // Offline eszközök → DB queue
     if (offlineIds.length > 0) {
       await prisma.deviceCommand.createMany({
         data: offlineIds.map(deviceId => ({
@@ -710,7 +709,6 @@ router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Respo
       });
     }
 
-    // Éppen játszó DISPATCHED ütemezések → CANCELLED
     const now = new Date();
     const dispatched = await prisma.radioSchedule.findMany({
       where:   { tenantId: tid(req), status: "DISPATCHED", dispatchedAt: { not: null } },
@@ -736,8 +734,6 @@ router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Respo
 });
 
 // GET /radio/now-playing
-// Visszaadja az összes VP eszköz utolsó SENT/ACKED PLAY_URL/TTS parancsát
-// (azaz amit éppen játszanak – heurisztika: legutóbbi dispatched command).
 router.get("/now-playing", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     const vpDevices = await prisma.device.findMany({
@@ -750,8 +746,6 @@ router.get("/now-playing", authJwt, requireTenant, async (req: Request, res: Res
     }
 
     const deviceIds = vpDevices.map(d => d.id);
-
-    // Legutóbbi PLAY_URL vagy TTS parancs (SENT vagy ACKED), ami az utóbbi 6 órában volt
     const since = new Date(Date.now() - 6 * 60 * 60 * 1000);
     const cmd = await prisma.deviceCommand.findFirst({
       where: {
@@ -763,13 +757,11 @@ router.get("/now-playing", authJwt, requireTenant, async (req: Request, res: Res
       orderBy: { queuedAt: "desc" },
     });
 
-    // Payload action szűrés JS-ben (JSON path query nem mindenhol megbízható)
     let nowPlaying: { name: string; durationSec: number | null; queuedAt: string } | null = null;
 
     if (cmd) {
       const payload = cmd.payload as any;
       if (payload?.action === "PLAY_URL" || payload?.action === "TTS") {
-        // Megkeressük a RadioFile-t ha van messageId vagy payload.url alapján
         let name: string = payload?.title ?? payload?.url?.split("/").pop() ?? "Ismeretlen";
         let durationSec: number | null = null;
 
@@ -780,7 +772,6 @@ router.get("/now-playing", authJwt, requireTenant, async (req: Request, res: Res
           });
           if (msg?.title) name = msg.title;
         } else if (payload?.url) {
-          // URL-ből próbáljuk megtalálni a RadioFile-t
           const filename = payload.url.split("/").pop()?.split("?")[0] ?? "";
           if (filename) {
             const rf = await prisma.radioFile.findFirst({
@@ -794,11 +785,7 @@ router.get("/now-playing", authJwt, requireTenant, async (req: Request, res: Res
           }
         }
 
-        nowPlaying = {
-          name,
-          durationSec,
-          queuedAt: cmd.queuedAt.toISOString(),
-        };
+        nowPlaying = { name, durationSec, queuedAt: cmd.queuedAt.toISOString() };
       }
     }
 
@@ -814,11 +801,9 @@ router.get("/now-playing", authJwt, requireTenant, async (req: Request, res: Res
 // PLAYLIST BUILDER – ÚJ ENDPOINTOK
 // ═══════════════════════════════════════════════════════════════════════════
 
-// In-memory build állapot tracker (fileId → status)
 const buildStatusMap = new Map<string, { status: "BUILDING"|"DONE"|"ERROR"; fileUrl?: string; name?: string; errorMsg?: string }>();
 
-// ── GET /radio/yt-info?url=... ────────────────────────────────────────────
-// YouTube videó cím + hossz lekérése yt-dlp-vel
+// GET /radio/yt-info?url=...
 router.get("/yt-info", authJwt, requireTenant, async (req: Request, res: Response) => {
   const url = String(req.query.url ?? "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "url required" });
@@ -841,8 +826,7 @@ router.get("/yt-info", authJwt, requireTenant, async (req: Request, res: Respons
   }
 });
 
-// ── GET /radio/yt-search?q=...&limit=5 ───────────────────────────────────
-// YouTube keresés yt-dlp-vel
+// GET /radio/yt-search?q=...&limit=5
 router.get("/yt-search", authJwt, requireTenant, async (req: Request, res: Response) => {
   const q     = String(req.query.q ?? "").trim();
   const limit = Math.min(10, Math.max(1, parseInt(String(req.query.limit ?? "5"), 10) || 5));
@@ -873,18 +857,15 @@ router.get("/yt-search", authJwt, requireTenant, async (req: Request, res: Respo
   }
 });
 
-// ── GET /radio/gdrive-files?url=... ──────────────────────────────────────
-// Google Drive fájl vagy mappa hangfájljainak listázása
+// GET /radio/gdrive-files?url=...
 router.get("/gdrive-files", authJwt, requireTenant, async (req: Request, res: Response) => {
   const url = String(req.query.url ?? "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "url required" });
 
-  // Mappa (folders/ID) vagy fájl (file/d/ID)?
   const isFolderUrl = /\/drive\/folders\//.test(url);
 
   try {
     if (isFolderUrl) {
-      // Mappa: flat playlist listing
       const out = await runCmd(YT_DLP_BIN, [
         url,
         "--flat-playlist",
@@ -902,7 +883,6 @@ router.get("/gdrive-files", authJwt, requireTenant, async (req: Request, res: Re
         .filter(f => f.url && /\.(mp3|wav|ogg|m4a|aac|flac)/i.test(f.name));
       return res.json({ ok: true, files });
     } else {
-      // Egyedi fájl
       const out = await runCmd(YT_DLP_BIN, [
         url,
         "--print", "%(title)s|||%(url)s|||%(duration)s",
@@ -919,8 +899,7 @@ router.get("/gdrive-files", authJwt, requireTenant, async (req: Request, res: Re
   }
 });
 
-// ── POST /radio/files/trim ────────────────────────────────────────────────
-// Hangfájl levágása + fade-out, eredmény mentése "-edited" névvel
+// POST /radio/files/trim
 router.post("/files/trim", authJwt, requireTenant, async (req: Request, res: Response) => {
   if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
 
@@ -952,8 +931,6 @@ router.post("/files/trim", authJwt, requireTenant, async (req: Request, res: Res
     const sizeBytes    = fs.statSync(outputPath).size;
     const durationSec  = await getAudioDurationSec(outputPath);
     const fileUrl      = `${baseUrl()}/uploads/radio/${filename}`;
-
-    // Eredeti fájlnév alapú -edited név
     const baseName     = radioFile.originalName.replace(/\.mp3$/i, "");
     const editedName   = fixEncoding(`${baseName}-edited.mp3`);
 
@@ -968,8 +945,7 @@ router.post("/files/trim", authJwt, requireTenant, async (req: Request, res: Res
   }
 });
 
-// ── POST /radio/ytplaylists/build-custom ─────────────────────────────────
-// Egyedi lista összeállítása vegyes forrásokból (youtube, gdrive, upload)
+// POST /radio/ytplaylists/build-custom
 router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Request, res: Response) => {
   if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
 
@@ -983,7 +959,6 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
   const buildId = crypto.randomBytes(12).toString("hex");
   buildStatusMap.set(buildId, { status: "BUILDING" });
 
-  // Aszinkron build
   (async () => {
     const tmpDir = path.join(RADIO_UPLOAD_DIR, `custom_tmp_${buildId}`);
     fs.mkdirSync(tmpDir, { recursive: true });
@@ -1027,7 +1002,6 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
           downloadedFiles.push(path.join(tmpDir, found));
 
         } else {
-          // upload: URL alapján letöltés vagy helyi fájl másolása
           const localFilename = item.url.split("/").pop()?.split("?")[0];
           const localPath = localFilename ? path.join(RADIO_UPLOAD_DIR, localFilename) : null;
 
@@ -1036,7 +1010,6 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
             fs.copyFileSync(localPath, dest);
             downloadedFiles.push(dest);
           } else if (item.url.startsWith("http")) {
-            // Letöltés fetch-el
             const https = await import("https");
             const http  = await import("http");
             const dest  = `${outBase}.mp3`;
@@ -1055,7 +1028,6 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
         }
       }
 
-      // Concat
       const concatFile = path.join(tmpDir, "concat.txt");
       fs.writeFileSync(concatFile, downloadedFiles.map(f => `file '${f}'`).join("\n"));
 
@@ -1078,7 +1050,6 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
       });
 
       buildStatusMap.set(buildId, { status: "DONE", fileUrl, name: radioFile.originalName });
-      // FileId-t is tároljuk
       buildStatusMap.set(`${buildId}_fileId`, { status: "DONE", fileUrl, name: radioFile.id });
 
       console.log(`[CUSTOM-BUILD] ✅ ${filename} (${(sizeBytes/1024/1024).toFixed(1)} MB)`);
@@ -1094,13 +1065,12 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
   return res.json({ ok: true, fileId: buildId });
 });
 
-// ── GET /radio/ytplaylists/build-status/:fileId ───────────────────────────
+// GET /radio/ytplaylists/build-status/:fileId
 router.get("/ytplaylists/build-status/:fileId", authJwt, requireTenant, async (req: Request, res: Response) => {
   const buildId = String(req.params.fileId);
   const status  = buildStatusMap.get(buildId);
   if (!status) return res.status(404).json({ ok: false, error: "Nincs ilyen build" });
 
-  // Ha DONE, a radioFileId-t a _fileId kulcson tároltuk
   let fileId: string | undefined;
   if (status.status === "DONE") {
     fileId = buildStatusMap.get(`${buildId}_fileId`)?.name;
