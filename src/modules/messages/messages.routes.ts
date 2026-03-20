@@ -1,15 +1,18 @@
 // src/modules/messages/messages.routes.ts
 //
-// Dispatch stratégia:
-//   - Azonnali: SyncEngine (online) + DB queue (offline)
-//   - Ütemezett: csak DB queue
+// Dispatch stratégia (Snapcast alapú):
+//   - Azonnali TTS/PLAY_URL: SnapcastService (audio) + SyncEngine (overlay VP-re)
+//   - Ütemezett: csak DB queue (Snapcast-ot az időpontban hívja a scheduler)
+//   - Offline VP fallback: DB queue
 
 import { Router, Request, Response } from "express";
-import { prisma }        from "../../prisma/client";
-import { authJwt }       from "../../middleware/authJwt";
-import { requireTenant } from "../../middleware/tenant";
-import { generateTTS }   from "../../services/tts.service";
-import { SyncEngine }    from "../../sync/SyncEngine";
+import { prisma }          from "../../prisma/client";
+import { authJwt }         from "../../middleware/authJwt";
+import { requireTenant }   from "../../middleware/tenant";
+import { generateTTS }     from "../../services/tts.service";
+import { SyncEngine }      from "../../sync/SyncEngine";
+import { SnapcastService } from "../snapcast/snapcast.service";
+import { randomUUID }      from "crypto";
 
 const router = Router();
 
@@ -79,7 +82,7 @@ router.delete("/templates/:id", authJwt, requireTenant, async (req: Request, res
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to delete template" }); }
 });
 
-// POST /messages
+// POST /messages – TTS üzenet küldése
 router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     const tid = tenantId(req);
@@ -93,11 +96,12 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
     const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${filename}`;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
     const isImmediate   = !scheduledTime || scheduledTime <= new Date();
+    const title         = text.trim().substring(0, 64);
 
     const message = await prisma.message.create({
       data: {
         tenantId: tid, createdById: uid, type: "TTS",
-        title: text.trim().substring(0, 64), text: text.trim(),
+        title, text: text.trim(),
         voice, fileUrl, targetType, targetId: targetId ?? null, scheduledAt: scheduledTime,
       },
     });
@@ -106,33 +110,66 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
     if (allDeviceIds.length === 0) return res.status(201).json({ ok: true, message });
 
     if (isImmediate) {
+      // ── 1. Snapcast: audio lejátszás (online mód) ────────────────────────
+      const snapOnline = await SnapcastService.isSnapserverOnline();
+      if (snapOnline) {
+        SnapcastService.play({
+          type:     "TTS",
+          source:   { type: "url", url: fileUrl },
+          tenantId: tid,
+          title,
+          text:     text.trim(),
+        });
+        console.log(`[MESSAGES] 🎙 Snapcast TTS → tenant: ${tid}`);
+      } else {
+        console.warn(`[MESSAGES] ⚠️ Snapserver offline – csak SyncEngine fallback | tenant: ${tid}`);
+      }
+
+      // ── 2. SyncEngine: overlay VP eszközökre + offline ESP32 fallback ────
+      // snapcastActive=true → VP csak overlay-t jelenít meg, hangot a Snapcast adja
+      // snapcastActive=false → VP és ESP32 is saját maga játszik
       const onlineIds  = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
       const offlineIds = allDeviceIds.filter(id => !SyncEngine.isDeviceOnline(id));
 
       if (onlineIds.length > 0) {
         SyncEngine.dispatchSync({
-          tenantId: tid, commandId: `msg-${message.id}`,
-          action: "TTS", url: fileUrl,
-          text: text.trim(), title: text.trim().substring(0, 64),
+          tenantId: tid,
+          commandId: `msg-${message.id}`,
+          action: "TTS",
+          url: snapOnline ? undefined : fileUrl,  // ha Snapcast aktív, VP nem tölti le újra
+          text: text.trim(),
+          title,
           targetDeviceIds: onlineIds,
+          snapcastActive: snapOnline,
         }).catch(e => console.error("[MESSAGES] SyncEngine hiba:", e));
-        console.log(`[MESSAGES] 📤 SyncCast TTS → ${onlineIds.length} online | tenant: ${tid}`);
+        console.log(`[MESSAGES] 📤 SyncEngine overlay → ${onlineIds.length} online | tenant: ${tid}`);
       }
 
+      // ── 3. DB queue: offline VP fallback ────────────────────────────────
       if (offlineIds.length > 0) {
         await prisma.deviceCommand.createMany({
           data: offlineIds.map(deviceId => ({
             tenantId: tid, deviceId, messageId: message.id, status: "QUEUED" as const,
-            payload: { action: "TTS", url: fileUrl, text: text.trim(), title: text.trim().substring(0, 64), scheduledAt: null },
+            payload: {
+              action: "TTS", url: fileUrl,
+              text: text.trim(), title,
+              scheduledAt: null,
+            },
           })),
         });
         console.log(`[MESSAGES] 📤 DB queue TTS → ${offlineIds.length} offline | tenant: ${tid}`);
       }
+
     } else {
+      // Ütemezett: DB queue-ba kerül, a scheduler hívja majd a Snapcastot
       await prisma.deviceCommand.createMany({
         data: allDeviceIds.map(deviceId => ({
           tenantId: tid, deviceId, messageId: message.id, status: "QUEUED" as const,
-          payload: { action: "TTS", url: fileUrl, text: text.trim(), title: text.trim().substring(0, 64), scheduledAt: scheduledTime?.toISOString() ?? null },
+          payload: {
+            action: "TTS", url: fileUrl,
+            text: text.trim(), title,
+            scheduledAt: scheduledTime?.toISOString() ?? null,
+          },
         })),
       });
       console.log(`[MESSAGES] 📅 Ütemezett TTS → ${allDeviceIds.length} eszköz @ ${scheduledTime?.toISOString()} | tenant: ${tid}`);
@@ -140,6 +177,67 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
 
     return res.status(201).json({ ok: true, message });
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to create message" }); }
+});
+
+// POST /messages/play-url – Rádió / stream indítása
+router.post("/play-url", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const tid = tenantId(req);
+    const { url, title = "Iskolarádió", targetType = "ALL", targetId } = req.body;
+
+    if (!url?.trim()) return res.status(400).json({ error: "url is required" });
+
+    const allDeviceIds = await resolveDeviceIds(tid, targetType, targetId);
+
+    // ── 1. Snapcast: stream indítása ─────────────────────────────────────
+    const snapOnline = await SnapcastService.isSnapserverOnline();
+    if (snapOnline) {
+      SnapcastService.play({
+        type:       "RADIO",
+        source:     { type: "stream", url },
+        tenantId:   tid,
+        title,
+        persistent: true,
+      });
+      console.log(`[MESSAGES] 📻 Snapcast RADIO → tenant: ${tid} url: ${url}`);
+    }
+
+    // ── 2. SyncEngine: overlay VP eszközökre ────────────────────────────
+    if (allDeviceIds.length > 0) {
+      const onlineIds = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
+      if (onlineIds.length > 0) {
+        SyncEngine.broadcastImmediate(tid, {
+          action:         "PLAY_URL",
+          commandId:      randomUUID(),
+          url:            snapOnline ? undefined : url,  // VP csak overlay, ha Snapcast aktív
+          title,
+          source:         "RADIO",
+          snapcastActive: snapOnline,
+        }, onlineIds);
+      }
+    }
+
+    return res.json({ ok: true, snapcastActive: snapOnline });
+  } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to start stream" }); }
+});
+
+// POST /messages/stop – Lejátszás leállítása
+router.post("/stop", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const tid = tenantId(req);
+
+    // Snapcast leállítása
+    SnapcastService.stop();
+
+    // SyncEngine broadcast – minden eszköznek
+    SyncEngine.broadcastImmediate(tid, {
+      action:    "STOP_PLAYBACK",
+      commandId: randomUUID(),
+    });
+
+    console.log(`[MESSAGES] 🛑 Stop → tenant: ${tid}`);
+    return res.json({ ok: true });
+  } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to stop playback" }); }
 });
 
 // GET /messages/:id
