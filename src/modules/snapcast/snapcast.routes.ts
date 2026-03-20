@@ -3,8 +3,15 @@
 // Csak SUPER_ADMIN férhet hozzá.
 
 import { Router, Request, Response } from "express";
-import { requireAuth, requireRole }  from "../auth/auth.middleware";
-import { SnapcastService }           from "./snapcast.service";
+import { authJwt }         from "../../middleware/authJwt";
+import { requireTenant }   from "../../middleware/tenant";
+import { SnapcastService } from "./snapcast.service";
+
+const requireSuperAdmin = (req: Request, res: Response, next: Function) => {
+  const user = (req as any).user;
+  if (user?.role !== "SUPER_ADMIN") return res.status(403).json({ error: "Forbidden" });
+  next();
+};
 
 const router = Router();
 
@@ -12,8 +19,8 @@ const router = Router();
 // Snapserver + service státusz
 router.get(
   "/status",
-  requireAuth,
-  requireRole("SUPER_ADMIN"),
+  authJwt,
+  requireSuperAdmin,
   async (_req: Request, res: Response) => {
     const serviceStatus  = SnapcastService.getStatus();
     const serverOnline   = await SnapcastService.isSnapserverOnline();
@@ -25,8 +32,8 @@ router.get(
 // Azonnali leállítás
 router.post(
   "/stop",
-  requireAuth,
-  requireRole("SUPER_ADMIN"),
+  authJwt,
+  requireSuperAdmin,
   (_req: Request, res: Response) => {
     SnapcastService.stop();
     res.json({ ok: true, message: "Snapcast lejátszás leállítva" });
@@ -37,8 +44,8 @@ router.post(
 // Csak a rádió leállítása
 router.post(
   "/stop-radio",
-  requireAuth,
-  requireRole("SUPER_ADMIN"),
+  authJwt,
+  requireSuperAdmin,
   (_req: Request, res: Response) => {
     SnapcastService.stopRadio();
     res.json({ ok: true, message: "Rádió leállítva" });
@@ -49,8 +56,8 @@ router.post(
 // 440Hz szinusz hang 2 másodpercig – kapcsolat teszteléshez
 router.post(
   "/test-tone",
-  requireAuth,
-  requireRole("SUPER_ADMIN"),
+  authJwt,
+  requireSuperAdmin,
   (_req: Request, res: Response) => {
     SnapcastService.play({
       type:     "TTS",
