@@ -118,6 +118,48 @@ router.get("/status/:hardwareId", async (req: Request, res: Response) => {
   }
 });
 
-// Exportáljuk a pendingKeyHashes Map-ot az admin routes-nak
+// ── POST /devices/native/beacon ──────────────────────────────────────────────
+// Eszköz jelzi hogy online – frissíti az online státuszt és lastSeenAt-t
+router.post("/beacon", async (req: Request, res: Response) => {
+  try {
+    const deviceKey = req.headers["x-device-key"] as string;
+    if (!deviceKey) return res.status(400).json({ error: "x-device-key header required" });
+
+    // Megkeressük az eszközt a deviceKey hash alapján
+    const { prisma } = await import("../../prisma/client");
+    const bcrypt = await import("bcrypt");
+    const devices = await prisma.device.findMany({
+      where: { deviceKeyHash: { not: null }, authType: "KEY" },
+      select: { id: true, deviceKeyHash: true },
+    });
+
+    let deviceId: string | null = null;
+    for (const d of devices) {
+      if (!d.deviceKeyHash) continue;
+      const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
+      if (ok) { deviceId = d.id; break; }
+    }
+
+    if (!deviceId) return res.status(401).json({ error: "Invalid device key" });
+
+    const ipAddress = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
+      ?? req.socket.remoteAddress ?? null;
+
+    await prisma.device.update({
+      where: { id: deviceId },
+      data: {
+        online:      true,
+        lastSeenAt:  new Date(),
+        ipAddress:   ipAddress ?? undefined,
+      },
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[NativeBeacon] hiba:", err);
+    return res.status(500).json({ error: "Beacon hiba" });
+  }
+});
+
 export { pendingKeyHashes };
 export default router;
