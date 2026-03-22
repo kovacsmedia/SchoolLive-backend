@@ -198,4 +198,8 @@ router.post("/beacon", async (req: Request, res: Response) => {
     return res.status(500).json({ error: "Beacon hiba" });
   }
 });
-
+router.get("/snap-port", async (req, res) => {
+  const deviceKey = req.headers["x-device-key"] as string;
+  // device key → tenant → snapPort
+  // visszaad: { snapPort: 1800 }
+});
