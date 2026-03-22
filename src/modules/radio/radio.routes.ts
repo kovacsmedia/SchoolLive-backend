@@ -686,7 +686,7 @@ router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Respo
     const { SnapcastService } = await import("../snapcast/snapcast.service");
 
     // Snapcast leállítása
-    SnapcastService.stop();
+    await SnapcastService.stop(tid(req));
 
     const onlineIds  = allDevices.map(d => d.id).filter(id => SyncEngine.isDeviceOnline(id));
     const offlineIds = allDevices.map(d => d.id).filter(id => !SyncEngine.isDeviceOnline(id));
