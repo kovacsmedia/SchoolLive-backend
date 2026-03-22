@@ -199,5 +199,3 @@ router.post("/beacon", async (req: Request, res: Response) => {
   }
 });
 
-export { pendingKeyHashes };
-export default router;
