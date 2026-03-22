@@ -136,7 +136,7 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
           tenantId: tid,
           commandId: `msg-${message.id}`,
           action: "TTS",
-          url: snapOnline ? undefined : fileUrl,  // ha Snapcast aktív, VP nem tölti le újra
+          url: fileUrl,  
           text: text.trim(),
           title,
           targetDeviceIds: onlineIds,
@@ -209,7 +209,7 @@ router.post("/play-url", authJwt, requireTenant, async (req: Request, res: Respo
         SyncEngine.broadcastImmediate(tid, {
           action:         "PLAY_URL",
           commandId:      randomUUID(),
-          url:            snapOnline ? undefined : url,  // VP csak overlay, ha Snapcast aktív
+          url:            url,
           title,
           source:         "RADIO",
           snapcastActive: snapOnline,
