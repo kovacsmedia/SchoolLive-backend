@@ -428,8 +428,14 @@ bellsRouter.get("/version", async (req: Request, res: Response) => {
 
 
 // ─── /today – JWT-vel is elérhető (VirtualPlayer) ─────────────────────────
-bellsRouter.get("/today", authJwt, async (req: Request, res: Response) => {
-  const tenantId = tid(req);
+bellsRouter.get("/today", async (req: Request, res: Response) => {
+  // Device key auth (native player) VAGY JWT auth
+  let tenantId = tid(req);
+  if (!tenantId) {
+    const device = await authenticateDevice(req);
+    if (!device) return res.status(401).json({ error: "Unauthorized" });
+    tenantId = device.tenantId;
+  }
   if (!tenantId) return res.status(400).json({ error: "Tenant required" });
 
   // UTC alapú dátum – a DB is UTC-ben tárolja
