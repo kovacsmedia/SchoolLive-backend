@@ -49,7 +49,8 @@ router.post("/provision", async (req: Request, res: Response) => {
     });
 
     if (activeDevice) {
-      return res.json({ status: "active", deviceId: activeDevice.id });
+      // Aktív → kliens tud csatlakozni WS-re a saját deviceKey-jével
+      return res.json({ status: "active" });
     }
 
     // 2. Pending-ben van-e már?
@@ -108,7 +109,7 @@ router.get("/status/:hardwareId", async (req: Request, res: Response) => {
     });
 
     if (activeDevice) {
-      return res.json({ status: "active", deviceId: activeDevice.id });
+      return res.json({ status: "active" });
     }
     return res.json({ status: "pending" });
   } catch (err) {
@@ -197,46 +198,8 @@ router.post("/beacon", async (req: Request, res: Response) => {
     return res.status(500).json({ error: "Beacon hiba" });
   }
 });
-
-// ── GET /devices/native/snap-port ────────────────────────────────────────────
-// ESP32 lekéri a saját tenant Snapcast portját device key alapján
-router.get("/snap-port", async (req: Request, res: Response) => {
-  try {
-    const deviceKey = req.headers["x-device-key"] as string;
-    if (!deviceKey) return res.status(400).json({ error: "x-device-key kötelező" });
-
-    const bcrypt  = await import("bcrypt");
-    const devices = await prisma.device.findMany({
-      where:  { deviceKeyHash: { not: null }, authType: "KEY" },
-      select: { id: true, deviceKeyHash: true, tenantId: true },
-    });
-
-    let tenantId: string | null = null;
-    for (const d of devices) {
-      if (!d.deviceKeyHash) continue;
-      if (await bcrypt.compare(deviceKey, d.deviceKeyHash)) {
-        tenantId = d.tenantId; break;
-      }
-    }
-
-    if (!tenantId) return res.status(401).json({ error: "Ismeretlen eszköz" });
-
-    const tenant = await prisma.tenant.findUnique({
-      where:  { id: tenantId },
-      select: { snapPort: true },
-    });
-
-    if (!tenant?.snapPort) {
-      return res.status(404).json({ error: "Nincs snapPort beállítva" });
-    }
-
-    console.log(`[NativeSnapPort] tenantId=${tenantId} snapPort=${tenant.snapPort}`);
-    return res.json({ ok: true, snapPort: tenant.snapPort });
-  } catch (err) {
-    console.error("[NativeSnapPort] hiba:", err);
-    return res.status(500).json({ error: "SnapPort lekérdezés hiba" });
-  }
+router.get("/snap-port", async (req, res) => {
+  const deviceKey = req.headers["x-device-key"] as string;
+  // device key → tenant → snapPort
+  // visszaad: { snapPort: 1800 }
 });
-
-export { pendingKeyHashes };
-export default router;
