@@ -118,7 +118,45 @@ router.get("/status/:hardwareId", async (req: Request, res: Response) => {
   }
 });
 
-// ── POST /devices/native/beacon ──────────────────────────────────────────────
+// ── GET /devices/native/info ──────────────────────────────────────────────────
+// Visszaadja az eszköz tenant nevét device key alapján
+router.get("/info", async (req: Request, res: Response) => {
+  try {
+    const deviceKey = req.headers["x-device-key"] as string;
+    if (!deviceKey) return res.status(400).json({ error: "x-device-key required" });
+
+    const { prisma } = await import("../../prisma/client");
+    const bcrypt = await import("bcrypt");
+
+    const devices = await prisma.device.findMany({
+      where: { deviceKeyHash: { not: null }, authType: "KEY" },
+      select: {
+        id: true,
+        deviceKeyHash: true,
+        tenant: { select: { name: true } },
+      },
+    });
+
+    let tenantName: string | null = null;
+    for (const d of devices) {
+      if (!d.deviceKeyHash) continue;
+      const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
+      if (ok) {
+        tenantName = d.tenant?.name ?? null;
+        break;
+      }
+    }
+
+    if (!tenantName) return res.status(401).json({ error: "Invalid device key" });
+    return res.json({ ok: true, tenantName });
+  } catch (err) {
+    console.error("[NativeInfo] hiba:", err);
+    return res.status(500).json({ error: "Info hiba" });
+  }
+});
+
+export { pendingKeyHashes };
+export default router;
 // Eszköz jelzi hogy online – frissíti az online státuszt és lastSeenAt-t
 router.post("/beacon", async (req: Request, res: Response) => {
   try {
