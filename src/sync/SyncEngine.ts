@@ -26,7 +26,6 @@ export interface PreparePayload {
   text?:           string;
   title?:          string;
   prepareDeadline: string;   // ISO – ennyi időd van a prefetchre
-  snapcastActive?: boolean;
 }
 
 export interface PlayPayload {
@@ -123,7 +122,7 @@ class SyncEngineClass {
         ws.close(4002, "Invalid token");
         return;
       }
-      deviceId   = payload.deviceId ?? payload.sub ?? "unknown";
+      deviceId   = url.searchParams.get("clientId") ?? payload.deviceId ?? payload.sub ?? "unknown";
       tenantId   = payload.tenantId ?? payload.tid ?? "";
       clientType = "browser";
     }
