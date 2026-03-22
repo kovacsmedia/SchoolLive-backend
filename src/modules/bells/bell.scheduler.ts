@@ -59,7 +59,6 @@ async function processTenant(
   minute:        number,
   now:           Date,
 ) {
-  // Minden eszköz – Snapcast az összes eszközre játszik (KEY=ESP32, JWT=VP)
   const allDevices = await prisma.device.findMany({
     where:  { tenantId },
     select: { id: true, authType: true },
@@ -102,27 +101,21 @@ async function processTenant(
     const audioUrl  = `https://api.schoollive.hu/audio/bells/${bell.soundFile}`;
     const soundPath = path.join(process.cwd(), "audio", "bells", bell.soundFile);
 
-    // ── 1. Snapcast: elsődleges lejátszás (online mód) ──────────────────────
-    const snapOnline = await SnapcastService.isSnapserverOnline();
+    // ── 1. Snapcast ──────────────────────────────────────────────────────────
+    const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
     if (snapOnline) {
-      SnapcastService.play({
+      await SnapcastService.play({
         type:     "BELL",
         source:   { type: "file", path: soundPath },
         tenantId,
         title:    `Csengetés ${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}`,
       });
-      console.log(
-        `[BELLS-SCHEDULER] 🔔 Snapcast: ${bell.hour}:${String(bell.minute).padStart(2,"0")}` +
-        ` (${bell.type}) | tenant: ${tenantId}`,
-      );
+      console.log(`[BELLS-SCHEDULER] 🔔 Snapcast: ${bell.hour}:${String(bell.minute).padStart(2,"0")} (${bell.type}) | tenant: ${tenantId}`);
     } else {
       console.warn(`[BELLS-SCHEDULER] ⚠️ Snapserver offline – csak fallback | tenant: ${tenantId}`);
     }
 
-    // ── 2. SyncEngine broadcast – vezérlőcsatorna ───────────────────────────
-    // snapcastActive=true → ESP32 NE játsszon lokálisan (Snapcast kezeli)
-    // snapcastActive=false → ESP32 játsszon lokálisan (offline fallback)
-    // VP eszközök megkapják a szöveget overlay megjelenítéshez
+    // ── 2. SyncEngine broadcast ──────────────────────────────────────────────
     SyncEngine.broadcastImmediate(tenantId, {
       action:         "BELL",
       commandId,
@@ -131,11 +124,10 @@ async function processTenant(
       soundFile:      bell.soundFile,
       hour:           bell.hour,
       minute:         bell.minute,
-      snapcastActive: snapOnline,  // ESP32 eldönti: Snapcast vagy lokális lejátszás
+      snapcastActive: snapOnline,
     });
 
-    // ── 3. DB queue – offline eszközök fallback ──────────────────────────────
-    // Csak VP eszközök (JWT) kerülnek a DB queue-ba – ESP32 saját offline logikája van
+    // ── 3. DB queue – offline VP ─────────────────────────────────────────────
     const offlineVpIds = allDevices
       .filter(d => d.authType === "JWT" && !SyncEngine.isDeviceOnline(d.id))
       .map(d => d.id);
@@ -157,10 +149,6 @@ async function processTenant(
           },
         })),
       });
-      console.log(
-        `[BELLS-SCHEDULER] 🔔 DB queue: ${bell.hour}:${String(bell.minute).padStart(2,"0")}` +
-        ` → ${offlineVpIds.length} offline VP | tenant: ${tenantId}`,
-      );
     }
   }
 }

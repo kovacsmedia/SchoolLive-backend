@@ -110,10 +110,10 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
     if (allDeviceIds.length === 0) return res.status(201).json({ ok: true, message });
 
     if (isImmediate) {
-      // ── 1. Snapcast: audio lejátszás (online mód) ────────────────────────
-      const snapOnline = await SnapcastService.isSnapserverOnline();
+      // ── 1. Snapcast ──────────────────────────────────────────────────────────
+      const snapOnline = await SnapcastService.isSnapserverOnline(tid);
       if (snapOnline) {
-        SnapcastService.play({
+        await SnapcastService.play({
           type:     "TTS",
           source:   { type: "url", url: fileUrl },
           tenantId: tid,
@@ -125,9 +125,7 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
         console.warn(`[MESSAGES] ⚠️ Snapserver offline – csak SyncEngine fallback | tenant: ${tid}`);
       }
 
-      // ── 2. SyncEngine: overlay VP eszközökre + offline ESP32 fallback ────
-      // snapcastActive=true → VP csak overlay-t jelenít meg, hangot a Snapcast adja
-      // snapcastActive=false → VP és ESP32 is saját maga játszik
+      // ── 2. SyncEngine ────────────────────────────────────────────────────────
       const onlineIds  = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
       const offlineIds = allDeviceIds.filter(id => !SyncEngine.isDeviceOnline(id));
 
@@ -136,7 +134,7 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
           tenantId: tid,
           commandId: `msg-${message.id}`,
           action: "TTS",
-          url: fileUrl,  
+          url: fileUrl,
           text: text.trim(),
           title,
           targetDeviceIds: onlineIds,
@@ -145,29 +143,23 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
         console.log(`[MESSAGES] 📤 SyncEngine overlay → ${onlineIds.length} online | tenant: ${tid}`);
       }
 
-      // ── 3. DB queue: offline VP fallback ────────────────────────────────
+      // ── 3. DB queue – offline VP ─────────────────────────────────────────────
       if (offlineIds.length > 0) {
         await prisma.deviceCommand.createMany({
           data: offlineIds.map(deviceId => ({
             tenantId: tid, deviceId, messageId: message.id, status: "QUEUED" as const,
-            payload: {
-              action: "TTS", url: fileUrl,
-              text: text.trim(), title,
-              scheduledAt: null,
-            },
+            payload: { action: "TTS", url: fileUrl, text: text.trim(), title, scheduledAt: null },
           })),
         });
         console.log(`[MESSAGES] 📤 DB queue TTS → ${offlineIds.length} offline | tenant: ${tid}`);
       }
 
     } else {
-      // Ütemezett: DB queue-ba kerül, a scheduler hívja majd a Snapcastot
       await prisma.deviceCommand.createMany({
         data: allDeviceIds.map(deviceId => ({
           tenantId: tid, deviceId, messageId: message.id, status: "QUEUED" as const,
           payload: {
-            action: "TTS", url: fileUrl,
-            text: text.trim(), title,
+            action: "TTS", url: fileUrl, text: text.trim(), title,
             scheduledAt: scheduledTime?.toISOString() ?? null,
           },
         })),
@@ -189,10 +181,10 @@ router.post("/play-url", authJwt, requireTenant, async (req: Request, res: Respo
 
     const allDeviceIds = await resolveDeviceIds(tid, targetType, targetId);
 
-    // ── 1. Snapcast: stream indítása ─────────────────────────────────────
-    const snapOnline = await SnapcastService.isSnapserverOnline();
+    // ── 1. Snapcast ──────────────────────────────────────────────────────────
+    const snapOnline = await SnapcastService.isSnapserverOnline(tid);
     if (snapOnline) {
-      SnapcastService.play({
+      await SnapcastService.play({
         type:       "RADIO",
         source:     { type: "stream", url },
         tenantId:   tid,
@@ -202,14 +194,14 @@ router.post("/play-url", authJwt, requireTenant, async (req: Request, res: Respo
       console.log(`[MESSAGES] 📻 Snapcast RADIO → tenant: ${tid} url: ${url}`);
     }
 
-    // ── 2. SyncEngine: overlay VP eszközökre ────────────────────────────
+    // ── 2. SyncEngine ────────────────────────────────────────────────────────
     if (allDeviceIds.length > 0) {
       const onlineIds = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
       if (onlineIds.length > 0) {
         SyncEngine.broadcastImmediate(tid, {
           action:         "PLAY_URL",
           commandId:      randomUUID(),
-          url:            url,
+          url,
           title,
           source:         "RADIO",
           snapcastActive: snapOnline,
@@ -226,10 +218,8 @@ router.post("/stop", authJwt, requireTenant, async (req: Request, res: Response)
   try {
     const tid = tenantId(req);
 
-    // Snapcast leállítása
-    SnapcastService.stop();
+    await SnapcastService.stop(tid);
 
-    // SyncEngine broadcast – minden eszköznek
     SyncEngine.broadcastImmediate(tid, {
       action:    "STOP_PLAYBACK",
       commandId: randomUUID(),

@@ -66,24 +66,22 @@ async function dispatchSchedule(schedule: {
   } else {
     const commandId = `radio-${schedule.id}`;
 
-    // ── 1. Snapcast: audio stream indítása ───────────────────────────────────
-    const snapOnline = await SnapcastService.isSnapserverOnline();
+    // ── 1. Snapcast ──────────────────────────────────────────────────────────
+    const snapOnline = await SnapcastService.isSnapserverOnline(schedule.tenantId);
     if (snapOnline) {
-      SnapcastService.play({
+      await SnapcastService.play({
         type:       "RADIO",
         source:     { type: "url", url: schedule.radioFile.fileUrl },
         tenantId:   schedule.tenantId,
         title:      schedule.radioFile.originalName,
-        persistent: false,  // ütemezett rádió – nem indul újra automatikusan
+        persistent: false,
       });
-      console.log(
-        `[RADIO-SCHEDULER] 📻 Snapcast: "${schedule.radioFile.originalName}" | tenant: ${schedule.tenantId}`,
-      );
+      console.log(`[RADIO-SCHEDULER] 📻 Snapcast: "${schedule.radioFile.originalName}" | tenant: ${schedule.tenantId}`);
     } else {
       console.warn(`[RADIO-SCHEDULER] ⚠️ Snapserver offline – csak SyncEngine fallback | tenant: ${schedule.tenantId}`);
     }
 
-    // ── 2. SyncEngine: overlay VP eszközökre + offline ESP32 fallback ────────
+    // ── 2. SyncEngine ────────────────────────────────────────────────────────
     const onlineIds  = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
     const offlineIds = allDeviceIds.filter(id => !SyncEngine.isDeviceOnline(id));
 
@@ -92,39 +90,34 @@ async function dispatchSchedule(schedule: {
         tenantId:        schedule.tenantId,
         commandId,
         action:          "PLAY_URL",
-        url:             snapOnline ? undefined : schedule.radioFile.fileUrl,
+        url:             schedule.radioFile.fileUrl,
         title:           schedule.radioFile.originalName,
         targetDeviceIds: onlineIds,
         snapcastActive:  snapOnline,
       });
-      console.log(
-        `[RADIO-SCHEDULER] 📻 SyncEngine overlay → ${onlineIds.length} online | tenant: ${schedule.tenantId}`,
-      );
+      console.log(`[RADIO-SCHEDULER] 📻 SyncEngine overlay → ${onlineIds.length} online | tenant: ${schedule.tenantId}`);
     }
 
-    // ── 3. DB queue: offline eszközök fallback ───────────────────────────────
+    // ── 3. DB queue – offline ────────────────────────────────────────────────
     if (offlineIds.length > 0) {
-      const payload = {
-        action:      "PLAY_URL",
-        url:         schedule.radioFile.fileUrl,
-        durationSec: schedule.radioFile.durationSec,
-        radioFileId: schedule.radioFile.id,
-        title:       schedule.radioFile.originalName,
-        scheduledAt: schedule.scheduledAt.toISOString(),
-        source:      "RADIO",
-      };
       await prisma.deviceCommand.createMany({
         data: offlineIds.map(deviceId => ({
           tenantId:  schedule.tenantId,
           deviceId,
           messageId: null,
           status:    "QUEUED" as const,
-          payload,
+          payload: {
+            action:      "PLAY_URL",
+            url:         schedule.radioFile.fileUrl,
+            durationSec: schedule.radioFile.durationSec,
+            radioFileId: schedule.radioFile.id,
+            title:       schedule.radioFile.originalName,
+            scheduledAt: schedule.scheduledAt.toISOString(),
+            source:      "RADIO",
+          },
         })),
       });
-      console.log(
-        `[RADIO-SCHEDULER] 📻 DB queue → ${offlineIds.length} offline | tenant: ${schedule.tenantId}`,
-      );
+      console.log(`[RADIO-SCHEDULER] 📻 DB queue → ${offlineIds.length} offline | tenant: ${schedule.tenantId}`);
     }
   }
 
@@ -134,11 +127,7 @@ async function dispatchSchedule(schedule: {
   });
 }
 
-async function resolveDeviceIds(
-  tenantId:   string,
-  targetType: string,
-  targetId:   string | null,
-): Promise<string[]> {
+async function resolveDeviceIds(tenantId: string, targetType: string, targetId: string | null): Promise<string[]> {
   if (targetType === "ALL") {
     return (await prisma.device.findMany({ where: { tenantId, online: true }, select: { id: true } })).map(d => d.id);
   }
@@ -152,13 +141,13 @@ async function resolveDeviceIds(
   return [];
 }
 
-// ── yt-dlp napi frissítés ─────────────────────────────────────────────────
+// ── yt-dlp napi frissítés ─────────────────────────────────────────────────────
 async function updateYtDlp() {
   const { spawn } = await import("child_process");
   const { existsSync } = await import("fs");
 
   const candidates = [
-    "/home/deploy/.local/bin/yt-dlp",   // elsődleges – deploy user saját telepítés
+    "/home/deploy/.local/bin/yt-dlp",
     "/home/balazs/.local/bin/yt-dlp",
     "/usr/local/bin/yt-dlp",
     "/usr/bin/yt-dlp",
