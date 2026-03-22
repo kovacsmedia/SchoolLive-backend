@@ -20,7 +20,7 @@ import { authJwt }              from "./middleware/authJwt";
 import { requireTenant }        from "./middleware/tenant";
 import prisma                   from "./prisma";
 import { SyncEngine }           from "./sync/SyncEngine";
-
+import nativeRoutes from "./modules/devices/devices.native.routes";
 export const app = express();
 
 const allowedOrigins = ["https://schoollive.hu", "http://localhost:5173"];
@@ -40,6 +40,7 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true, limit: "200mb" }));
+app.use("/devices/native", nativeRoutes);
 
 // ── Alap health + időszinkron ─────────────────────────────────────────────────
 

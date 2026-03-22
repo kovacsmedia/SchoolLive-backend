@@ -1,0 +1,123 @@
+// src/modules/devices/devices.native.routes.ts
+//
+// Native player provisioning – JWT nélkül, MAC alapú hardwareId + client-oldali deviceKey
+//
+// Flow:
+//   1. Kliens generál deviceKey-t (UUID), elmenti lokálisan
+//   2. POST /devices/native/provision {hardwareId, deviceKeyHash, shortId, platform, version}
+//      → pending:  {status:"pending", shortId}
+//      → active:   {status:"active"}   (kliens a saját deviceKey-jével csatlakozik WS-re)
+//   3. Admin aktiválja az Devices oldalon → Device létrejön deviceKeyHash-sel
+//   4. Kliens poll-ol amíg active nem lesz
+
+import { Router, Request, Response } from "express";
+import { prisma }                    from "../../prisma/client";
+import { randomBytes }               from "crypto";
+
+const router = Router();
+
+// In-memory store a pending native playerek deviceKeyHash-éhez
+// (PendingDevice táblában nincs erre mező, ezért memóriában tároljuk)
+// Key: shortId (pl. "WP-ABCD1234"), Value: deviceKeyHash
+const pendingKeyHashes = new Map<string, string>();
+
+// ── POST /devices/native/provision ────────────────────────────────────────────
+// Nyilvános endpoint (nincs auth) – rate limit a caller oldalán ajánlott
+router.post("/provision", async (req: Request, res: Response) => {
+  try {
+    const {
+      hardwareId,    // MAC cím alapú azonosító (pl. "aa:bb:cc:dd:ee:ff")
+      deviceKeyHash, // bcrypt(deviceKey) – kliens generálta
+      shortId,       // "WP-ABCD1234" – a kliens azonosítója a UI-on
+      platform,      // "windows" | "linux" | "android"
+      version,       // app verzió
+      userAgent,
+    } = req.body ?? {};
+
+    if (!hardwareId || !deviceKeyHash || !shortId) {
+      return res.status(400).json({ error: "hardwareId, deviceKeyHash és shortId kötelező" });
+    }
+
+    const ipAddress = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
+      ?? req.socket.remoteAddress
+      ?? null;
+
+    // 1. Megvan-e már aktív Device ezzel a hardwareId-vel?
+    const activeDevice = await prisma.device.findFirst({
+      where: { serialNumber: hardwareId, authType: "KEY" },
+      select: { id: true, tenantId: true },
+    });
+
+    if (activeDevice) {
+      // Aktív → kliens tud csatlakozni WS-re a saját deviceKey-jével
+      return res.json({ status: "active" });
+    }
+
+    // 2. Pending-ben van-e már?
+    const existing = await prisma.pendingDevice.findFirst({
+      where: { mac: hardwareId },
+    });
+
+    if (existing) {
+      // Frissítjük a lastSeenAt-ot és az IP-t
+      await prisma.pendingDevice.update({
+        where: { id: existing.id },
+        data: {
+          lastSeenAt: new Date(),
+          ipAddress:  ipAddress ?? existing.ipAddress,
+          userAgent:  userAgent ?? existing.userAgent,
+        },
+      });
+      // DeviceKeyHash memóriában frissítjük (kliens újraindulhatott)
+      pendingKeyHashes.set(shortId, deviceKeyHash);
+      return res.json({ status: "pending", shortId });
+    }
+
+    // 3. Új pending native player létrehozása
+    await prisma.pendingDevice.create({
+      data: {
+        mac:         hardwareId,
+        clientId:    shortId,       // shortId a UI azonosítójaként
+        ipAddress,
+        userAgent:   `${platform ?? "native"}/${version ?? "?"}${userAgent ? ` | ${userAgent}` : ""}`,
+        firstSeenAt: new Date(),
+        lastSeenAt:  new Date(),
+      },
+    });
+
+    // DeviceKeyHash memóriában tárolva az aktiváláshoz
+    pendingKeyHashes.set(shortId, deviceKeyHash);
+
+    console.log(`[NativeProvision] Új pending native player: ${shortId} (${platform}) ip=${ipAddress}`);
+    return res.json({ status: "pending", shortId });
+
+  } catch (err) {
+    console.error("[NativeProvision] hiba:", err);
+    return res.status(500).json({ error: "Provisioning hiba" });
+  }
+});
+
+// ── GET /devices/native/status/:hardwareId ────────────────────────────────────
+// Kliens poll-ol: active lett-e már?
+router.get("/status/:hardwareId", async (req: Request, res: Response) => {
+  try {
+    const hardwareId = String(req.params.hardwareId);
+
+    const activeDevice = await prisma.device.findFirst({
+      where: { serialNumber: hardwareId, authType: "KEY" },
+      select: { id: true },
+    });
+
+    if (activeDevice) {
+      return res.json({ status: "active" });
+    }
+    return res.json({ status: "pending" });
+  } catch (err) {
+    console.error("[NativeProvision] status hiba:", err);
+    return res.status(500).json({ error: "Status lekérdezés hiba" });
+  }
+});
+
+// Exportáljuk a pendingKeyHashes Map-ot az admin routes-nak
+export { pendingKeyHashes };
+export default router;
