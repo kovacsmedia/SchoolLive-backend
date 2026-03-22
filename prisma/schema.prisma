@@ -71,6 +71,7 @@ model Tenant {
   domain    String?  @unique
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
+  snapPort  Int?     @unique 
 
   address        String?
   directorName   String?
