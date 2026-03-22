@@ -154,8 +154,6 @@ router.get("/info", async (req: Request, res: Response) => {
   }
 });
 
-export { pendingKeyHashes };
-export default router;
 // Eszköz jelzi hogy online – frissíti az online státuszt és lastSeenAt-t
 router.post("/beacon", async (req: Request, res: Response) => {
   try {
