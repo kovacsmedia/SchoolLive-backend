@@ -66,6 +66,7 @@ class TenantSnapEngine extends EventEmitter {
     const cfg = [
       `[server]`, `threads = -1`, ``,
       `[stream]`,
+      `port = ${this.snapPort}`,   // ← EZ HIÁNYZOTT
       `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=pcm&chunk_ms=20`,
       ``, `[http]`, `enabled = true`, `port = ${httpPort(this.snapPort)}`,
       ``, `[tcp]`, `enabled = false`,
