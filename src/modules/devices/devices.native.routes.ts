@@ -175,11 +175,14 @@ router.post("/beacon", async (req: Request, res: Response) => {
     await prisma.device.update({
       where: { id: deviceId },
       data: {
-        online:     true,
-        lastSeenAt: new Date(),
-        ipAddress:  ipAddress ?? undefined,
-      },
-    });
+       online:          true,
+       lastSeenAt:      new Date(),
+       ipAddress:       ipAddress ?? undefined,
+       firmwareVersion: req.body?.platform
+        ? `${req.body.platform}/${req.body.appVersion ?? '?'}`
+        : undefined,
+   },
+});
 
     // deviceId visszaadva – kliens cachelti ha még nincs meg
     return res.json({ ok: true, deviceId });
