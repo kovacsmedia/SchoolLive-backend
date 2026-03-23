@@ -110,8 +110,11 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
       },
     });
 
-    const allDeviceIds = await resolveDeviceIds(tid, targetType, targetId);
-    if (allDeviceIds.length === 0) return res.status(201).json({ ok: true, message });
+    const targetIds = await resolveDeviceIds(tid, targetType, targetId);
+    // null = ALL (mindenki), [] = üres célzott lista (senki) → ne küldjük
+    if (targetIds !== null && targetIds.length === 0) {
+      return res.status(201).json({ ok: true, message });
+    }
 
     if (isImmediate) {
       // ── 1. Snapcast ──────────────────────────────────────────────────────────
@@ -130,18 +133,28 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
       }
 
       // ── 2. SyncEngine ────────────────────────────────────────────────────────
-      const onlineIds  = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
-      const offlineIds = allDeviceIds.filter(id => !SyncEngine.isDeviceOnline(id));
+      // targetIds=null → ALL → minden online eszköz, targetDeviceIds nélkül
+      const allOnline = await prisma.device.findMany({
+        where:  { tenantId: tid, online: true },
+        select: { id: true },
+      });
+      const candidateIds = targetIds === null
+        ? allOnline.map(d => d.id)
+        : targetIds;
+
+      const onlineIds  = candidateIds.filter(id => SyncEngine.isDeviceOnline(id));
+      const offlineIds = candidateIds.filter(id => !SyncEngine.isDeviceOnline(id));
 
       if (onlineIds.length > 0) {
         SyncEngine.dispatchSync({
-          tenantId: tid,
+          tenantId:  tid,
           commandId: `msg-${message.id}`,
-          action: "TTS",
-          url: fileUrl,
-          text: text.trim(),
+          action:    "TTS",
+          url:       fileUrl,
+          text:      text.trim(),
           title,
-          targetDeviceIds: onlineIds,   // ← kliens önmute ha nem célzott
+          // ALL esetén nincs targetDeviceIds → mindenki szól
+          ...(targetIds !== null && { targetDeviceIds: onlineIds }),
           snapcastActive: snapOnline,
         }).catch(e => console.error("[MESSAGES] SyncEngine hiba:", e));
         console.log(`[MESSAGES] 📤 SyncEngine TTS → ${onlineIds.length} online | tenant: ${tid}`);
@@ -159,8 +172,11 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
       }
 
     } else {
+      const scheduledIds = targetIds === null
+        ? (await prisma.device.findMany({ where: { tenantId: tid }, select: { id: true } })).map(d => d.id)
+        : targetIds;
       await prisma.deviceCommand.createMany({
-        data: allDeviceIds.map(deviceId => ({
+        data: scheduledIds.map(deviceId => ({
           tenantId: tid, deviceId, messageId: message.id, status: "QUEUED" as const,
           payload: {
             action: "TTS", url: fileUrl, text: text.trim(), title,
@@ -168,7 +184,7 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
           },
         })),
       });
-      console.log(`[MESSAGES] 📅 Ütemezett TTS → ${allDeviceIds.length} eszköz @ ${scheduledTime?.toISOString()} | tenant: ${tid}`);
+      console.log(`[MESSAGES] 📅 Ütemezett TTS → ${scheduledIds.length} eszköz @ ${scheduledTime?.toISOString()} | tenant: ${tid}`);
     }
 
     return res.status(201).json({ ok: true, message });
@@ -287,13 +303,15 @@ router.delete("/:id", authJwt, requireTenant, async (req: Request, res: Response
 
 // ── resolveDeviceIds ──────────────────────────────────────────────────────────
 // Visszaadja a célzott eszközök ID-jait.
-// FONTOS: Snapcast az összes kliensnek játszik – az önmute a kliensek feladata
-// a targetDeviceIds lista alapján (ESP32 SyncClient, Python player _on_prepare).
-async function resolveDeviceIds(tid: string, targetType: string, targetId?: string): Promise<string[]> {
+// ALL esetén null-t ad vissza (nem üres tömböt!) → a hívó tudja hogy
+// "mindenki" a cél, nem kell targetDeviceIds szűrés a WS üzenetbe.
+// Üres tömb = "senki sem célzott" → korai visszatérés.
+async function resolveDeviceIds(
+  tid: string, targetType: string, targetId?: string
+): Promise<string[] | null> {
   if (targetType === "ALL") {
-    // ALL esetén üres listát adunk vissza – a broadcastImmediate mindenkinek küld
-    // (targetDeviceIds nem kerül az üzenetbe → kliensek nem mute-olnak)
-    return [];
+    // null = mindenki → Snapcast + SyncEngine broadcast targetDeviceIds nélkül
+    return null;
   }
   if (targetType === "DEVICE" && targetId) return [targetId];
   if (targetType === "GROUP" && targetId) {
