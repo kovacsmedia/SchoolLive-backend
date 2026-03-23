@@ -2,13 +2,10 @@
 //
 // Native player provisioning – JWT nélkül, MAC alapú hardwareId + client-oldali deviceKey
 //
-// Flow:
-//   1. Kliens generál deviceKey-t (UUID), elmenti lokálisan
-//   2. POST /devices/native/provision {hardwareId, deviceKeyHash, shortId, platform, version}
-//      → pending:  {status:"pending", shortId}
-//      → active:   {status:"active"}   (kliens a saját deviceKey-jével csatlakozik WS-re)
-//   3. Admin aktiválja az Devices oldalon → Device létrejön deviceKeyHash-sel
-//   4. Kliens poll-ol amíg active nem lesz
+// Változások:
+//   • GET /info      → deviceId mezőt is visszaadja (targeting-hez szükséges)
+//   • POST /beacon   → deviceId visszaadva a válaszban (kliens cachelti)
+//   • GET /snap-port → változatlan
 
 import { Router, Request, Response } from "express";
 import { prisma }                    from "../../prisma/client";
@@ -16,21 +13,17 @@ import { randomBytes }               from "crypto";
 
 const router = Router();
 
-// In-memory store a pending native playerek deviceKeyHash-éhez
-// (PendingDevice táblában nincs erre mező, ezért memóriában tároljuk)
-// Key: shortId (pl. "WP-ABCD1234"), Value: deviceKeyHash
 const pendingKeyHashes = new Map<string, string>();
 
 // ── POST /devices/native/provision ────────────────────────────────────────────
-// Nyilvános endpoint (nincs auth) – rate limit a caller oldalán ajánlott
 router.post("/provision", async (req: Request, res: Response) => {
   try {
     const {
-      hardwareId,    // MAC cím alapú azonosító (pl. "aa:bb:cc:dd:ee:ff")
-      deviceKeyHash, // bcrypt(deviceKey) – kliens generálta
-      shortId,       // "WP-ABCD1234" – a kliens azonosítója a UI-on
-      platform,      // "windows" | "linux" | "android"
-      version,       // app verzió
+      hardwareId,
+      deviceKeyHash,
+      shortId,
+      platform,
+      version,
       userAgent,
     } = req.body ?? {};
 
@@ -42,23 +35,21 @@ router.post("/provision", async (req: Request, res: Response) => {
       ?? req.socket.remoteAddress
       ?? null;
 
-    // 1. Megvan-e már aktív Device ezzel a hardwareId-vel?
+    // Aktív eszköz?
     const activeDevice = await prisma.device.findFirst({
-      where: { serialNumber: hardwareId, authType: "KEY" },
+      where:  { serialNumber: hardwareId, authType: "KEY" },
       select: { id: true, tenantId: true },
     });
 
     if (activeDevice) {
+      // deviceId visszaadva – kliens cachelti a targetinghez
       return res.json({ status: "active", deviceId: activeDevice.id });
     }
 
-    // 2. Pending-ben van-e már?
-    const existing = await prisma.pendingDevice.findFirst({
-      where: { mac: hardwareId },
-    });
+    // Pending frissítés
+    const existing = await prisma.pendingDevice.findFirst({ where: { mac: hardwareId } });
 
     if (existing) {
-      // Frissítjük a lastSeenAt-ot és az IP-t
       await prisma.pendingDevice.update({
         where: { id: existing.id },
         data: {
@@ -67,16 +58,15 @@ router.post("/provision", async (req: Request, res: Response) => {
           userAgent:  userAgent ?? existing.userAgent,
         },
       });
-      // DeviceKeyHash memóriában frissítjük (kliens újraindulhatott)
       pendingKeyHashes.set(shortId, deviceKeyHash);
       return res.json({ status: "pending", shortId });
     }
 
-    // 3. Új pending native player létrehozása
+    // Új pending
     await prisma.pendingDevice.create({
       data: {
         mac:         hardwareId,
-        clientId:    shortId,       // shortId a UI azonosítójaként
+        clientId:    shortId,
         ipAddress,
         userAgent:   `${platform ?? "native"}/${version ?? "?"}${userAgent ? ` | ${userAgent}` : ""}`,
         firstSeenAt: new Date(),
@@ -84,7 +74,6 @@ router.post("/provision", async (req: Request, res: Response) => {
       },
     });
 
-    // DeviceKeyHash memóriában tárolva az aktiváláshoz
     pendingKeyHashes.set(shortId, deviceKeyHash);
 
     console.log(`[NativeProvision] Új pending native player: ${shortId} (${platform}) ip=${ipAddress}`);
@@ -97,17 +86,17 @@ router.post("/provision", async (req: Request, res: Response) => {
 });
 
 // ── GET /devices/native/status/:hardwareId ────────────────────────────────────
-// Kliens poll-ol: active lett-e már?
 router.get("/status/:hardwareId", async (req: Request, res: Response) => {
   try {
     const hardwareId = String(req.params.hardwareId);
 
     const activeDevice = await prisma.device.findFirst({
-      where: { serialNumber: hardwareId, authType: "KEY" },
+      where:  { serialNumber: hardwareId, authType: "KEY" },
       select: { id: true },
     });
 
     if (activeDevice) {
+      // deviceId visszaadva – kliens cachelti a targetinghez
       return res.json({ status: "active", deviceId: activeDevice.id });
     }
     return res.json({ status: "pending" });
@@ -118,53 +107,56 @@ router.get("/status/:hardwareId", async (req: Request, res: Response) => {
 });
 
 // ── GET /devices/native/info ──────────────────────────────────────────────────
-// Visszaadja az eszköz tenant nevét device key alapján
+// Változás: deviceId is visszaadva (targeting-hez szükséges a Python playernek)
 router.get("/info", async (req: Request, res: Response) => {
   try {
     const deviceKey = req.headers["x-device-key"] as string;
     if (!deviceKey) return res.status(400).json({ error: "x-device-key required" });
 
-    const { prisma } = await import("../../prisma/client");
-    const bcrypt = await import("bcrypt");
-
+    const bcrypt  = await import("bcrypt");
     const devices = await prisma.device.findMany({
-      where: { deviceKeyHash: { not: null }, authType: "KEY" },
+      where:  { deviceKeyHash: { not: null }, authType: "KEY" },
       select: {
-        id: true,
+        id:            true,
         deviceKeyHash: true,
         tenant: { select: { name: true } },
       },
     });
 
-    let tenantName: string | null = null;
+    let matchedId:   string | null = null;
+    let tenantName:  string | null = null;
+
     for (const d of devices) {
       if (!d.deviceKeyHash) continue;
       const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
       if (ok) {
+        matchedId  = d.id;
         tenantName = d.tenant?.name ?? null;
         break;
       }
     }
 
-    if (!tenantName) return res.status(401).json({ error: "Invalid device key" });
-    return res.json({ ok: true, tenantName });
+    if (!matchedId) return res.status(401).json({ error: "Invalid device key" });
+
+    // deviceId most már benne van a válaszban!
+    return res.json({ ok: true, tenantName, deviceId: matchedId });
+
   } catch (err) {
     console.error("[NativeInfo] hiba:", err);
     return res.status(500).json({ error: "Info hiba" });
   }
 });
 
-// Eszköz jelzi hogy online – frissíti az online státuszt és lastSeenAt-t
+// ── POST /devices/native/beacon ───────────────────────────────────────────────
+// Változás: deviceId visszaadva a válaszban
 router.post("/beacon", async (req: Request, res: Response) => {
   try {
     const deviceKey = req.headers["x-device-key"] as string;
     if (!deviceKey) return res.status(400).json({ error: "x-device-key header required" });
 
-    // Megkeressük az eszközt a deviceKey hash alapján
-    const { prisma } = await import("../../prisma/client");
-    const bcrypt = await import("bcrypt");
+    const bcrypt  = await import("bcrypt");
     const devices = await prisma.device.findMany({
-      where: { deviceKeyHash: { not: null }, authType: "KEY" },
+      where:  { deviceKeyHash: { not: null }, authType: "KEY" },
       select: { id: true, deviceKeyHash: true },
     });
 
@@ -183,21 +175,22 @@ router.post("/beacon", async (req: Request, res: Response) => {
     await prisma.device.update({
       where: { id: deviceId },
       data: {
-        online:      true,
-        lastSeenAt:  new Date(),
-        ipAddress:   ipAddress ?? undefined,
+        online:     true,
+        lastSeenAt: new Date(),
+        ipAddress:  ipAddress ?? undefined,
       },
     });
 
-    return res.json({ ok: true });
+    // deviceId visszaadva – kliens cachelti ha még nincs meg
+    return res.json({ ok: true, deviceId });
+
   } catch (err) {
     console.error("[NativeBeacon] hiba:", err);
     return res.status(500).json({ error: "Beacon hiba" });
   }
 });
 
-// ── GET /devices/native/snap-port ────────────────────────────────────────────
-// ESP32 lekéri a saját tenant Snapcast portját device key alapján
+// ── GET /devices/native/snap-port ─────────────────────────────────────────────
 router.get("/snap-port", async (req: Request, res: Response) => {
   try {
     const deviceKey = req.headers["x-device-key"] as string;
@@ -230,6 +223,7 @@ router.get("/snap-port", async (req: Request, res: Response) => {
 
     console.log(`[NativeSnapPort] tenantId=${tenantId} snapPort=${tenant.snapPort}`);
     return res.json({ ok: true, snapPort: tenant.snapPort });
+
   } catch (err) {
     console.error("[NativeSnapPort] hiba:", err);
     return res.status(500).json({ error: "SnapPort lekérdezés hiba" });
