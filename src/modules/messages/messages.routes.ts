@@ -4,6 +4,10 @@
 //   - Azonnali TTS/PLAY_URL: SnapcastService (audio) + SyncEngine (overlay VP-re)
 //   - Ütemezett: csak DB queue (Snapcast-ot az időpontban hívja a scheduler)
 //   - Offline VP fallback: DB queue
+//
+// Változások:
+//   • play-url endpoint: broadcastImmediate-be targetDeviceIds bekerült
+//     (az ESP32 és Python player önmute logikájához szükséges)
 
 import { Router, Request, Response } from "express";
 import { prisma }          from "../../prisma/client";
@@ -137,10 +141,10 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
           url: fileUrl,
           text: text.trim(),
           title,
-          targetDeviceIds: onlineIds,
+          targetDeviceIds: onlineIds,   // ← kliens önmute ha nem célzott
           snapcastActive: snapOnline,
         }).catch(e => console.error("[MESSAGES] SyncEngine hiba:", e));
-        console.log(`[MESSAGES] 📤 SyncEngine overlay → ${onlineIds.length} online | tenant: ${tid}`);
+        console.log(`[MESSAGES] 📤 SyncEngine TTS → ${onlineIds.length} online | tenant: ${tid}`);
       }
 
       // ── 3. DB queue – offline VP ─────────────────────────────────────────────
@@ -195,9 +199,28 @@ router.post("/play-url", authJwt, requireTenant, async (req: Request, res: Respo
     }
 
     // ── 2. SyncEngine ────────────────────────────────────────────────────────
+    // Változás: targetDeviceIds átadva, hogy a nem célzott kliensek self-mute-oljanak
     if (allDeviceIds.length > 0) {
       const onlineIds = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
       if (onlineIds.length > 0) {
+        SyncEngine.broadcastImmediate(tid, {
+          action:          "PLAY_URL",
+          commandId:       randomUUID(),
+          url,
+          title,
+          source:          "RADIO",
+          snapcastActive:  snapOnline,
+          targetDeviceIds: onlineIds,   // ← kliens önmute ha nem célzott
+        }, onlineIds);
+      }
+    } else {
+      // targetType=ALL: minden online eszköz kap értesítést, nincs önmute
+      const allOnlineIds = (await prisma.device.findMany({
+        where:  { tenantId: tid, online: true },
+        select: { id: true },
+      })).map(d => d.id).filter(id => SyncEngine.isDeviceOnline(id));
+
+      if (allOnlineIds.length > 0) {
         SyncEngine.broadcastImmediate(tid, {
           action:         "PLAY_URL",
           commandId:      randomUUID(),
@@ -205,7 +228,8 @@ router.post("/play-url", authJwt, requireTenant, async (req: Request, res: Respo
           title,
           source:         "RADIO",
           snapcastActive: snapOnline,
-        }, onlineIds);
+          // targetDeviceIds szándékosan hiányzik → mindenki szól
+        });
       }
     }
 
@@ -261,16 +285,28 @@ router.delete("/:id", authJwt, requireTenant, async (req: Request, res: Response
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to delete message" }); }
 });
 
+// ── resolveDeviceIds ──────────────────────────────────────────────────────────
+// Visszaadja a célzott eszközök ID-jait.
+// FONTOS: Snapcast az összes kliensnek játszik – az önmute a kliensek feladata
+// a targetDeviceIds lista alapján (ESP32 SyncClient, Python player _on_prepare).
 async function resolveDeviceIds(tid: string, targetType: string, targetId?: string): Promise<string[]> {
   if (targetType === "ALL") {
-    return (await prisma.device.findMany({ where: { tenantId: tid, online: true }, select: { id: true } })).map(d => d.id);
+    // ALL esetén üres listát adunk vissza – a broadcastImmediate mindenkinek küld
+    // (targetDeviceIds nem kerül az üzenetbe → kliensek nem mute-olnak)
+    return [];
   }
   if (targetType === "DEVICE" && targetId) return [targetId];
   if (targetType === "GROUP" && targetId) {
-    return (await prisma.deviceGroupMember.findMany({ where: { groupId: targetId }, select: { deviceId: true } })).map(m => m.deviceId);
+    return (await prisma.deviceGroupMember.findMany({
+      where:  { groupId: targetId },
+      select: { deviceId: true },
+    })).map(m => m.deviceId);
   }
   if (targetType === "ORG_UNIT" && targetId) {
-    return (await prisma.device.findMany({ where: { tenantId: tid, orgUnitId: targetId, online: true }, select: { id: true } })).map(d => d.id);
+    return (await prisma.device.findMany({
+      where:  { tenantId: tid, orgUnitId: targetId, online: true },
+      select: { id: true },
+    })).map(d => d.id);
   }
   return [];
 }
