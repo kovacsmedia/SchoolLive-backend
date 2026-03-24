@@ -1,19 +1,22 @@
 // src/modules/radio/radio.scheduler.ts
 //
-// Dispatch stratégia (Snapcast alapú):
-//   1. SnapcastService → PCM stream (elsődleges, online mód)
-//   2. SyncEngine.dispatchSync() → overlay VP eszközökre + snapcastActive flag
-//   3. DeviceCommand DB queue → offline eszközök fallback
+// Javítások:
+//   • dispatchSchedule() pontosan a scheduledAt pillanatában indítja a Snapcastot
+//     (setTimeout alapú, nem azonnal)
+//   • Stale check: ha a scheduledAt > STALE_THRESHOLD_MS múltban van → skip
+//   • SyncEngine dispatch is setTimeout-tal időzítve
 
 import { prisma }          from "../../prisma/client";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
 
-const TICK_INTERVAL_MS   = 30_000;
-const LOOKAHEAD_MS       = 60_000;
-const DISPATCH_WINDOW_MS = 10_000;
+const TICK_INTERVAL_MS   = 10_000;   // 10s tick (pontosabb időzítéshez)
+const LOOKAHEAD_MS       = 15_000;   // 15s előre néz (elég a felkészüléshez)
+const STALE_THRESHOLD_MS = 5_000;    // ha > 5s múltban van → már nem játsszuk
 
 let _running = false;
+// Aktív timeouток nyilvántartása – stop esetén törölhetők
+const _pendingTimeouts = new Map<string, ReturnType<typeof setTimeout>[]>();
 
 async function tick() {
   const now     = new Date();
@@ -23,7 +26,11 @@ async function tick() {
     const due = await prisma.radioSchedule.findMany({
       where: {
         status:      "PENDING",
-        scheduledAt: { gte: new Date(now.getTime() - DISPATCH_WINDOW_MS), lte: horizon },
+        // Csak a jövőbeli és közeli ütemezések (nem a múltbeliek)
+        scheduledAt: {
+          gte: new Date(now.getTime() - STALE_THRESHOLD_MS),
+          lte: horizon,
+        },
       },
       include: {
         radioFile: {
@@ -36,10 +43,13 @@ async function tick() {
     console.log(`[RADIO-SCHEDULER] ${due.length} schedule(s) due`);
 
     for (const schedule of due) {
+      // Már folyamatban van? (előző tick már beütemezte)
+      if (_pendingTimeouts.has(schedule.id)) continue;
+
       try {
-        await dispatchSchedule(schedule);
+        await scheduleDispatch(schedule);
       } catch (e) {
-        console.error(`[RADIO-SCHEDULER] Failed to dispatch ${schedule.id}:`, e);
+        console.error(`[RADIO-SCHEDULER] Failed to schedule ${schedule.id}:`, e);
       }
     }
   } catch (e) {
@@ -47,7 +57,7 @@ async function tick() {
   }
 }
 
-async function dispatchSchedule(schedule: {
+async function scheduleDispatch(schedule: {
   id:          string;
   tenantId:    string;
   targetType:  string;
@@ -55,36 +65,49 @@ async function dispatchSchedule(schedule: {
   scheduledAt: Date;
   radioFile:   { id: string; fileUrl: string; durationSec: number | null; originalName: string };
 }) {
-  const allDeviceIds = await resolveDeviceIds(
-    schedule.tenantId,
-    schedule.targetType,
-    schedule.targetId,
-  );
+  const now         = Date.now();
+  const scheduledMs = schedule.scheduledAt.getTime();
+  const waitMs      = scheduledMs - now;
 
-  if (allDeviceIds.length === 0) {
-    console.warn(`[RADIO-SCHEDULER] Nincs eszköz: ${schedule.id} – DISPATCHED státusz beállítva`);
-  } else {
-    const commandId = `radio-${schedule.id}`;
+  // Stale check: ha már elmúlt STALE_THRESHOLD_MS-nél régebben → skip
+  if (waitMs < -STALE_THRESHOLD_MS) {
+    console.warn(`[RADIO-SCHEDULER] Stale schedule ${schedule.id} (${-waitMs}ms régen) → skip`);
+    await prisma.radioSchedule.update({
+      where: { id: schedule.id },
+      data:  { status: "DISPATCHED", dispatchedAt: new Date() },
+    });
+    return;
+  }
 
-    // ── 1. Snapcast ──────────────────────────────────────────────────────────
-    const snapOnline = await SnapcastService.isSnapserverOnline(schedule.tenantId);
-    if (snapOnline) {
-      await SnapcastService.play({
-        type:       "RADIO",
-        source:     { type: "url", url: schedule.radioFile.fileUrl },
-        tenantId:   schedule.tenantId,
-        title:      schedule.radioFile.originalName,
-        persistent: false,
-      });
-      console.log(`[RADIO-SCHEDULER] 📻 Snapcast: "${schedule.radioFile.originalName}" | tenant: ${schedule.tenantId}`);
-    } else {
-      console.warn(`[RADIO-SCHEDULER] ⚠️ Snapserver offline – csak SyncEngine fallback | tenant: ${schedule.tenantId}`);
+  // Pontosan scheduledAt-kor indul a lejátszás
+  // A SyncEngine PREPARE-t kell küldeni PREPARE_LEAD_MS-sel korábban
+  const PREPARE_LEAD_MS = 4000;  // ennyi időt kapnak a kliensek a prefetchre
+  const snapStartDelay  = Math.max(0, waitMs);
+  const prepareDelay    = Math.max(0, waitMs - PREPARE_LEAD_MS);
+
+  console.log(`[RADIO-SCHEDULER] Schedule ${schedule.id}: waitMs=${waitMs}, snapDelay=${snapStartDelay}, prepareDelay=${prepareDelay}`);
+
+  const timeouts: ReturnType<typeof setTimeout>[] = [];
+
+  // ── PREPARE küldése PREPARE_LEAD_MS-sel korábban ──────────────────────────
+  const prepareTimeout = setTimeout(async () => {
+    const allDeviceIds = await resolveDeviceIds(
+      schedule.tenantId,
+      schedule.targetType,
+      schedule.targetId,
+    );
+
+    if (allDeviceIds.length === 0) {
+      console.warn(`[RADIO-SCHEDULER] Nincs eszköz: ${schedule.id}`);
+      return;
     }
 
-    // ── 2. SyncEngine ────────────────────────────────────────────────────────
+    const commandId = `radio-${schedule.id}`;
+    const snapOnline = await SnapcastService.isSnapserverOnline(schedule.tenantId);
     const onlineIds  = allDeviceIds.filter(id => SyncEngine.isDeviceOnline(id));
     const offlineIds = allDeviceIds.filter(id => !SyncEngine.isDeviceOnline(id));
 
+    // SyncEngine PREPARE küldése
     if (onlineIds.length > 0) {
       await SyncEngine.dispatchSync({
         tenantId:        schedule.tenantId,
@@ -94,11 +117,13 @@ async function dispatchSchedule(schedule: {
         title:           schedule.radioFile.originalName,
         targetDeviceIds: onlineIds,
         snapcastActive:  snapOnline,
+        // playAtMs átadása: pontosan scheduledAt-kor kell indulni
+        playAtMs:        scheduledMs,
       });
-      console.log(`[RADIO-SCHEDULER] 📻 SyncEngine overlay → ${onlineIds.length} online | tenant: ${schedule.tenantId}`);
+      console.log(`[RADIO-SCHEDULER] 📤 PREPARE → ${onlineIds.length} eszköz, playAt=${schedule.scheduledAt.toISOString()}`);
     }
 
-    // ── 3. DB queue – offline ────────────────────────────────────────────────
+    // DB queue – offline eszközök
     if (offlineIds.length > 0) {
       await prisma.deviceCommand.createMany({
         data: offlineIds.map(deviceId => ({
@@ -117,14 +142,59 @@ async function dispatchSchedule(schedule: {
           },
         })),
       });
-      console.log(`[RADIO-SCHEDULER] 📻 DB queue → ${offlineIds.length} offline | tenant: ${schedule.tenantId}`);
     }
+  }, prepareDelay);
+  timeouts.push(prepareTimeout);
+
+  // ── Snapcast stream indítása pontosan scheduledAt-kor ─────────────────────
+  const snapTimeout = setTimeout(async () => {
+    const snapOnline = await SnapcastService.isSnapserverOnline(schedule.tenantId);
+    if (snapOnline) {
+      await SnapcastService.play({
+        type:       "RADIO",
+        source:     { type: "url", url: schedule.radioFile.fileUrl },
+        tenantId:   schedule.tenantId,
+        title:      schedule.radioFile.originalName,
+        persistent: false,
+      });
+      console.log(`[RADIO-SCHEDULER] 📻 Snapcast START: "${schedule.radioFile.originalName}" @ ${new Date().toISOString()}`);
+    } else {
+      console.warn(`[RADIO-SCHEDULER] ⚠️ Snapserver offline: ${schedule.tenantId}`);
+    }
+
+    // Státusz frissítés
+    await prisma.radioSchedule.update({
+      where: { id: schedule.id },
+      data:  { status: "DISPATCHED", dispatchedAt: new Date() },
+    });
+
+    // Timeout cleanup
+    _pendingTimeouts.delete(schedule.id);
+
+  }, snapStartDelay);
+  timeouts.push(snapTimeout);
+
+  _pendingTimeouts.set(schedule.id, timeouts);
+}
+
+// ── Rádió azonnali leállítása (stop gomb) ─────────────────────────────────────
+export async function stopRadioImmediate(tenantId: string): Promise<void> {
+  // 1. Függő timeoutok törlése (ne induljon el a tervezett lejátszás)
+  for (const [scheduleId, timeouts] of _pendingTimeouts.entries()) {
+    timeouts.forEach(t => clearTimeout(t));
+    _pendingTimeouts.delete(scheduleId);
+    console.log(`[RADIO-SCHEDULER] Pending timeout törölve: ${scheduleId}`);
   }
 
-  await prisma.radioSchedule.update({
-    where: { id: schedule.id },
-    data:  { status: "DISPATCHED", dispatchedAt: new Date() },
+  // 2. Snapcast leállítása
+  await SnapcastService.stopRadio(tenantId);
+
+  // 3. SyncEngine broadcast: STOP_PLAYBACK minden online eszközre
+  SyncEngine.broadcastImmediate(tenantId, {
+    action: "STOP_PLAYBACK",
   });
+
+  console.log(`[RADIO-SCHEDULER] ⏹ Rádió leállítva: tenant=${tenantId}`);
 }
 
 async function resolveDeviceIds(tenantId: string, targetType: string, targetId: string | null): Promise<string[]> {
@@ -145,7 +215,6 @@ async function resolveDeviceIds(tenantId: string, targetType: string, targetId: 
 async function updateYtDlp() {
   const { spawn } = await import("child_process");
   const { existsSync } = await import("fs");
-
   const candidates = [
     "/home/deploy/.local/bin/yt-dlp",
     "/home/balazs/.local/bin/yt-dlp",
@@ -153,8 +222,7 @@ async function updateYtDlp() {
     "/usr/bin/yt-dlp",
   ];
   const bin = candidates.find(p => existsSync(p)) ?? "yt-dlp";
-
-  console.log(`[YT-UPDATE] yt-dlp frissítés indítása: ${bin}`);
+  console.log(`[YT-UPDATE] yt-dlp frissítés: ${bin}`);
   return new Promise<void>((resolve) => {
     const proc = spawn(bin, ["--update"], { stdio: "pipe" });
     let out = "";
@@ -164,10 +232,7 @@ async function updateYtDlp() {
       console.log(`[YT-UPDATE] Kész (code=${code}): ${out.trim().split("\n").pop() ?? ""}`);
       resolve();
     });
-    proc.on("error", (e: Error) => {
-      console.warn("[YT-UPDATE] Hiba:", e.message);
-      resolve();
-    });
+    proc.on("error", (e: Error) => { console.warn("[YT-UPDATE] Hiba:", e.message); resolve(); });
   });
 }
 
@@ -183,13 +248,12 @@ function scheduleYtDlpUpdate() {
     void updateYtDlp();
     setTimeout(run, 24 * 60 * 60 * 1000);
   }, msUntilNextUpdate());
-  console.log(`[YT-UPDATE] Következő frissítés: ${Math.round(msUntilNextUpdate()/1000/60)} perc múlva`);
 }
 
 export function startRadioScheduler() {
   if (_running) return;
   _running = true;
-  console.log("[RADIO-SCHEDULER] Started (tick every 30s, lookahead 60s)");
+  console.log("[RADIO-SCHEDULER] Started (tick every 10s, lookahead 15s)");
   tick();
   setInterval(tick, TICK_INTERVAL_MS);
   scheduleYtDlpUpdate();
