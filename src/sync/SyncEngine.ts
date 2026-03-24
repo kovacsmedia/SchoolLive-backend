@@ -1,20 +1,11 @@
 // src/sync/SyncEngine.ts
-// ─────────────────────────────────────────────────────────────────────────────
-//  SyncCast Protocol – kétfázisú szinkron lejátszás motor
-//  Fázis 1: PREPARE  → eszközök prefetchelnek, READY ACK-ot küldenek
-//  Fázis 2: PLAY     → abszolút UTC timestamp, mindenki egyszerre indul
-// ─────────────────────────────────────────────────────────────────────────────
-
 import WS from "ws";
 const { WebSocketServer } = WS;
 type WebSocket = WS;
 import type { IncomingMessage }        from "http";
 import jwt                             from "jsonwebtoken";
-import { createHash }                  from "crypto";
 import bcrypt                          from "bcrypt";
 import { env }                         from "../config/env";
-
-// ── Típusok ──────────────────────────────────────────────────────────────────
 
 export type SyncAction = "BELL" | "TTS" | "PLAY_URL" | "STOP_PLAYBACK" | "SYNC_BELLS" | "OTA_UPDATE";
 
@@ -25,15 +16,15 @@ export interface PreparePayload {
   url?:            string;
   text?:           string;
   title?:          string;
-  prepareDeadline: string;   // ISO – ennyi időd van a prefetchre
+  prepareDeadline: string;
   snapcastActive?: boolean;
 }
 
 export interface PlayPayload {
   phase:     "PLAY";
   commandId: string;
-  playAt:    string;         // ISO
-  playAtMs?: number;         // Unix ms – ESP32 közvetlenül használja
+  playAt:    string;
+  playAtMs?: number;
 }
 
 export interface ReadyAck {
@@ -44,10 +35,10 @@ export interface ReadyAck {
 }
 
 interface ConnectedClient {
-  ws:       WebSocket;
-  deviceId: string;
-  tenantId: string;
-  type:     "browser" | "esp32";          // ESP32 is csatlakozhat WS-en ha akar
+  ws:          WebSocket;
+  deviceId:    string;
+  tenantId:    string;
+  type:        "browser" | "esp32";
   connectedAt: Date;
 }
 
@@ -59,42 +50,35 @@ interface PendingSync {
   text?:           string;
   title?:          string;
   prepareDeadline: Date;
-  acks:            Map<string, ReadyAck>; // deviceId → ack
-  expectedDevices: Set<string>;           // kik kapták a PREPARE-t
+  acks:            Map<string, ReadyAck>;
+  expectedDevices: Set<string>;
   playAtTimer:     ReturnType<typeof setTimeout> | null;
   resolved:        boolean;
+  fixedPlayAtMs?:  number;   // ha meg van adva, sendPlay ezt használja (pontos időzítés)
 }
-
-// ── Adaptive device profile ───────────────────────────────────────────────────
 
 interface DeviceProfile {
-  deviceId:        string;
-  samples:         number[];  // utolsó 10 prepare idő (ms)
-  avg:             number;
-  p95:             number;
+  deviceId: string;
+  samples:  number[];
+  avg:      number;
+  p95:      number;
 }
-
-// ── SyncEngine ────────────────────────────────────────────────────────────────
 
 class SyncEngineClass {
   private wss:      InstanceType<typeof WebSocketServer> | null = null;
-  private clients:  Map<string, ConnectedClient> = new Map(); // deviceId → client
-  private pending:  Map<string, PendingSync>     = new Map(); // commandId → sync
-  private profiles: Map<string, DeviceProfile>   = new Map(); // deviceId → profile
+  private clients:  Map<string, ConnectedClient> = new Map();
+  private pending:  Map<string, PendingSync>     = new Map();
+  private profiles: Map<string, DeviceProfile>   = new Map();
 
-  // Konfig
-  private readonly PREPARE_WINDOW_MS  = 4000;  // ennyi idő a prefetchre
-  private readonly SAFETY_MARGIN_MS   = 500;   // playAt buffer a p95 felett
-  private readonly FALLBACK_LEAD_MS   = 5000;  // ha nincs minden ACK: 5s múlva játszik
-  private readonly MIN_LEAD_MS        = 2000;  // minimum lead time (ESP32 startup ~350ms + margin)
-  private readonly ACK_WAIT_MS        = 3800;  // ennyi ms-ig várunk ACK-okra
-
-  // ── Init ──────────────────────────────────────────────────────────────────
+  private readonly PREPARE_WINDOW_MS = 4000;
+  private readonly SAFETY_MARGIN_MS  = 500;
+  private readonly FALLBACK_LEAD_MS  = 5000;
+  private readonly MIN_LEAD_MS       = 2000;
+  private readonly ACK_WAIT_MS       = 3800;
 
   init(wss: InstanceType<typeof WebSocketServer>): void {
     this.wss = wss;
     console.log("[SyncEngine] ✅ Inicializálva");
-
     wss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
       this.handleConnection(ws, req).catch(err => {
         console.error("[SyncEngine] handleConnection hiba:", err);
@@ -103,18 +87,15 @@ class SyncEngineClass {
     });
   }
 
-  // ── WebSocket kapcsolat kezelése ──────────────────────────────────────────
-
   private async handleConnection(ws: WebSocket, req: IncomingMessage): Promise<void> {
-    // JWT auth az URL query stringből: ws://api.../sync?token=xxx
-    const url    = new URL(req.url ?? "/", "http://localhost");
-    const token  = url.searchParams.get("token");
+    const url       = new URL(req.url ?? "/", "http://localhost");
+    const token     = url.searchParams.get("token");
+    const deviceKey = url.searchParams.get("deviceKey");
 
-    let deviceId = "unknown";
-    let tenantId  = "";
+    let deviceId   = "unknown";
+    let tenantId   = "";
     let clientType: "browser" | "esp32" = "browser";
 
-    // JWT auth (browser VirtualPlayer)
     if (token) {
       let payload: any;
       try {
@@ -128,19 +109,14 @@ class SyncEngineClass {
       clientType = "browser";
     }
 
-    // Ha sem token sem deviceKey → elutasítás
-    const deviceKey = url.searchParams.get("deviceKey");
     if (!token && !deviceKey) {
       ws.close(4001, "Missing auth");
       return;
     }
 
-    // Device key auth (ESP32) – deviceKeyHash = bcrypt(deviceKey)
     if (deviceKey && !token) {
       try {
         const { prisma } = await import("../prisma/client");
-        // bcrypt: az összes eszközt le kell kérni majd compare-elni
-        // (bcrypt nem kereshető direktben, de az eszközök száma kicsi)
         const devices = await prisma.device.findMany({
           where:  { deviceKeyHash: { not: null } },
           select: { id: true, tenantId: true, deviceKeyHash: true },
@@ -152,7 +128,7 @@ class SyncEngineClass {
           if (ok) { matched = d; break; }
         }
         if (!matched) {
-          console.warn("[SyncEngine] Ismeretlen device key (bcrypt)");
+          console.warn("[SyncEngine] Ismeretlen device key");
           ws.close(4004, "Invalid device key");
           return;
         }
@@ -172,28 +148,18 @@ class SyncEngineClass {
       return;
     }
 
-    // Ha ugyanaz az eszköz újracsatlakozik, leváltja a régit
     const existing = this.clients.get(deviceId);
     if (existing && existing.ws.readyState === 1) {
       existing.ws.close(4010, "Replaced by new connection");
     }
 
-    const client: ConnectedClient = {
-      ws, deviceId, tenantId,
-      type: clientType,
-      connectedAt: new Date(),
-    };
+    const client: ConnectedClient = { ws, deviceId, tenantId, type: clientType, connectedAt: new Date() };
     this.clients.set(deviceId, client);
-
     console.log(`[SyncEngine] 🔌 Csatlakozott: ${deviceId} (${client.type}) tenant=${tenantId}`);
 
-    // Ping-pong keepalive
     const pingInterval = setInterval(() => {
-      if (ws.readyState === 1) {
-        ws.ping();
-      } else {
-        clearInterval(pingInterval);
-      }
+      if (ws.readyState === 1) ws.ping();
+      else clearInterval(pingInterval);
     }, 25_000);
 
     ws.on("message", (data: Buffer | ArrayBuffer | Buffer[]) => {
@@ -207,7 +173,6 @@ class SyncEngineClass {
 
     ws.on("close", () => {
       clearInterval(pingInterval);
-      // Csak akkor töröljük ha ez a jelenlegi kapcsolat
       if (this.clients.get(deviceId)?.ws === ws) {
         this.clients.delete(deviceId);
         console.log(`[SyncEngine] 🔌 Lecsatlakozott: ${deviceId}`);
@@ -218,23 +183,19 @@ class SyncEngineClass {
       console.error(`[SyncEngine] WS hiba: ${deviceId}`, err.message);
     });
 
-    // Üdvözlő üzenet – időszinkronhoz
     const nowMs = Date.now();
     this.send(ws, {
       type:        "HELLO",
       serverNow:   new Date(nowMs).toISOString(),
-      serverNowMs: nowMs,   // numerikus ms – ESP32 közvetlenül használja
+      serverNowMs: nowMs,
       deviceId,
     });
   }
-
-  // ── Beérkező üzenetek ─────────────────────────────────────────────────────
 
   private handleMessage(deviceId: string, tenantId: string, msg: any): void {
     if (msg.type === "READY_ACK") {
       this.receiveAck(msg as ReadyAck & { type: string });
     } else if (msg.type === "TIME_SYNC") {
-      // Időszinkron kérés – válasz azonnali
       const client = this.clients.get(deviceId);
       if (client) {
         this.send(client.ws, {
@@ -246,35 +207,28 @@ class SyncEngineClass {
     }
   }
 
-  // ── PREPARE broadcast ─────────────────────────────────────────────────────
-
-  /**
-   * Főmetódus: szinkron lejátszás indítása.
-   * Meghívandó a schedulerből / message dispatcherből.
-   */
   async dispatchSync(params: {
-    tenantId:    string;
-    commandId:   string;
-    action:      SyncAction;
-    url?:        string;
-    text?:       string;
-    title?:      string;
-    targetDeviceIds?: string[];  // ha null → tenant összes online eszköze
-    snapcastActive?:  boolean;   // VP csak overlayt mutat, hangot Snapcast adja
+    tenantId:         string;
+    commandId:        string;
+    action:           SyncAction;
+    url?:             string;
+    text?:            string;
+    title?:           string;
+    targetDeviceIds?: string[];
+    snapcastActive?:  boolean;
+    playAtMs?:        number;   // pontos lejátszási időpont (scheduler adja)
   }): Promise<void> {
-    const { tenantId, commandId, action, url, text, title, targetDeviceIds, snapcastActive } = params;
+    const { tenantId, commandId, action, url, text, title,
+            targetDeviceIds, snapcastActive, playAtMs } = params;
 
-    // Online eszközök szűrése
     const targets = this.getOnlineClients(tenantId, targetDeviceIds);
-
     if (targets.length === 0) {
       console.log(`[SyncEngine] ⚠️ Nincs online eszköz: tenant=${tenantId}`);
       return;
     }
 
-    // Lead time kiszámítása az eszközprofilok alapján
-    const leadMs    = this.computeLeadTime(targets.map(c => c.deviceId));
-    const deadline  = new Date(Date.now() + this.PREPARE_WINDOW_MS);
+    const leadMs   = this.computeLeadTime(targets.map(c => c.deviceId));
+    const deadline = new Date(Date.now() + this.PREPARE_WINDOW_MS);
 
     const syncState: PendingSync = {
       commandId, tenantId, action, url, text, title,
@@ -283,10 +237,10 @@ class SyncEngineClass {
       expectedDevices: new Set(targets.map(c => c.deviceId)),
       playAtTimer:     null,
       resolved:        false,
+      fixedPlayAtMs:   playAtMs,   // pontos időpont ha meg van adva
     };
     this.pending.set(commandId, syncState);
 
-    // PREPARE küldése
     const prepareMsg: PreparePayload = {
       phase:           "PREPARE",
       commandId,
@@ -298,13 +252,12 @@ class SyncEngineClass {
       snapcastActive,
     };
 
-    console.log(`[SyncEngine] 📤 PREPARE → ${targets.length} eszköz, leadMs=${leadMs}, commandId=${commandId}`);
+    console.log(`[SyncEngine] 📤 PREPARE → ${targets.length} eszköz, leadMs=${leadMs}, commandId=${commandId}${playAtMs ? ` fixedPlayAt=${new Date(playAtMs).toISOString()}` : ""}`);
 
     for (const client of targets) {
       this.send(client.ws, prepareMsg);
     }
 
-    // Fallback timer: ha nem jön minden ACK, playAt = most + leadMs
     syncState.playAtTimer = setTimeout(() => {
       if (!syncState.resolved) {
         console.log(`[SyncEngine] ⏱ ACK timeout – fallback PLAY: ${commandId}`);
@@ -313,54 +266,46 @@ class SyncEngineClass {
     }, this.ACK_WAIT_MS);
   }
 
-  // ── READY ACK fogadás ─────────────────────────────────────────────────────
-
   private receiveAck(ack: ReadyAck & { type: string }): void {
     const { commandId, deviceId, bufferMs } = ack;
     const syncState = this.pending.get(commandId);
-
     if (!syncState || syncState.resolved) return;
 
-    syncState.acks.set(deviceId, {
-      commandId,
-      deviceId,
-      readyAt:  ack.readyAt,
-      bufferMs: bufferMs ?? 0,
-    });
-
-    // Profil frissítése
+    syncState.acks.set(deviceId, { commandId, deviceId, readyAt: ack.readyAt, bufferMs: bufferMs ?? 0 });
     this.updateProfile(deviceId, bufferMs ?? 0);
 
     console.log(`[SyncEngine] ✅ READY ACK: ${deviceId}, bufferMs=${bufferMs} (${syncState.acks.size}/${syncState.expectedDevices.size})`);
 
-    // Ha mindenki ACK-olt → azonnal PLAY
     if (syncState.acks.size >= syncState.expectedDevices.size) {
       if (syncState.playAtTimer) clearTimeout(syncState.playAtTimer);
-
-      // JAVÍTÁS: a bufferMs a LETÖLTÉSI idő – az már KÉSZ.
-      // A playFile() startup overhead-et az ESP32 maga kompenzálja (SyncClient.cpp).
-      // Elég MIN_LEAD_MS (2000ms) a PLAY broadcast propagációjához + biztonságra.
-      // Ez kisebb lead time-ot eredményez mint a korábbi maxBufferMs + margin,
-      // ami feleslegesen nagy késleltetést okozott.
       const leadMs = this.MIN_LEAD_MS;
-
       console.log(`[SyncEngine] 🎯 Minden ACK megérkezett (${syncState.acks.size} db) – PLAY leadMs=${leadMs}`);
       this.sendPlay(syncState, leadMs);
     }
   }
 
-  // ── PLAY broadcast ────────────────────────────────────────────────────────
-
   private sendPlay(syncState: PendingSync, leadMs: number): void {
     if (syncState.resolved) return;
     syncState.resolved = true;
 
-    const playAt = new Date(Date.now() + leadMs);
+    // Ha fixedPlayAtMs meg van adva (pontos scheduler időzítés), azt használjuk.
+    // Ha nem, akkor leadMs másodperccel a jelen után.
+    const playAt = syncState.fixedPlayAtMs
+      ? new Date(syncState.fixedPlayAtMs)
+      : new Date(Date.now() + leadMs);
+
+    // Stale check: ha a fixedPlayAtMs már elmúlt, skip
+    if (syncState.fixedPlayAtMs && syncState.fixedPlayAtMs < Date.now() - 5000) {
+      console.warn(`[SyncEngine] ⚠️ fixedPlayAtMs már elmúlt – PLAY skip: ${syncState.commandId}`);
+      this.pending.delete(syncState.commandId);
+      return;
+    }
+
     const playMsg: PlayPayload = {
-      phase:      "PLAY",
-      commandId:  syncState.commandId,
-      playAt:     playAt.toISOString(),
-      playAtMs:   playAt.getTime(),   // numerikus ms – ESP32 közvetlenül használja
+      phase:     "PLAY",
+      commandId: syncState.commandId,
+      playAt:    playAt.toISOString(),
+      playAtMs:  playAt.getTime(),
     };
 
     const targets = this.getOnlineClients(syncState.tenantId);
@@ -370,11 +315,8 @@ class SyncEngineClass {
       this.send(client.ws, playMsg);
     }
 
-    // Cleanup
     setTimeout(() => this.pending.delete(syncState.commandId), 30_000);
   }
-
-  // ── Broadcast (SYNC_BELLS, STOP stb. – azonnali, nem szinkronizált) ───────
 
   broadcastImmediate(tenantId: string, payload: object, targetDeviceIds?: string[]): void {
     const targets = this.getOnlineClients(tenantId, targetDeviceIds);
@@ -383,8 +325,6 @@ class SyncEngineClass {
     }
     console.log(`[SyncEngine] 📡 Broadcast → ${targets.length} eszköz`);
   }
-
-  // ── Helpers ───────────────────────────────────────────────────────────────
 
   private getOnlineClients(tenantId: string, deviceIds?: string[]): ConnectedClient[] {
     const result: ConnectedClient[] = [];
@@ -398,9 +338,7 @@ class SyncEngineClass {
   }
 
   private send(ws: WebSocket, payload: object): void {
-    if (ws.readyState === 1) {
-      ws.send(JSON.stringify(payload));
-    }
+    if (ws.readyState === 1) ws.send(JSON.stringify(payload));
   }
 
   private computeLeadTime(deviceIds: string[]): number {
@@ -415,26 +353,20 @@ class SyncEngineClass {
       profile = { deviceId, samples: [], avg: bufferMs, p95: bufferMs };
       this.profiles.set(deviceId, profile);
     }
-
     profile.samples.push(bufferMs);
-    if (profile.samples.length > 10) profile.samples.shift(); // csak utolsó 10
-
+    if (profile.samples.length > 10) profile.samples.shift();
     const sorted = [...profile.samples].sort((a, b) => a - b);
-    profile.avg  = sorted.reduce((s, v) => s + v, 0) / sorted.length;
-    profile.p95  = sorted[Math.floor(sorted.length * 0.95)] ?? sorted[sorted.length - 1];
+    profile.avg = sorted.reduce((s, v) => s + v, 0) / sorted.length;
+    profile.p95 = sorted[Math.floor(sorted.length * 0.95)] ?? sorted[sorted.length - 1];
   }
-
-  // ── Publikus státusz ──────────────────────────────────────────────────────
 
   getStatus(): object {
     return {
       connectedClients: this.clients.size,
       pendingSyncs:     this.pending.size,
       clients: Array.from(this.clients.values()).map(c => ({
-        deviceId: c.deviceId,
-        tenantId: c.tenantId,
-        type:     c.type,
-        connectedAt: c.connectedAt,
+        deviceId: c.deviceId, tenantId: c.tenantId,
+        type: c.type, connectedAt: c.connectedAt,
       })),
     };
   }
@@ -445,5 +377,4 @@ class SyncEngineClass {
   }
 }
 
-// Singleton export
 export const SyncEngine = new SyncEngineClass();
