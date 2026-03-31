@@ -103,7 +103,7 @@ router.post("/templates", authJwt, requireTenant, async (req: Request, res: Resp
 // DELETE /messages/templates/:id
 router.delete("/templates/:id", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
-    const id = req.params.id;
+    const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     await prisma.messageTemplate.deleteMany({
       where: { id, tenantId: tenantId(req), userId: userId(req) },
     });
