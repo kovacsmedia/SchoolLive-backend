@@ -1,19 +1,17 @@
 // src/services/tts.service.ts
-// Piper TTS → WAV kimenet (nem MP3)
-// A Snapcast PCM-et vár, felesleges a veszteséges MP3 konverzió.
-// A dingdong.wav-ot is WAV-ként fűzzük hozzá ffmpeg concat-tal.
-// VirtualPlayer fallback URL is WAV-ot szolgál ki.
+// Piper TTS → WAV kimenet
+// generateTTS visszaadja a { filename, durationMs } értéket
+// hogy a dispatchSync átadhassa az overlay timer-hez
 
-import { spawn } from "child_process";
-import path      from "path";
-import fs        from "fs";
-import crypto    from "crypto";
+import { spawn, execSync } from "child_process";
+import path                from "path";
+import fs                  from "fs";
+import crypto              from "crypto";
 
 const PIPER_BIN  = "/opt/schoollive/piper/piper";
 const MODELS_DIR = "/opt/schoollive/piper/models";
 const AUDIO_DIR  = "/opt/schoollive/backend/audio";
 
-// Dingdong WAV (ha MP3 van, egyszer konvertáljuk)
 const DINGDONG_WAV = path.join(AUDIO_DIR, "dingdong.wav");
 const DINGDONG_MP3 = path.join(AUDIO_DIR, "dingdong.mp3");
 
@@ -37,98 +35,76 @@ function runProcess(bin: string, args: string[], input?: string): Promise<void> 
   });
 }
 
-// Dingdong WAV biztosítása (MP3-ból konvertálás ha szükséges)
-async function ensureDingdongWav(): Promise<boolean> {
-  if (fs.existsSync(DINGDONG_WAV)) return true;
-  if (!fs.existsSync(DINGDONG_MP3)) return false;
+// ── Hangfájl hosszának lekérése ffprobe-bal ──────────────────────────────────
+function getFileDurationMs(filePath: string): number | null {
   try {
-    await runProcess("ffmpeg", [
-      "-y", "-i", DINGDONG_MP3,
-      "-ar", "22050", "-ac", "1",   // Piper output formátum
-      DINGDONG_WAV,
-    ]);
-    return fs.existsSync(DINGDONG_WAV);
-  } catch (e) {
-    console.error("[TTS] dingdong WAV konverzió sikertelen:", e);
-    return false;
-  }
+    const out = execSync(
+      `ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`,
+      { timeout: 3000 }
+    ).toString().trim();
+    const sec = parseFloat(out);
+    if (isFinite(sec) && sec > 0) return Math.round(sec * 1000);
+  } catch {}
+  return null;
 }
 
-export async function generateTTS(text: string, voice: string = "anna"): Promise<string> {
-  const modelFile = VOICES[voice] ?? VOICES["anna"];
-  const modelPath = path.join(MODELS_DIR, modelFile);
+// Dingdong WAV biztosítása
+async function ensureDingdongWav(): Promise<void> {
+  if (fs.existsSync(DINGDONG_WAV)) return;
+  if (!fs.existsSync(DINGDONG_MP3)) return;
+  await runProcess("ffmpeg", [
+    "-y", "-i", DINGDONG_MP3,
+    "-ar", "22050", "-ac", "1",
+    DINGDONG_WAV,
+  ]);
+  console.log("[TTS] dingdong.wav elkészítve");
+}
 
-  const hasDingdong = await ensureDingdongWav();
+// ── generateTTS ───────────────────────────────────────────────────────────────
+// Visszaad: { filename, durationMs }
+// filename = az /audio/ könyvtárban lévő WAV fájl neve
+export async function generateTTS(
+  text:  string,
+  voice: string = "anna",
+): Promise<{ filename: string; durationMs: number | null }> {
+  await ensureDingdongWav();
 
-  // Cache kulcs: szöveg + hang + dingdong jelenlét
-  const cacheKey = `${text}|${voice}|dd:${hasDingdong ? "1" : "0"}|wav`;
-  const hash     = crypto.createHash("sha256").update(cacheKey).digest("hex").slice(0, 16);
-  const filename = `tts_${hash}.wav`;
-  const outPath  = path.join(AUDIO_DIR, filename);
+  const modelName = VOICES[voice] ?? VOICES["anna"];
+  const modelPath = path.join(MODELS_DIR, modelName);
 
-  // Cache találat
-  if (fs.existsSync(outPath)) return filename;
-
-  const speechWav  = path.join(AUDIO_DIR, `tts_${hash}_speech.wav`);
-  const concatList = path.join(AUDIO_DIR, `tts_${hash}_list.txt`);
-
-  try {
-    // ── 1. Piper: szöveg → WAV ─────────────────────────────────────────────
-    await runProcess(PIPER_BIN, [
-      "--model", modelPath,
-      "--output_file", speechWav,
-    ], text);
-
-    if (!fs.existsSync(speechWav)) throw new Error("Piper: WAV not created");
-
-    // ── 2. Dingdong + TTS összefűzés WAV-ban ──────────────────────────────
-    if (hasDingdong) {
-      // Mindkét WAV azonos sample rate-re konvertálva (48000:16:2 snapcast formátum)
-      const dingdongNorm = path.join(AUDIO_DIR, `tts_${hash}_dd.wav`);
-      const speechNorm   = path.join(AUDIO_DIR, `tts_${hash}_sp.wav`);
-
-      await runProcess("ffmpeg", [
-        "-y", "-i", DINGDONG_WAV,
-        "-ar", "48000", "-ac", "2", "-sample_fmt", "s16",
-        dingdongNorm,
-      ]);
-      await runProcess("ffmpeg", [
-        "-y", "-i", speechWav,
-        "-ar", "48000", "-ac", "2", "-sample_fmt", "s16",
-        speechNorm,
-      ]);
-
-      fs.writeFileSync(concatList,
-        `file '${dingdongNorm}'\nfile '${speechNorm}'\n`
-      );
-
-      await runProcess("ffmpeg", [
-        "-y",
-        "-f", "concat", "-safe", "0", "-i", concatList,
-        "-ar", "48000", "-ac", "2", "-sample_fmt", "s16",
-        outPath,
-      ]);
-
-      // Temp fájlok
-      for (const f of [dingdongNorm, speechNorm]) {
-        try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
-      }
-    } else {
-      // Nincs dingdong – csak normalizálás 48000:16:2-re
-      await runProcess("ffmpeg", [
-        "-y", "-i", speechWav,
-        "-ar", "48000", "-ac", "2", "-sample_fmt", "s16",
-        outPath,
-      ]);
-    }
-
-    if (!fs.existsSync(outPath)) throw new Error("ffmpeg: final WAV not created");
-    console.log(`[TTS] Generálva: ${filename}`);
-    return filename;
-
-  } finally {
-    for (const f of [speechWav, concatList]) {
-      try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
-    }
+  if (!fs.existsSync(modelPath)) {
+    throw new Error(`Piper modell nem található: ${modelPath}`);
   }
+
+  const hash       = crypto.randomBytes(8).toString("hex");
+  const speechFile = path.join(AUDIO_DIR, `tts_speech_${hash}.wav`);
+  const finalFile  = path.join(AUDIO_DIR, `tts_${hash}.wav`);
+
+  // 1. Szöveg → WAV (Piper)
+  await runProcess(PIPER_BIN, [
+    "--model",       modelPath,
+    "--output_file", speechFile,
+  ], text);
+
+  // 2. Dingdong + speech concat (ha van dingdong)
+  if (fs.existsSync(DINGDONG_WAV)) {
+    const concatList = path.join(AUDIO_DIR, `concat_${hash}.txt`);
+    fs.writeFileSync(concatList, `file '${DINGDONG_WAV}'\nfile '${speechFile}'\n`);
+    await runProcess("ffmpeg", [
+      "-y", "-f", "concat", "-safe", "0",
+      "-i", concatList,
+      "-ar", "22050", "-ac", "1",
+      finalFile,
+    ]);
+    fs.unlinkSync(concatList);
+    fs.unlinkSync(speechFile);
+  } else {
+    fs.renameSync(speechFile, finalFile);
+  }
+
+  const filename   = path.basename(finalFile);
+  const durationMs = getFileDurationMs(finalFile);
+
+  console.log(`[TTS] Generálva: ${filename} (${durationMs}ms)`);
+  return { filename, durationMs };
 }
