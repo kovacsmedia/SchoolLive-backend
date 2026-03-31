@@ -117,8 +117,9 @@ async function scheduleDispatch(schedule: {
         title:           schedule.radioFile.originalName,
         targetDeviceIds: onlineIds,
         snapcastActive:  snapOnline,
-        // playAtMs átadása: pontosan scheduledAt-kor kell indulni
         playAtMs:        scheduledMs,
+        // durationMs: rádióhoz nincs fix hossz (STOP parancsig él)
+        durationMs:      undefined,
       });
       console.log(`[RADIO-SCHEDULER] 📤 PREPARE → ${onlineIds.length} eszköz, playAt=${schedule.scheduledAt.toISOString()}`);
     }
