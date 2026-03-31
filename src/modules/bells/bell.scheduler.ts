@@ -68,6 +68,20 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
 
   if (calDay?.isHoliday) return;
 
+  // Hétvége ellenőrzés Budapest időzónában
+  // Ha nincs explicit naptári sablon a napra → hétvégén nem cseng
+  const budapestDayOfWeek = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Budapest",
+    weekday: "short",
+  }).format(now);
+  const isWeekend = budapestDayOfWeek === "Sat" || budapestDayOfWeek === "Sun";
+  const hasExplicitTemplate = !!calDay?.template?.bells?.length;
+
+  if (isWeekend && !hasExplicitTemplate) {
+    // Hétvége + nincs explicit hétvégi sablon → nincs csengetés
+    return;
+  }
+
   let bells: Array<{ hour: number; minute: number; type: string; soundFile: string }> = [];
   if (calDay?.template?.bells?.length) {
     bells = calDay.template.bells;
