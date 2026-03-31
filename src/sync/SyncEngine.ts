@@ -21,10 +21,11 @@ export interface PreparePayload {
 }
 
 export interface PlayPayload {
-  phase:     "PLAY";
-  commandId: string;
-  playAt:    string;
-  playAtMs?: number;
+  phase:       "PLAY";
+  commandId:   string;
+  playAt:      string;
+  playAtMs?:   number;
+  durationMs?: number;   // lejátszás hossza ms-ben – overlay timer-hez
 }
 
 export interface ReadyAck {
@@ -54,7 +55,8 @@ interface PendingSync {
   expectedDevices: Set<string>;
   playAtTimer:     ReturnType<typeof setTimeout> | null;
   resolved:        boolean;
-  fixedPlayAtMs?:  number;   // ha meg van adva, sendPlay ezt használja (pontos időzítés)
+  fixedPlayAtMs?:  number;
+  durationMs?:     number;
 }
 
 interface DeviceProfile {
@@ -72,7 +74,6 @@ class SyncEngineClass {
 
   private readonly PREPARE_WINDOW_MS = 4000;
   private readonly SAFETY_MARGIN_MS  = 500;
-  private readonly FALLBACK_LEAD_MS  = 5000;
   private readonly MIN_LEAD_MS       = 2000;
   private readonly ACK_WAIT_MS       = 3800;
 
@@ -98,21 +99,14 @@ class SyncEngineClass {
 
     if (token) {
       let payload: any;
-      try {
-        payload = jwt.verify(token, env.JWT_ACCESS_SECRET);
-      } catch {
-        ws.close(4002, "Invalid token");
-        return;
-      }
+      try { payload = jwt.verify(token, env.JWT_ACCESS_SECRET); }
+      catch { ws.close(4002, "Invalid token"); return; }
       deviceId   = url.searchParams.get("clientId") ?? payload.deviceId ?? payload.sub ?? "unknown";
       tenantId   = payload.tenantId ?? payload.tid ?? "";
       clientType = "browser";
     }
 
-    if (!token && !deviceKey) {
-      ws.close(4001, "Missing auth");
-      return;
-    }
+    if (!token && !deviceKey) { ws.close(4001, "Missing auth"); return; }
 
     if (deviceKey && !token) {
       try {
@@ -127,48 +121,31 @@ class SyncEngineClass {
           const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
           if (ok) { matched = d; break; }
         }
-        if (!matched) {
-          console.warn("[SyncEngine] Ismeretlen device key");
-          ws.close(4004, "Invalid device key");
-          return;
-        }
-        deviceId   = matched.id;
-        tenantId   = matched.tenantId;
-        clientType = "esp32";
+        if (!matched) { ws.close(4004, "Invalid device key"); return; }
+        deviceId = matched.id; tenantId = matched.tenantId; clientType = "esp32";
         console.log(`[SyncEngine] ESP32 auth OK: ${deviceId} tenant=${tenantId}`);
       } catch (e) {
         console.error("[SyncEngine] Device key lookup hiba:", e);
-        ws.close(4005, "Auth error");
-        return;
+        ws.close(4005, "Auth error"); return;
       }
     }
 
-    if (!tenantId) {
-      ws.close(4003, "Missing tenantId");
-      return;
-    }
+    if (!tenantId) { ws.close(4003, "Missing tenantId"); return; }
 
     const existing = this.clients.get(deviceId);
-    if (existing && existing.ws.readyState === 1) {
-      existing.ws.close(4010, "Replaced by new connection");
-    }
+    if (existing && existing.ws.readyState === 1) existing.ws.close(4010, "Replaced");
 
     const client: ConnectedClient = { ws, deviceId, tenantId, type: clientType, connectedAt: new Date() };
     this.clients.set(deviceId, client);
     console.log(`[SyncEngine] 🔌 Csatlakozott: ${deviceId} (${client.type}) tenant=${tenantId}`);
 
     const pingInterval = setInterval(() => {
-      if (ws.readyState === 1) ws.ping();
-      else clearInterval(pingInterval);
+      if (ws.readyState === 1) ws.ping(); else clearInterval(pingInterval);
     }, 25_000);
 
     ws.on("message", (data: Buffer | ArrayBuffer | Buffer[]) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        this.handleMessage(deviceId, tenantId, msg);
-      } catch (e) {
-        console.warn(`[SyncEngine] Érvénytelen üzenet: ${deviceId}`, e);
-      }
+      try { this.handleMessage(deviceId, tenantId, JSON.parse(data.toString())); }
+      catch (e) { console.warn(`[SyncEngine] Érvénytelen üzenet: ${deviceId}`, e); }
     });
 
     ws.on("close", () => {
@@ -179,17 +156,10 @@ class SyncEngineClass {
       }
     });
 
-    ws.on("error", (err: Error) => {
-      console.error(`[SyncEngine] WS hiba: ${deviceId}`, err.message);
-    });
+    ws.on("error", (err: Error) => console.error(`[SyncEngine] WS hiba: ${deviceId}`, err.message));
 
     const nowMs = Date.now();
-    this.send(ws, {
-      type:        "HELLO",
-      serverNow:   new Date(nowMs).toISOString(),
-      serverNowMs: nowMs,
-      deviceId,
-    });
+    this.send(ws, { type: "HELLO", serverNow: new Date(nowMs).toISOString(), serverNowMs: nowMs, deviceId });
   }
 
   private handleMessage(deviceId: string, tenantId: string, msg: any): void {
@@ -197,13 +167,7 @@ class SyncEngineClass {
       this.receiveAck(msg as ReadyAck & { type: string });
     } else if (msg.type === "TIME_SYNC") {
       const client = this.clients.get(deviceId);
-      if (client) {
-        this.send(client.ws, {
-          type:      "TIME_SYNC_RESPONSE",
-          clientSeq: msg.seq,
-          serverNow: new Date().toISOString(),
-        });
-      }
+      if (client) this.send(client.ws, { type: "TIME_SYNC_RESPONSE", clientSeq: msg.seq, serverNow: new Date().toISOString() });
     }
   }
 
@@ -216,10 +180,11 @@ class SyncEngineClass {
     title?:           string;
     targetDeviceIds?: string[];
     snapcastActive?:  boolean;
-    playAtMs?:        number;   // pontos lejátszási időpont (scheduler adja)
+    playAtMs?:        number;
+    durationMs?:      number;   // ← lejátszás hossza, overlay timer-hez
   }): Promise<void> {
     const { tenantId, commandId, action, url, text, title,
-            targetDeviceIds, snapcastActive, playAtMs } = params;
+            targetDeviceIds, snapcastActive, playAtMs, durationMs } = params;
 
     const targets = this.getOnlineClients(tenantId, targetDeviceIds);
     if (targets.length === 0) {
@@ -237,26 +202,19 @@ class SyncEngineClass {
       expectedDevices: new Set(targets.map(c => c.deviceId)),
       playAtTimer:     null,
       resolved:        false,
-      fixedPlayAtMs:   playAtMs,   // pontos időpont ha meg van adva
+      fixedPlayAtMs:   playAtMs,
+      durationMs,
     };
     this.pending.set(commandId, syncState);
 
     const prepareMsg: PreparePayload = {
-      phase:           "PREPARE",
-      commandId,
-      action,
-      url,
-      text,
-      title,
+      phase: "PREPARE", commandId, action, url, text, title,
       prepareDeadline: deadline.toISOString(),
       snapcastActive,
     };
 
-    console.log(`[SyncEngine] 📤 PREPARE → ${targets.length} eszköz, leadMs=${leadMs}, commandId=${commandId}${playAtMs ? ` fixedPlayAt=${new Date(playAtMs).toISOString()}` : ""}`);
-
-    for (const client of targets) {
-      this.send(client.ws, prepareMsg);
-    }
+    console.log(`[SyncEngine] 📤 PREPARE → ${targets.length} eszköz, commandId=${commandId}${durationMs ? ` dur=${durationMs}ms` : ""}`);
+    for (const client of targets) this.send(client.ws, prepareMsg);
 
     syncState.playAtTimer = setTimeout(() => {
       if (!syncState.resolved) {
@@ -278,9 +236,7 @@ class SyncEngineClass {
 
     if (syncState.acks.size >= syncState.expectedDevices.size) {
       if (syncState.playAtTimer) clearTimeout(syncState.playAtTimer);
-      const leadMs = this.MIN_LEAD_MS;
-      console.log(`[SyncEngine] 🎯 Minden ACK megérkezett (${syncState.acks.size} db) – PLAY leadMs=${leadMs}`);
-      this.sendPlay(syncState, leadMs);
+      this.sendPlay(syncState, this.MIN_LEAD_MS);
     }
   }
 
@@ -288,41 +244,34 @@ class SyncEngineClass {
     if (syncState.resolved) return;
     syncState.resolved = true;
 
-    // Ha fixedPlayAtMs meg van adva (pontos scheduler időzítés), azt használjuk.
-    // Ha nem, akkor leadMs másodperccel a jelen után.
     const playAt = syncState.fixedPlayAtMs
       ? new Date(syncState.fixedPlayAtMs)
       : new Date(Date.now() + leadMs);
 
-    // Stale check: ha a fixedPlayAtMs már elmúlt, skip
     if (syncState.fixedPlayAtMs && syncState.fixedPlayAtMs < Date.now() - 5000) {
-      console.warn(`[SyncEngine] ⚠️ fixedPlayAtMs már elmúlt – PLAY skip: ${syncState.commandId}`);
+      console.warn(`[SyncEngine] ⚠️ fixedPlayAtMs elmúlt – skip: ${syncState.commandId}`);
       this.pending.delete(syncState.commandId);
       return;
     }
 
     const playMsg: PlayPayload = {
-      phase:     "PLAY",
-      commandId: syncState.commandId,
-      playAt:    playAt.toISOString(),
-      playAtMs:  playAt.getTime(),
+      phase:      "PLAY",
+      commandId:  syncState.commandId,
+      playAt:     playAt.toISOString(),
+      playAtMs:   playAt.getTime(),
+      durationMs: syncState.durationMs,
     };
 
     const targets = this.getOnlineClients(syncState.tenantId);
-    console.log(`[SyncEngine] 🎵 PLAY → ${targets.length} eszköz, playAt=${playAt.toISOString()}`);
-
-    for (const client of targets) {
-      this.send(client.ws, playMsg);
-    }
+    console.log(`[SyncEngine] 🎵 PLAY → ${targets.length} eszköz, playAt=${playAt.toISOString()}${syncState.durationMs ? ` dur=${syncState.durationMs}ms` : ""}`);
+    for (const client of targets) this.send(client.ws, playMsg);
 
     setTimeout(() => this.pending.delete(syncState.commandId), 30_000);
   }
 
   broadcastImmediate(tenantId: string, payload: object, targetDeviceIds?: string[]): void {
     const targets = this.getOnlineClients(tenantId, targetDeviceIds);
-    for (const client of targets) {
-      this.send(client.ws, payload);
-    }
+    for (const client of targets) this.send(client.ws, payload);
     console.log(`[SyncEngine] 📡 Broadcast → ${targets.length} eszköz`);
   }
 
@@ -343,16 +292,12 @@ class SyncEngineClass {
 
   private computeLeadTime(deviceIds: string[]): number {
     const p95values = deviceIds.map(id => this.profiles.get(id)?.p95 ?? 600);
-    const maxP95    = Math.max(...p95values);
-    return Math.max(this.MIN_LEAD_MS, maxP95 + this.SAFETY_MARGIN_MS);
+    return Math.max(this.MIN_LEAD_MS, Math.max(...p95values) + this.SAFETY_MARGIN_MS);
   }
 
   private updateProfile(deviceId: string, bufferMs: number): void {
     let profile = this.profiles.get(deviceId);
-    if (!profile) {
-      profile = { deviceId, samples: [], avg: bufferMs, p95: bufferMs };
-      this.profiles.set(deviceId, profile);
-    }
+    if (!profile) { profile = { deviceId, samples: [], avg: bufferMs, p95: bufferMs }; this.profiles.set(deviceId, profile); }
     profile.samples.push(bufferMs);
     if (profile.samples.length > 10) profile.samples.shift();
     const sorted = [...profile.samples].sort((a, b) => a - b);
@@ -365,8 +310,7 @@ class SyncEngineClass {
       connectedClients: this.clients.size,
       pendingSyncs:     this.pending.size,
       clients: Array.from(this.clients.values()).map(c => ({
-        deviceId: c.deviceId, tenantId: c.tenantId,
-        type: c.type, connectedAt: c.connectedAt,
+        deviceId: c.deviceId, tenantId: c.tenantId, type: c.type, connectedAt: c.connectedAt,
       })),
     };
   }
