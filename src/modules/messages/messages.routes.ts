@@ -27,16 +27,10 @@ async function processRecording(inputPath: string): Promise<string> {
   const dingdongWav  = path.join(AUDIO_DIR, "dingdong.wav");
 
   try {
-    // 1. Hosszú halk részek eltávolítása a felvételből + hangnormalizálás
-    // stop_periods=-1: bárhol a hangban (nem csak eleje/vége)
-    // stop_duration=1.0: legalább 1mp legyen a halk rész hogy töröljük
-    // stop_threshold=-10dB: -10dB alatti szint számít csendnek
+    // 1. Hangnormalizálás
     execFileSync("ffmpeg", [
       "-y", "-i", inputPath,
-      "-af", [
-        "silenceremove=stop_periods=-1:stop_duration=1.0:stop_threshold=-10dB",
-        "loudnorm",
-      ].join(","),
+      "-af", "loudnorm",
       "-ar", "22050", "-ac", "1",
       tmpWav,
     ]);
