@@ -8,6 +8,7 @@ import { generateTTS }     from "../../services/tts.service";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
 import { randomUUID }      from "crypto";
+import { execFileSync }    from "child_process";
 import multer              from "multer";
 import path                from "path";
 import fs                  from "fs";
@@ -16,6 +17,55 @@ const router = Router();
 
 const AUDIO_DIR = path.join(process.cwd(), "audio");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
+
+// Hangfelvétel feldolgozása: csend levágás + hangnormalizálás + dingdong elejére
+async function processRecording(inputPath: string): Promise<string> {
+  const hash         = randomUUID().slice(0, 8);
+  const tmpWav       = path.join(AUDIO_DIR, `rec_tmp_${hash}.wav`);
+  const finalWav     = path.join(AUDIO_DIR, `rec_${hash}.wav`);
+  const concatList   = path.join(AUDIO_DIR, `concat_${hash}.txt`);
+  const dingdongWav  = path.join(AUDIO_DIR, "dingdong.wav");
+
+  try {
+    // 1. Csend levágása az elejéről/végéről + hangnormalizálás
+    execFileSync("ffmpeg", [
+      "-y", "-i", inputPath,
+      "-af", [
+        "silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB",
+        "areverse",
+        "silenceremove=start_periods=1:start_silence=0.3:start_threshold=-50dB",
+        "areverse",
+        "loudnorm",
+      ].join(","),
+      "-ar", "22050", "-ac", "1",
+      tmpWav,
+    ]);
+
+    // 2. Dingdong elejére fűzése (ha létezik)
+    if (fs.existsSync(dingdongWav)) {
+      fs.writeFileSync(concatList, `file '${dingdongWav}'\nfile '${tmpWav}'\n`);
+      execFileSync("ffmpeg", [
+        "-y", "-f", "concat", "-safe", "0",
+        "-i", concatList,
+        "-ar", "22050", "-ac", "1",
+        finalWav,
+      ]);
+      fs.unlinkSync(concatList);
+      fs.unlinkSync(tmpWav);
+    } else {
+      fs.renameSync(tmpWav, finalWav);
+    }
+
+    // Eredeti webm törlése
+    fs.unlinkSync(inputPath);
+    return finalWav;
+
+  } catch (err) {
+    // Cleanup
+    for (const f of [tmpWav, concatList]) { try { fs.unlinkSync(f); } catch {} }
+    throw err;
+  }
+}
 
 // Multer – hangfelvétel feltöltéshez
 const audioUpload = multer({
@@ -204,7 +254,16 @@ router.post("/audio", authJwt, requireTenant, audioUpload.single("audio"), async
 
     const { targetType = "ALL", targetId, scheduledAt } = req.body ?? {};
 
-    const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${req.file.filename}`;
+    // Feldolgozás: csend levágás + normalizálás + dingdong
+    let processedFilename = req.file.filename;
+    try {
+      const processedPath = await processRecording(req.file.path);
+      processedFilename = path.basename(processedPath);
+      console.log(`[MESSAGES] Hangfelvétel feldolgozva: ${processedFilename}`);
+    } catch (procErr) {
+      console.error("[MESSAGES] Feldolgozás hiba (eredeti fájl használva):", procErr);
+    }
+    const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${processedFilename}`;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
     const isImmediate   = !scheduledTime || scheduledTime <= new Date();
     const title         = "Hangfelvétel";
@@ -256,7 +315,7 @@ router.post("/audio", authJwt, requireTenant, audioUpload.single("audio"), async
       });
     }
 
-    console.log(`[MESSAGES] Hangfelvétel elküldve: ${req.file.filename} | tenant: ${tid}`);
+    console.log(`[MESSAGES] Hangfelvétel elküldve: ${processedFilename} | tenant: ${tid}`);
     return res.status(201).json({ ok: true, message });
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to send recording" }); }
 });
