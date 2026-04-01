@@ -27,16 +27,14 @@ async function processRecording(inputPath: string): Promise<string> {
   const dingdongWav  = path.join(AUDIO_DIR, "dingdong.wav");
 
   try {
-    // 1. Csend levágása az elejéről/végéről + hangnormalizálás
-    // start_silence=1.0: legalább 1 másodperc legyen a csend
-    // start_threshold=-10dB: -10dB alatti részt tekintjük csendnek (háttérzajra toleráns)
+    // 1. Hosszú halk részek eltávolítása a felvételből + hangnormalizálás
+    // stop_periods=-1: bárhol a hangban (nem csak eleje/vége)
+    // stop_duration=1.0: legalább 1mp legyen a halk rész hogy töröljük
+    // stop_threshold=-10dB: -10dB alatti szint számít csendnek
     execFileSync("ffmpeg", [
       "-y", "-i", inputPath,
       "-af", [
-        "silenceremove=start_periods=1:start_silence=1.0:start_threshold=-10dB",
-        "areverse",
-        "silenceremove=start_periods=1:start_silence=1.0:start_threshold=-10dB",
-        "areverse",
+        "silenceremove=stop_periods=-1:stop_duration=1.0:stop_threshold=-10dB",
         "loudnorm",
       ].join(","),
       "-ar", "22050", "-ac", "1",
