@@ -28,12 +28,14 @@ async function processRecording(inputPath: string): Promise<string> {
 
   try {
     // 1. Csend levágása az elejéről/végéről + hangnormalizálás
+    // start_silence=1.0: legalább 1 másodperc legyen a csend
+    // start_threshold=-10dB: -10dB alatti részt tekintjük csendnek (háttérzajra toleráns)
     execFileSync("ffmpeg", [
       "-y", "-i", inputPath,
       "-af", [
-        "silenceremove=start_periods=1:start_silence=0.1:start_threshold=-50dB",
+        "silenceremove=start_periods=1:start_silence=1.0:start_threshold=-10dB",
         "areverse",
-        "silenceremove=start_periods=1:start_silence=0.3:start_threshold=-50dB",
+        "silenceremove=start_periods=1:start_silence=1.0:start_threshold=-10dB",
         "areverse",
         "loudnorm",
       ].join(","),
