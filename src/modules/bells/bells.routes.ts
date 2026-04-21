@@ -6,6 +6,7 @@ import crypto from "crypto";
 import axios from "axios";
 import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
+import { broadcastSyncBells } from "./bell.scheduler";
 
 export const bellsRouter = Router();
 
@@ -118,9 +119,10 @@ async function resolveTodayBells(tenantId: string, today: Date): Promise<{
   return { bells, defaultBells, isHoliday, todayVersion, defaultVersion };
 }
 
-// ─── SYNC_BELLS dispatch helper ────────────────────────────────────────────
-// Minden VP eszközre (authType: JWT) küld egy SYNC_BELLS parancsot,
-// hogy azonnal szinkronizálják a csengetési rendet.
+// ── SYNC_BELLS dispatch helper ─────────────────────────────────────────────
+// Kétirányú értesítés minden módosításkor:
+//   1. broadcastSyncBells   → azonnal WS push az online eszközöknek (ESP32, Android, Python)
+//   2. dispatchSyncBellsToVP → DB queue a JWT-alapú offline VP eszközöknek (polling)
 async function dispatchSyncBellsToVP(tenantId: string): Promise<void> {
   try {
     const vpDevices = await prisma.device.findMany({
@@ -137,13 +139,21 @@ async function dispatchSyncBellsToVP(tenantId: string): Promise<void> {
         payload: { action: "SYNC_BELLS" },
       })),
     });
-    console.log(`[BELLS] SYNC_BELLS dispatched to ${vpDevices.length} VP device(s) in tenant ${tenantId}`);
+    console.log(`[BELLS] SYNC_BELLS DB queue → ${vpDevices.length} VP eszköz (tenant: ${tenantId})`);
   } catch (e) {
     console.error("[BELLS] dispatchSyncBellsToVP error:", e);
   }
 }
 
-// ─── Sablonok ──────────────────────────────────────────────────────────────
+// Mindkét értesítést egyszerre hívja – ezt használjuk minden módosítás után
+function notifyAllClients(tenantId: string): void {
+  // 1. Azonnali WS push az online eszközöknek
+  broadcastSyncBells(tenantId);
+  // 2. DB queue az offline/JWT eszközöknek
+  void dispatchSyncBellsToVP(tenantId);
+}
+
+// ── Sablonok ───────────────────────────────────────────────────────────────
 
 bellsRouter.get("/templates", authJwt, canEdit, async (req: Request, res: Response) => {
   const templates = await prisma.bellScheduleTemplate.findMany({
@@ -180,8 +190,7 @@ bellsRouter.post("/templates", authJwt, canEdit, async (req: Request, res: Respo
     include: { bells: true },
   });
 
-  // VP eszközök értesítése
-  void dispatchSyncBellsToVP(tid(req));
+  notifyAllClients(tid(req));
 
   res.status(201).json({ ok: true, template });
 });
@@ -212,8 +221,7 @@ bellsRouter.put("/templates/:id", authJwt, canEdit, async (req: Request, res: Re
     include: { bells: true },
   });
 
-  // VP eszközök értesítése
-  void dispatchSyncBellsToVP(tid(req));
+  notifyAllClients(tid(req));
 
   res.json({ ok: true, template: updated });
 });
@@ -228,8 +236,7 @@ bellsRouter.delete("/templates/:id", authJwt, canEdit, async (req: Request, res:
 
   await prisma.bellScheduleTemplate.delete({ where: { id: template.id } });
 
-  // VP eszközök értesítése
-  void dispatchSyncBellsToVP(tid(req));
+  notifyAllClients(tid(req));
 
   res.json({ ok: true });
 });
@@ -258,18 +265,17 @@ bellsRouter.put("/templates/:id/set-default", authJwt, canEdit, async (req: Requ
     include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
   });
 
-  // VP eszközök értesítése
-  void dispatchSyncBellsToVP(tid(req));
+  notifyAllClients(tid(req));
 
   res.json({ ok: true, template: updated });
 });
 
-// ─── Naptár ────────────────────────────────────────────────────────────────
+// ── Naptár ─────────────────────────────────────────────────────────────────
 
 bellsRouter.get("/calendar", authJwt, canEdit, async (req: Request, res: Response) => {
   const year = parseInt(req.query.year as string) || new Date().getFullYear();
   const from = new Date(`${year}-01-01`);
-  const to = new Date(`${year}-12-31`);
+  const to   = new Date(`${year}-12-31`);
 
   const days = await prisma.bellCalendarDay.findMany({
     where: { tenantId: tid(req), date: { gte: from, lte: to } },
@@ -302,6 +308,10 @@ bellsRouter.post("/calendar/init", authJwt, canEdit, async (req: Request, res: R
         create: { tenantId: tid(req), date: new Date(dateStr), isHoliday: true },
       });
     }
+
+    // Naptár inicializálásakor is értesítjük a klienseket
+    notifyAllClients(tid(req));
+
     res.json({ ok: true, imported: allHolidays.length });
   } catch (err) {
     console.error(err);
@@ -312,7 +322,7 @@ bellsRouter.post("/calendar/init", authJwt, canEdit, async (req: Request, res: R
 bellsRouter.put("/calendar/:date", authJwt, canEdit, async (req: Request, res: Response) => {
   const { isHoliday, templateId } = req.body;
   const dateStr = req.params.date as string;
-  const date = new Date(dateStr);
+  const date    = new Date(dateStr);
 
   const day = await prisma.bellCalendarDay.upsert({
     where: { tenantId_date: { tenantId: tid(req), date } },
@@ -321,13 +331,12 @@ bellsRouter.put("/calendar/:date", authJwt, canEdit, async (req: Request, res: R
     include: { template: true },
   });
 
-  // VP eszközök értesítése
-  void dispatchSyncBellsToVP(tid(req));
+  notifyAllClients(tid(req));
 
   res.json({ ok: true, day });
 });
 
-// ─── Hangfájlok ────────────────────────────────────────────────────────────
+// ── Hangfájlok ────────────────────────────────────────────────────────────
 
 bellsRouter.get("/sounds", authJwt, canEdit, async (req: Request, res: Response) => {
   const sounds = await prisma.bellSoundFile.findMany({
@@ -341,7 +350,7 @@ bellsRouter.post("/sounds", authJwt, canEdit, upload.single("file"), async (req:
   const file = (req as any).file as Express.Multer.File | undefined;
   if (!file) return res.status(400).json({ error: "No file uploaded" });
 
-  const existing = await prisma.bellSoundFile.findMany({ where: { tenantId: tid(req) } });
+  const existing  = await prisma.bellSoundFile.findMany({ where: { tenantId: tid(req) } });
   const totalUsed = existing.reduce((sum: number, s: any) => sum + s.sizeBytes, 0);
   const available = MAX_TOTAL_BYTES - totalUsed;
 
@@ -356,22 +365,21 @@ bellsRouter.post("/sounds", authJwt, canEdit, upload.single("file"), async (req:
     where: { tenantId_filename: { tenantId: tid(req), filename: file.originalname } },
     update: { sizeBytes: file.size },
     create: {
-      tenantId: tid(req),
-      filename: file.originalname,
+      tenantId:  tid(req),
+      filename:  file.originalname,
       sizeBytes: file.size,
       isDefault: DEFAULT_SOUNDS.includes(file.originalname),
     },
   });
 
-  // Új hangfájl feltöltésekor is szinkronizáljuk
-  void dispatchSyncBellsToVP(tid(req));
+  notifyAllClients(tid(req));
 
   res.status(201).json({ ok: true, sound });
 });
 
 bellsRouter.delete("/sounds/:id", authJwt, canEdit, async (req: Request, res: Response) => {
   const soundId = req.params.id as string;
-  const sound = await prisma.bellSoundFile.findFirst({
+  const sound   = await prisma.bellSoundFile.findFirst({
     where: { id: soundId, tenantId: tid(req) },
   });
   if (!sound) return res.status(404).json({ error: "Not found" });
@@ -381,10 +389,14 @@ bellsRouter.delete("/sounds/:id", authJwt, canEdit, async (req: Request, res: Re
   if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
 
   await prisma.bellSoundFile.delete({ where: { id: sound.id } });
+
+  // Hangfájl törlésekor is értesítjük – a kliensek így tudnak takarítani a cache-ből
+  notifyAllClients(tid(req));
+
   res.json({ ok: true });
 });
 
-// ─── Szerkesztési zár ──────────────────────────────────────────────────────
+// ── Szerkesztési zár ───────────────────────────────────────────────────────
 
 bellsRouter.post("/lock", authJwt, canEdit, async (req: Request, res: Response) => {
   const existing = await prisma.bellScheduleLock.findUnique({ where: { tenantId: tid(req) } });
@@ -410,26 +422,22 @@ bellsRouter.delete("/lock", authJwt, canEdit, async (req: Request, res: Response
   res.json({ ok: true });
 });
 
-// ─── Verzió lekérdezés ─────────────────────────────────────────────────────
+// ── Verzió lekérdezés ──────────────────────────────────────────────────────
 
 bellsRouter.get("/version", async (req: Request, res: Response) => {
   const device = await authenticateDevice(req);
   if (!device) return res.status(401).json({ error: "Invalid or missing device key" });
 
   const today = todayInBudapest();
-
   const { isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(device.tenantId, today);
 
   res.json({ ok: true, todayVersion, defaultVersion, isHoliday });
 });
 
-// ─── Teljes szinkronizáció eszköznek ──────────────────────────────────────
+// ── /today – JWT-vel is elérhető (VirtualPlayer) ──────────────────────────
 
-
-// ─── /today – JWT-vel is elérhető (VirtualPlayer) ─────────────────────────
 bellsRouter.get("/today", async (req: Request, res: Response) => {
-  // Device key auth (native player) VAGY JWT auth
   let tenantId = tid(req);
   if (!tenantId) {
     const device = await authenticateDevice(req);
@@ -438,9 +446,7 @@ bellsRouter.get("/today", async (req: Request, res: Response) => {
   }
   if (!tenantId) return res.status(400).json({ error: "Tenant required" });
 
-  // UTC alapú dátum – a DB is UTC-ben tárolja
   const today = todayInBudapest();
-
   const { bells, isHoliday } = await resolveTodayBells(tenantId, today);
 
   return res.json({
@@ -452,16 +458,16 @@ bellsRouter.get("/today", async (req: Request, res: Response) => {
       type:      b.type,
       soundFile: b.soundFile,
     })),
-
   });
 });
+
+// ── /sync – ESP32 / native player ─────────────────────────────────────────
 
 bellsRouter.get("/sync", async (req: Request, res: Response) => {
   const device = await authenticateDevice(req);
   if (!device) return res.status(401).json({ error: "Invalid or missing device key" });
 
   const today = todayInBudapest();
-
   const { bells, defaultBells, isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(device.tenantId, today);
 
