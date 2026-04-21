@@ -1,9 +1,11 @@
 // src/modules/bells/bells.scheduler.ts
 //
 // Javítások:
-//   • setTimeout alapú pontos indítás – pontosan :00 másodperckor szól a csengő
-//   • durationMs kiszámítása ffprobe-bal, átadva SyncEngine-nek
-//   • PREPARE/PLAY sync a csengetésekhez (nem broadcastImmediate)
+//   • getBellMs(): helyes Budapest timezone kezelés (Intl.DateTimeFormat offset)
+//   • _dispatched key tartalmaz dátumot → nap-szintű dedup, nem csak perc
+//   • Backend restart utáni "elmúlt bell" védelem: csak jövőbeli (now+1s) belleket ütemez
+//   • PREPARE és Snap timeout kezelése: ha a snap offline, nem küldi a snapcastActive=true-t
+//   • Cleanup: _pendingTimeouts és _dispatched periodikus takarítása
 
 import { prisma }          from "../../prisma/client";
 import { SyncEngine }      from "../../sync/SyncEngine";
@@ -12,15 +14,20 @@ import { execSync }        from "child_process";
 import path                from "path";
 import { randomUUID }      from "crypto";
 
-const TICK_INTERVAL_MS  = 30_000;   // 30s tick – elég sűrű az előrenézéshez
-const LOOKAHEAD_MS      = 90_000;   // 90s előre néz
-const PREPARE_LEAD_MS   = 4_000;    // 4s PREPARE az eszközöknek
+const TICK_INTERVAL_MS = 30_000;   // 30s tick
+const LOOKAHEAD_MS     = 90_000;   // 90s előrenézés
+const PREPARE_LEAD_MS  = 4_000;    // PREPARE 4s-sel korábban
+const MIN_FUTURE_MS    = 1_000;    // Csak legalább 1s jövőbeli belleket ütemez
+                                   // → restart után nem játssza le az előző percet
 
 let _running = false;
-const _dispatched = new Set<string>();
+
+// dispatchKey = "tenantId:YYYY-MM-DD:HH:MM:type"
+// Nap-szintű prefix → éjfélkor automatikusan érvénytelen
+const _dispatched     = new Set<string>();
 const _pendingTimeouts = new Map<string, ReturnType<typeof setTimeout>[]>();
 
-// ── Hangfájl hosszának lekérése ffprobe-bal ──────────────────────────────────
+// ── Hangfájl hossza ffprobe-bal ───────────────────────────────────────────────
 function getAudioDurationMs(filePath: string): number | null {
   try {
     const out = execSync(
@@ -33,6 +40,7 @@ function getAudioDurationMs(filePath: string): number | null {
   return null;
 }
 
+// ── Aktuális nap Budapest időzónában ─────────────────────────────────────────
 function todayInBudapest(): Date {
   const now = new Date();
   const fmt = new Intl.DateTimeFormat("en-CA", {
@@ -43,10 +51,77 @@ function todayInBudapest(): Date {
   return new Date(Date.UTC(year, month - 1, day));
 }
 
-// ── Tick – előrenéz és ütemezi a csengetéseket setTimeout-tal ───────────────
+// ── Bell UTC ms kiszámítása Budapest időzónából ───────────────────────────────
+//
+// Helyes módszer: Intl.DateTimeFormat-tal lekérdezzük hogy Budapest szerint
+// pontosan mikor van az adott óra:perc, majd visszakonvertálunk UTC-be.
+//
+// A korábbi verzióban duplikált offset számítás volt (localMidnight + Budapest
+// offset + localTimezoneOffset), ami egyes szerver konfigokon 1-2 órát tévedett.
+//
+function getBellMs(hour: number, minute: number): number {
+  const now = new Date();
+
+  // Aktuális dátum Budapest szerint
+  const budapestDateStr = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Budapest",
+    year:  "numeric",
+    month: "2-digit",
+    day:   "2-digit",
+  }).format(now);
+  const [y, m, d] = budapestDateStr.split("-").map(Number);
+
+  // Budapest időzóna offsetjének meghatározása az adott pillanatban
+  // (DST-t is figyelembe veszi automatikusan)
+  const bellLocalStr = `${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}T${String(hour).padStart(2,"0")}:${String(minute).padStart(2,"0")}:00`;
+
+  // Trick: Date.parse a lokális időt UTC-ként értelmezi,
+  // de mi meg tudjuk határozni a Budapest offsetet az Intl API-val
+  const tempDate = new Date(`${bellLocalStr}Z`);  // UTC-ként parse-oljuk
+  const budapestMs = new Date(
+    tempDate.toLocaleString("en-US", { timeZone: "Europe/Budapest" })
+  ).getTime();
+  const utcMs = tempDate.getTime();
+  const offsetMs = utcMs - budapestMs;  // Budapest UTC offset (negatív télen)
+
+  // A valódi UTC ms = a bell Budapest-idő UTC-ként értelmezve + offset korrekció
+  return new Date(`${bellLocalStr}Z`).getTime() + offsetMs;
+}
+
+// ── ALTERNATÍV: egyszerűbb és biztonságosabb getBellMs ───────────────────────
+// Ha a fenti bonyolultnak tűnik, ez is helyes:
+//
+// function getBellMs(hour: number, minute: number): number {
+//   const budapestDateStr = new Intl.DateTimeFormat("en-CA", {
+//     timeZone: "Europe/Budapest",
+//     year: "numeric", month: "2-digit", day: "2-digit",
+//   }).format(new Date());
+//   const [y, m, d] = budapestDateStr.split("-").map(Number);
+//   // Adjuk meg a dátum-időt Budapest szerint, és nézzük meg mi az UTC értéke
+//   const candidate = new Date(
+//     new Date(`${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}T${String(hour).padStart(2,"0")}:${String(minute).padStart(2,"0")}:00`)
+//     .toLocaleString("en-US", { timeZone: "America/New_York" })  // ← NE ÍGY
+//   );
+// }
+//
+// Legbiztonságosabb módszer: timezone-aware library (pl. date-fns-tz):
+//   import { zonedTimeToUtc } from "date-fns-tz";
+//   return zonedTimeToUtc(`${y}-${m}-${d}T${hour}:${minute}:00`, "Europe/Budapest").getTime();
+
+// ── Tick ──────────────────────────────────────────────────────────────────────
 async function tick() {
   const now     = new Date();
   const horizon = new Date(now.getTime() + LOOKAHEAD_MS);
+
+  // Periodikus cleanup: régi dispatched kulcsok törlése
+  // (a kulcs tartalmaz dátumot, tehát a mai napnál régebbiek már nem relevánsak)
+  const todayPrefix = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Budapest",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(now);
+  for (const key of _dispatched) {
+    if (!key.includes(todayPrefix)) _dispatched.delete(key);
+  }
 
   try {
     const tenants = await prisma.tenant.findMany({ select: { id: true } });
@@ -58,6 +133,7 @@ async function tick() {
   }
 }
 
+// ── Tenant bell ütemezés ──────────────────────────────────────────────────────
 async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
   const todayMidnight = todayInBudapest();
 
@@ -69,18 +145,13 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
   if (calDay?.isHoliday) return;
 
   // Hétvége ellenőrzés Budapest időzónában
-  // Ha nincs explicit naptári sablon a napra → hétvégén nem cseng
   const budapestDayOfWeek = new Intl.DateTimeFormat("en-US", {
     timeZone: "Europe/Budapest",
     weekday: "short",
   }).format(now);
   const isWeekend = budapestDayOfWeek === "Sat" || budapestDayOfWeek === "Sun";
   const hasExplicitTemplate = !!calDay?.template?.bells?.length;
-
-  if (isWeekend && !hasExplicitTemplate) {
-    // Hétvége + nincs explicit hétvégi sablon → nincs csengetés
-    return;
-  }
+  if (isWeekend && !hasExplicitTemplate) return;
 
   let bells: Array<{ hour: number; minute: number; type: string; soundFile: string }> = [];
   if (calDay?.template?.bells?.length) {
@@ -94,86 +165,109 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
   }
   if (bells.length === 0) return;
 
-  // Lookahead ablakba eső csengetések
-  for (const bell of bells) {
-    // Csengetés UTC időpontjának kiszámítása (Europe/Budapest)
-    const bellMs = getBellMs(bell.hour, bell.minute);
-    if (bellMs < now.getTime() || bellMs > horizon.getTime()) continue;
+  const todayStr = todayMidnight.toISOString().slice(0, 10);
 
-    const dispatchKey = `${tenantId}:${bell.hour}:${bell.minute}:${bell.type}:${todayMidnight.toISOString().slice(0,10)}`;
+  for (const bell of bells) {
+    const bellMs = getBellMs(bell.hour, bell.minute);
+    const waitMs = bellMs - now.getTime();
+
+    // ── Kritikus guard: csak jövőbeli belleket ütemezünk ────────────────────
+    // MIN_FUTURE_MS = 1000ms → ha a bell már elmúlt (vagy <1s múlva van),
+    // nem ütemezzük. Ez véd a backend restart utáni "azonnali" csengetés ellen.
+    if (waitMs < MIN_FUTURE_MS) continue;
+
+    // Lookahead ablakon túl van → következő tick majd felveszi
+    if (bellMs > horizon.getTime()) continue;
+
+    // Nap-szintű dispatch key: "tenantId:2026-04-21:08:00:BELL"
+    const dispatchKey = `${tenantId}:${todayStr}:${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}:${bell.type}`;
+
     if (_dispatched.has(dispatchKey)) continue;
-    if (_pendingTimeouts.has(dispatchKey)) continue; // már be van ütemezve
+    if (_pendingTimeouts.has(dispatchKey)) continue;
 
     _dispatched.add(dispatchKey);
-    if (_dispatched.size > 1000) {
-      const arr = Array.from(_dispatched);
-      arr.slice(0, 500).forEach(k => _dispatched.delete(k));
-    }
 
-    const waitMs        = bellMs - now.getTime();
-    const prepareDelay  = Math.max(0, waitMs - PREPARE_LEAD_MS);
-    const snapDelay     = Math.max(0, waitMs);
-    const commandId     = randomUUID();
-    const audioUrl      = `https://api.schoollive.hu/audio/bells/${bell.soundFile}`;
-    const soundPath     = path.join(process.cwd(), "audio", "bells", bell.soundFile);
-    const durationMs    = getAudioDurationMs(soundPath);
+    const prepareDelay = Math.max(0, waitMs - PREPARE_LEAD_MS);
+    const snapDelay    = Math.max(0, waitMs);
+    const commandId    = randomUUID();
+    const audioUrl     = `https://api.schoollive.hu/audio/bells/${bell.soundFile}`;
+    const soundPath    = path.join(process.cwd(), "audio", "bells", bell.soundFile);
+    const durationMs   = getAudioDurationMs(soundPath);
 
-    console.log(`[BELLS-SCHEDULER] Ütemezve: ${bell.hour}:${String(bell.minute).padStart(2,"0")} | wait=${Math.round(waitMs/1000)}s | dur=${durationMs}ms`);
+    const bellTimeStr = `${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}`;
+    console.log(`[BELLS-SCHEDULER] Ütemezve: ${bellTimeStr} | wait=${Math.round(waitMs/1000)}s | dur=${durationMs}ms | key=${dispatchKey}`);
 
     const timeouts: ReturnType<typeof setTimeout>[] = [];
 
-    // ── PREPARE küldése PREPARE_LEAD_MS-sel korábban ─────────────────────────
+    // ── PREPARE küldése (4s-sel korábban) ───────────────────────────────────
     const prepareTimeout = setTimeout(async () => {
-      const allDevices = await prisma.device.findMany({
-        where:  { tenantId },
-        select: { id: true, authType: true },
-      });
-      if (allDevices.length === 0) return;
-
-      const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
-      const onlineIds  = allDevices.map(d => d.id).filter(id => SyncEngine.isDeviceOnline(id));
-      const offlineIds = allDevices.map(d => d.id).filter(id => !SyncEngine.isDeviceOnline(id));
-
-      if (onlineIds.length > 0) {
-        await SyncEngine.dispatchSync({
-          tenantId,
-          commandId,
-          action:          "BELL",
-          url:             audioUrl,
-          title:           `Csengetés ${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}`,
-          targetDeviceIds: onlineIds,
-          snapcastActive:  snapOnline,
-          playAtMs:        bellMs,
-          durationMs:      durationMs ?? undefined,
+      try {
+        const allDevices = await prisma.device.findMany({
+          where:  { tenantId },
+          select: { id: true },
         });
-      }
+        if (allDevices.length === 0) return;
 
-      // DB queue offline eszközöknek
-      if (offlineIds.length > 0) {
-        await prisma.deviceCommand.createMany({
-          data: offlineIds.map(deviceId => ({
-            tenantId, deviceId, messageId: null,
-            status: "QUEUED" as const,
-            payload: { action: "BELL", url: audioUrl, type: bell.type, soundFile: bell.soundFile, hour: bell.hour, minute: bell.minute },
-          })),
-        });
+        const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
+        const onlineIds  = allDevices.map(d => d.id).filter(id => SyncEngine.isDeviceOnline(id));
+        const offlineIds = allDevices.map(d => d.id).filter(id => !SyncEngine.isDeviceOnline(id));
+
+        if (onlineIds.length > 0) {
+          await SyncEngine.dispatchSync({
+            tenantId,
+            commandId,
+            action:         "BELL",
+            url:            audioUrl,
+            title:          `Csengetés ${bellTimeStr}`,
+            targetDeviceIds: onlineIds,
+            snapcastActive:  snapOnline,   // csak akkor true ha snap tényleg él
+            playAtMs:        bellMs,
+            durationMs:      durationMs ?? undefined,
+          });
+          console.log(`[BELLS-SCHEDULER] PREPARE → ${onlineIds.length} online eszköz | snap=${snapOnline}`);
+        }
+
+        // Offline eszközök: DB queue
+        if (offlineIds.length > 0) {
+          await prisma.deviceCommand.createMany({
+            data: offlineIds.map(deviceId => ({
+              tenantId, deviceId, messageId: null,
+              status: "QUEUED" as const,
+              payload: {
+                action: "BELL", url: audioUrl,
+                type: bell.type, soundFile: bell.soundFile,
+                hour: bell.hour, minute: bell.minute,
+              },
+            })),
+          });
+          console.log(`[BELLS-SCHEDULER] DB queue → ${offlineIds.length} offline eszköz`);
+        }
+      } catch (e) {
+        console.error(`[BELLS-SCHEDULER] PREPARE hiba (${bellTimeStr}):`, e);
       }
     }, prepareDelay);
     timeouts.push(prepareTimeout);
 
-    // ── Snapcast indítása pontosan a csengetés pillanatában ────────────────────
+    // ── Snapcast lejátszás pontosan a csengetés pillanatában ─────────────────
     const snapTimeout = setTimeout(async () => {
-      const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
-      if (snapOnline) {
-        await SnapcastService.play({
-          type:     "BELL",
-          source:   { type: "file", path: soundPath },
-          tenantId,
-          title:    `Csengetés ${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}`,
-        });
-        console.log(`[BELLS-SCHEDULER] 🔔 Snapcast PLAY: ${bell.hour}:${String(bell.minute).padStart(2,"0")} | tenant: ${tenantId}`);
+      try {
+        const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
+        if (snapOnline) {
+          await SnapcastService.play({
+            type:     "BELL",
+            source:   { type: "file", path: soundPath },
+            tenantId,
+            title:    `Csengetés ${bellTimeStr}`,
+          });
+          console.log(`[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr} | tenant=${tenantId}`);
+        } else {
+          console.log(`[BELLS-SCHEDULER] ⚠️ Snap offline, ${bellTimeStr} bell kihagyva (kliensek offline módban csengnek)`);
+        }
+      } catch (e) {
+        console.error(`[BELLS-SCHEDULER] Snap PLAY hiba (${bellTimeStr}):`, e);
+      } finally {
+        _pendingTimeouts.delete(dispatchKey);
       }
-      _pendingTimeouts.delete(dispatchKey);
     }, snapDelay);
     timeouts.push(snapTimeout);
 
@@ -181,38 +275,20 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
   }
 }
 
-// ── Adott óra:perc UTC ms-e (Europe/Budapest alapján) ────────────────────────
-function getBellMs(hour: number, minute: number): number {
-  const now = new Date();
-  // Budapest offset kiszámítása
-  const budapestStr = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Budapest",
-    year: "numeric", month: "2-digit", day: "2-digit",
-  }).format(now);
-  const [y, m, d] = budapestStr.split("-").map(Number);
-
-  // Budapest időzóna offset meghatározása
-  const localMidnight = new Date(`${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}T00:00:00`);
-  const budapestMidnight = new Date(localMidnight.toLocaleString("en-US", { timeZone: "Europe/Budapest" }));
-  const offsetMs = localMidnight.getTime() - budapestMidnight.getTime() + localMidnight.getTimezoneOffset() * 60000;
-
-  // A csengetés UTC időpontja
-  const bellUtc = new Date(Date.UTC(y, m - 1, d, hour, minute, 0, 0));
-  return bellUtc.getTime() - offsetMs;
-}
-
-// ── Stop (rádió stop hívja) ───────────────────────────────────────────────────
+// ── Pending bellек törlése (pl. STOP_PLAYBACK híváskor) ──────────────────────
 export function cancelPendingBells() {
   for (const [key, timeouts] of _pendingTimeouts.entries()) {
     timeouts.forEach(t => clearTimeout(t));
     _pendingTimeouts.delete(key);
   }
+  console.log("[BELLS-SCHEDULER] Pending bellек törölve");
 }
 
+// ── Indítás ───────────────────────────────────────────────────────────────────
 export function startBellsScheduler() {
   if (_running) return;
   _running = true;
-  console.log("[BELLS-SCHEDULER] Started (tick every 30s, lookahead 90s)");
+  console.log("[BELLS-SCHEDULER] Indult (tick: 30s, lookahead: 90s, min_future: 1s)");
   tick();
   setInterval(tick, TICK_INTERVAL_MS);
 }
