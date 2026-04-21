@@ -1,11 +1,13 @@
 // src/modules/snapcast/snapcast.service.ts
-// Multi-tenant, per-tenant FIFO + snapserver, WAV stream, prioritásos queue
 //
-// v2 javítások:
-//   • buildArgs: url típusnál NEM reconnect_at_eof – statikus fájl egyszer játszik le
-//   • buildArgs: stream típusnál marad a teljes reconnect logika (rádió)
-//   • persistent RADIO restart: csak "error" esetén, "done" esetén NEM indul újra
-//   • FIFO írás: shell redirect helyett spawn stdout pipe → biztonságosabb
+// v3 javítások:
+//   • _killedByUs flag: killCurrent() jelzi hogy mi öltük meg → "interrupted"
+//     reason, nem "error" → a persistent RADIO nem indul újra feleslegesen
+//   • pauseCurrent() → pausedStack-be kerül a rádió, majd resumeFromStack()
+//     folytatja bell/TTS után
+//   • processQueue() mindig hívódik a job befejezésekor (return nélkül)
+//   • url típusnál reconnect_at_eof nincs (véges fájl)
+//   • stream típusnál reconnect_at_eof van (élő stream)
 
 import { spawn, ChildProcess, execSync } from "child_process";
 import { existsSync, mkdirSync, writeFileSync, createWriteStream } from "fs";
@@ -43,6 +45,11 @@ class TenantSnapEngine extends EventEmitter {
   private jobStartedAt: Date | null      = null;
   private _snapOnline   = false;
 
+  // ── KULCS JAVÍTÁS: flag jelzi hogy mi öltük meg a process-t ──────────────
+  // Ha _killedByUs=true → a proc.on("close")-ban "interrupted" reason lesz,
+  // nem "error" → a persistent RADIO nem indul újra automatikusan
+  private _killedByUs   = false;
+
   constructor(tenantId: string, snapPort: number) {
     super();
     this.tenantId = tenantId;
@@ -63,7 +70,7 @@ class TenantSnapEngine extends EventEmitter {
     if (!existsSync(this.fifoPath)) {
       try {
         execSync(`mkfifo ${this.fifoPath} && chmod 666 ${this.fifoPath}`);
-        console.log(`[Snap:${this.snapPort}] FIFO létrehozva: ${this.fifoPath}`);
+        console.log(`[Snap:${this.snapPort}] FIFO: ${this.fifoPath}`);
       } catch (e) {
         console.error(`[Snap:${this.snapPort}] FIFO hiba:`, e);
       }
@@ -96,7 +103,6 @@ class TenantSnapEngine extends EventEmitter {
         return;
       }
     } catch {}
-
     try {
       execSync(
         `sudo -u deploy pm2 start ${SNAPSERVER_BIN} --name snapserver-${this.snapPort} ` +
@@ -107,7 +113,7 @@ class TenantSnapEngine extends EventEmitter {
       this._snapOnline = true;
       console.log(`[Snap:${this.snapPort}] PM2 snapserver elindítva`);
     } catch (e) {
-      console.error(`[Snap:${this.snapPort}] PM2 snapserver indítási hiba:`, e);
+      console.error(`[Snap:${this.snapPort}] PM2 hiba:`, e);
     }
   }
 
@@ -126,7 +132,7 @@ class TenantSnapEngine extends EventEmitter {
     return this._snapOnline;
   }
 
-  // ── Lejátszás indítása ──────────────────────────────────────────────────────
+  // ── Lejátszás ─────────────────────────────────────────────────────────────
 
   play(params: {
     type:        SnapJobType;
@@ -155,7 +161,7 @@ class TenantSnapEngine extends EventEmitter {
       return job.id;
     }
 
-    // Magasabb prioritású → megszakítja a jelenlegit
+    // Magasabb prioritású → megszakítja a jelenlegit (pause-zal ha lehetséges)
     if (this.currentJob && job.priority < this.currentJob.priority) {
       this.pauseCurrent();
       this.queue.unshift(job);
@@ -178,21 +184,16 @@ class TenantSnapEngine extends EventEmitter {
     if (this.currentJob?.type === "RADIO") this.killCurrent();
   }
 
-  // ── Queue kezelés ───────────────────────────────────────────────────────────
+  // ── Queue kezelés ─────────────────────────────────────────────────────────
 
   private enqueue(job: SnapJob): void {
     if (job.type === "RADIO") {
-      // Rádiónál csak egy példány lehet a sorban / paused stackben
       const qi = this.queue.findIndex(j => j.type === "RADIO");
       if (qi !== -1) this.queue.splice(qi, 1, job);
       else this.queue.push(job);
-
       const pi = this.pausedStack.findIndex(p => p.job.type === "RADIO");
-      if (pi !== -1) {
-        this.pausedStack[pi] = { job, elapsedSec: 0, pausedAt: new Date() };
-      }
+      if (pi !== -1) this.pausedStack[pi] = { job, elapsedSec: 0, pausedAt: new Date() };
     } else {
-      // Prioritás szerinti beszúrás (kisebb szám = magasabb prioritás)
       const i = this.queue.findIndex(j => j.priority > job.priority);
       if (i === -1) this.queue.push(job);
       else this.queue.splice(i, 0, job);
@@ -202,32 +203,35 @@ class TenantSnapEngine extends EventEmitter {
   private pauseCurrent(): void {
     if (!this.currentJob || !this.jobStartedAt) return;
     const elapsedSec = (Date.now() - this.jobStartedAt.getTime()) / 1000;
-    this.pausedStack.push({
+    const paused: PausedJob = {
       job:        this.currentJob,
       elapsedSec: Math.max(0, elapsedSec - SILENCE_PAD_MS / 1000),
       pausedAt:   new Date(),
-    });
+    };
+    this.pausedStack.push(paused);
+    console.log(`[Snap:${this.snapPort}] ⏸ pause: ${paused.job.type} @${paused.elapsedSec.toFixed(1)}s`);
     this.killCurrent();
   }
 
   private resumeFromStack(): void {
     if (!this.pausedStack.length) return;
     const p = this.pausedStack.pop()!;
+    console.log(`[Snap:${this.snapPort}] ▶▶ resume: ${p.job.type} @${p.elapsedSec.toFixed(1)}s`);
     this.startJob({ ...p.job, source: this.applySeek(p.job.source, p.elapsedSec) });
   }
 
   private applySeek(src: SnapAudioSource, s: number): SnapAudioSource {
-    if (src.type === "stream") return src;   // stream-et nem lehet seekelni
+    if (src.type === "stream") return src;   // stream nem seekelhető
     return { ...src, _seekSec: s } as any;
   }
 
   private processQueue(): void {
     if (this.currentJob) return;
 
+    // Ha van felfüggesztett job és nincs nála magasabb prioritású a queue-ban → resume
     if (this.pausedStack.length) {
       const top = this.pausedStack[this.pausedStack.length - 1];
       const nxt = this.queue[0];
-      // Ha nincs magasabb prioritású a sorban → resume
       if (!nxt || nxt.priority >= top.job.priority) {
         setTimeout(() => this.resumeFromStack(), SILENCE_PAD_MS);
         return;
@@ -239,7 +243,7 @@ class TenantSnapEngine extends EventEmitter {
     setTimeout(() => this.startJob(job), SILENCE_PAD_MS);
   }
 
-  // ── ffmpeg indítás ──────────────────────────────────────────────────────────
+  // ── ffmpeg indítás ────────────────────────────────────────────────────────
 
   private startJob(job: SnapJob): void {
     if (!existsSync(this.fifoPath)) {
@@ -251,15 +255,13 @@ class TenantSnapEngine extends EventEmitter {
     this.currentJob   = job;
     this.jobStartedAt = new Date();
     this._running     = true;
+    this._killedByUs  = false;   // reset minden új job előtt
 
     console.log(`[Snap:${this.snapPort}] ▶ ${job.type} | ${this.desc(job.source)}`);
 
-    const args = this.buildArgs(job.source);
-
-    // stdout-ot közvetlenül a FIFO-ba pipe-oljuk (shell redirect helyett)
-    // Ez biztonságosabb: nem kell shell escaping, és a process jobban kezelhető
+    const args       = this.buildArgs(job.source);
     const fifoStream = createWriteStream(this.fifoPath);
-    const proc = spawn(FFMPEG_BIN, args, {
+    const proc       = spawn(FFMPEG_BIN, args, {
       stdio: ["ignore", "pipe", "pipe"],
     });
     this.ffmpeg = proc;
@@ -271,7 +273,6 @@ class TenantSnapEngine extends EventEmitter {
       for (const line of lines) {
         const l = line.trim();
         if (!l) continue;
-        // Csak valódi hibák – az ffmpeg progress sorokat kihagyjuk
         if (l.includes("Error") || l.includes("error") || l.includes("Invalid")) {
           console.error(`[Snap:${this.snapPort}/ffmpeg] ${l}`);
         }
@@ -288,19 +289,31 @@ class TenantSnapEngine extends EventEmitter {
 
       if (!was) return;
 
-      const reason = signal ? "interrupted" : code === 0 ? "done" : "error";
+      // ── KULCS JAVÍTÁS ──────────────────────────────────────────────────
+      // Ha mi öltük meg (killCurrent) → "interrupted", különben code alapján
+      // Ez megakadályozza hogy a pauseCurrent() által leállított rádió
+      // "error"-nak látsszon és újrainduljon
+      const reason = this._killedByUs
+        ? "interrupted"
+        : (code === 0 ? "done" : "error");
+
+      this._killedByUs = false;   // reset
       console.log(`[Snap:${this.snapPort}] ⏹ ${reason}: ${was.type}`);
 
-      // Persistent rádió: CSAK hiba esetén indul újra automatikusan.
-      // Ha "done" (EOF) → a stream véget ért, nem indítjuk újra.
+      // Persistent rádió CSAK valódi hiba esetén indul újra automatikusan.
+      // "interrupted" = mi állítottuk le (pause/stop) → NEM indítjuk újra,
+      // a processQueue() fogja kezelni (resume vagy következő job).
+      // "done" = véget ért a stream → NEM indítjuk újra (pl. véges fájl).
+      // "error" = ffmpeg hiba → újraindítás.
       if (was.persistent && was.type === "RADIO" && reason === "error") {
-        console.log(`[Snap:${this.snapPort}] Rádió újraindítás 3s múlva...`);
+        console.log(`[Snap:${this.snapPort}] 🔄 Rádió újraindítás 3s múlva (hiba miatt)...`);
         setTimeout(() => {
           if (!this.currentJob) this.startJob(was);
         }, 3000);
         return;
       }
 
+      // Minden más esetben: queue feldolgozása (resume vagy következő job)
       this.processQueue();
     });
 
@@ -311,12 +324,14 @@ class TenantSnapEngine extends EventEmitter {
       this.currentJob   = null;
       this.jobStartedAt = null;
       this._running     = false;
+      this._killedByUs  = false;
       this.processQueue();
     });
   }
 
   private killCurrent(): void {
     if (this.ffmpeg) {
+      this._killedByUs = true;   // jelöljük hogy mi öltük meg
       this.ffmpeg.kill("SIGTERM");
     } else {
       this.currentJob   = null;
@@ -325,35 +340,29 @@ class TenantSnapEngine extends EventEmitter {
     }
   }
 
-  // ── ffmpeg argumentumok ─────────────────────────────────────────────────────
+  // ── ffmpeg argumentumok ───────────────────────────────────────────────────
 
   private buildArgs(src: SnapAudioSource & { _seekSec?: number }): string[] {
     const ss  = (src as any)._seekSec as number | undefined;
     const sk  = ss && ss > 0.5 ? ["-ss", ss.toFixed(3)] : [];
-
-    // Kimeneti formátum: nyers PCM → stdout (a FIFO-ba pipe-oljuk)
     const out = [
-      "-f", "s16le",
+      "-f",  "s16le",
       "-ar", String(SAMPLE_RATE),
       "-ac", String(CHANNELS),
-      "-",          // stdout
+      "-",
       "-y",
     ];
 
     if (src.type === "file") {
-      // Helyi fájl – seek támogatással
       return ["-re", ...sk, "-i", src.path, "-vn", ...out];
     }
 
     if (src.type === "url") {
-      // ── Statikus URL (TTS hangfájl, bell URL) ────────────────────────────
-      // FONTOS: reconnect_at_eof NINCS itt!
-      // A fájl véges → ffmpeg egyszer lejátssza és kilép (code=0).
-      // reconnect_at_eof=1 esetén a fájl végén újraindítja magát → végtelen loop.
+      // Statikus fájl – NEM reconnect_at_eof (véges fájl, egyszer játssza le)
       return [
         "-re",
-        "-reconnect",        "1",   // HTTP hiba esetén újrapróbál
-        "-reconnect_streamed","1",   // stream megszakadás esetén újrapróbál
+        "-reconnect",         "1",
+        "-reconnect_streamed","1",
         ...sk,
         "-i", src.url,
         "-vn",
@@ -362,13 +371,11 @@ class TenantSnapEngine extends EventEmitter {
     }
 
     if (src.type === "stream") {
-      // ── Élő stream (rádió) ───────────────────────────────────────────────
-      // Végtelen stream → reconnect_at_eof=1 helyes, mert a stream újraindul
-      // ha a szerver ideiglenesen leáll.
+      // Élő stream – reconnect_at_eof IGEN (végtelen stream)
       return [
         "-re",
         "-reconnect",          "1",
-        "-reconnect_at_eof",   "1",   // ← CSAK stream típusnál!
+        "-reconnect_at_eof",   "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max","5",
         "-i", src.url,
@@ -378,7 +385,7 @@ class TenantSnapEngine extends EventEmitter {
       ];
     }
 
-    throw new Error(`Ismeretlen source típus: ${(src as any).type}`);
+    throw new Error(`Ismeretlen source: ${(src as any).type}`);
   }
 
   private desc(src: SnapAudioSource & { _seekSec?: number }): string {
@@ -393,12 +400,13 @@ class TenantSnapEngine extends EventEmitter {
 
   getStatus() {
     return {
-      tenantId:   this.tenantId,
-      snapPort:   this.snapPort,
-      running:    this._running,
-      snapOnline: this._snapOnline,
-      currentJob: this.currentJob,
+      tenantId:    this.tenantId,
+      snapPort:    this.snapPort,
+      running:     this._running,
+      snapOnline:  this._snapOnline,
+      currentJob:  this.currentJob,
       queueLength: this.queue.length,
+      pausedStack: this.pausedStack.length,
     };
   }
 }
@@ -424,7 +432,7 @@ class SnapcastServiceClass {
     if (this.engines.has(tenantId)) return this.engines.get(tenantId)!;
     const port = await this.getSnapPort(tenantId);
     if (!port) {
-      console.warn(`[Snapcast] Nincs snapPort a tenanthoz: ${tenantId}`);
+      console.warn(`[Snapcast] Nincs snapPort: ${tenantId}`);
       return null;
     }
     const eng = new TenantSnapEngine(tenantId, port);
