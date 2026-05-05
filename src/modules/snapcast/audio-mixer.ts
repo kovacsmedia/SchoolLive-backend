@@ -40,7 +40,7 @@ const BYTES_PER_SAMPLE = 2;                           // s16le
 const FRAME_BYTES      = CHANNELS * BYTES_PER_SAMPLE; // 4 byte/frame
 const BYTES_PER_SEC    = SAMPLE_RATE * FRAME_BYTES;   // 192 000 byte/s
 
-// ── Fade/gap paraméterek (byte-ban számolunk, nem időben) ───────────────────
+// ── Fade/gap paraméterek (byte-ban számolva, nem időben) ───────────────────
 const FADE_OUT_BYTES    = Math.round(BYTES_PER_SEC * 1.0);   // 1 s fade-out
 const FADE_IN_BYTES     = Math.round(BYTES_PER_SEC * 0.2);   // 200 ms fade-in
 const POST_FADE_GAP_MS  = 200;                                // csend fade-out után
@@ -134,11 +134,11 @@ export class TenantAudioMixer extends EventEmitter {
       console.warn(`[Mixer:${this.tenantId}] FIFO nincs: ${this.fifoPath}`);
       return;
     }
-    this.openFifo();
-    // Csend-timer: folyamatosan táplálja a FIFO-t, ha nincs aktív forrás.
-    // Ez megakadályozza, hogy a snapserver "idle"-ba essen.
-    this.silenceTimer = setInterval(() => this.tickSilence(), SILENCE_TICK_MS);
     this.running = true;
+
+    this.openFifo();
+
+    this.silenceTimer = setInterval(() => this.tickSilence(), SILENCE_TICK_MS)
     console.log(`[Mixer:${this.tenantId}] ▶ stream INDUL → ${this.fifoPath}`);
   }
 
