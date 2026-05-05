@@ -119,6 +119,7 @@ export class TenantAudioMixer extends EventEmitter {
   private gapTimer:     ReturnType<typeof setTimeout>  | null = null;
   private running       = false;
   private inGap         = false;   // POST_FADE_GAP_MS csend aktív
+  private warmedUp = false;
 
   constructor(tenantId: string, fifoPath: string) {
     super();
@@ -192,15 +193,23 @@ export class TenantAudioMixer extends EventEmitter {
   enqueue(job: MixerJob): void {
     console.log(`[Mixer:${this.tenantId}] ➕ ${job.jobType} (prio=${job.priority}) | ${this.desc(job)}`);
 
-    if (!this.active && !this.inGap) {
-  this.inGap = true;
+  f (!this.active && !this.inGap) {
+  if (!this.warmedUp) {
+    this.warmedUp = true;
+    this.inGap = true;
+
+    console.log(`[Mixer:${this.tenantId}] ⏳ első hang előtt 5s warmup csend`);
 
     setTimeout(() => {
-     this.inGap = false;
-     this.startSource(job);
-    }, 700);
+      this.inGap = false;
+      this.startSource(job);
+    }, 5000);
 
     return;
+  }
+
+  this.startSource(job);
+  return;
   }
     if (this.active && job.priority < this.active.job.priority) {
       this.queue.unshift(job);
