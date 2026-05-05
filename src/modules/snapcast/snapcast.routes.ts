@@ -65,6 +65,7 @@ router.post(
 );
 
 // ── POST /snapcast/test-tone ──────────────────────────────────────────────────
+// Minden tenant-eszközt unmutál a teszthez (admin csak).
 router.post(
   "/test-tone",
   authJwt,
@@ -72,13 +73,18 @@ router.post(
   async (req: Request, res: Response) => {
     const tid = getTenantId(req);
     if (!tid) return res.status(400).json({ error: "tenantId query param kötelező" });
+    const { prisma } = await import("../../prisma/client");
+    const allIds = (await prisma.device.findMany({
+      where: { tenantId: tid }, select: { id: true },
+    })).map(d => d.id);
     await SnapcastService.play({
-      type:     "TTS",
-      source:   { type: "url", url: "lavfi:sine=frequency=440:duration=2" },
-      tenantId: tid,
-      title:    "Test tone 440Hz",
+      type:               "TTS",
+      source:             { type: "url", url: "lavfi:sine=frequency=440:duration=2" },
+      tenantId:           tid,
+      title:              "Test tone 440Hz",
+      deviceIdsToUnmute:  allIds,
     });
-    return res.json({ ok: true, message: "Test tone elindítva" });
+    return res.json({ ok: true, message: "Test tone elindítva", devices: allIds.length });
   }
 );
 

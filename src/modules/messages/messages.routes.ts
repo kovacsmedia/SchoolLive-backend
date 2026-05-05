@@ -203,14 +203,23 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
 
     if (isImmediate) {
       const snapOnline = await SnapcastService.isSnapserverOnline(tid);
-      if (snapOnline) await SnapcastService.play({ type: "TTS", source: { type: "url", url: fileUrl }, tenantId: tid, title, text: text.trim() });
+      if (snapOnline) {
+        await SnapcastService.play({
+          type:               "TTS",
+          source:             { type: "url", url: fileUrl },
+          tenantId:           tid,
+          title,
+          text:               text.trim(),
+          deviceIdsToUnmute:  candidateIds,
+        });
+      }
       const onlineIds  = candidateIds.filter(id => SyncEngine.isDeviceOnline(id));
       const offlineIds = candidateIds.filter(id => !SyncEngine.isDeviceOnline(id));
       if (onlineIds.length > 0) {
         SyncEngine.dispatchSync({
           tenantId: tid, commandId: `msg-${message.id}`, action: "TTS",
           url: fileUrl, text: text.trim(), title, durationMs: durationMs ?? undefined,
-          ...(targetIds !== null && { targetDeviceIds: onlineIds }),
+          targetDeviceIds: candidateIds,
           snapcastActive: snapOnline,
         }).catch(e => console.error("[MESSAGES] SyncEngine hiba:", e));
       }
@@ -278,14 +287,22 @@ router.post("/audio", authJwt, requireTenant, audioUpload.single("audio"), async
 
     if (isImmediate) {
       const snapOnline = await SnapcastService.isSnapserverOnline(tid);
-      if (snapOnline) await SnapcastService.play({ type: "TTS", source: { type: "url", url: fileUrl }, tenantId: tid, title });
+      if (snapOnline) {
+        await SnapcastService.play({
+          type:               "TTS",
+          source:             { type: "url", url: fileUrl },
+          tenantId:           tid,
+          title,
+          deviceIdsToUnmute:  candidateIds,
+        });
+      }
       const onlineIds  = candidateIds.filter(id => SyncEngine.isDeviceOnline(id));
       const offlineIds = candidateIds.filter(id => !SyncEngine.isDeviceOnline(id));
       if (onlineIds.length > 0) {
         SyncEngine.dispatchSync({
           tenantId: tid, commandId: `rec-${message.id}`, action: "TTS",
           url: fileUrl, title,
-          ...(targetIds !== null && { targetDeviceIds: onlineIds }),
+          targetDeviceIds: candidateIds,
           snapcastActive: snapOnline,
         }).catch(e => console.error("[MESSAGES] SyncEngine hiba:", e));
       }
@@ -323,13 +340,22 @@ router.post("/play-url", authJwt, requireTenant, async (req: Request, res: Respo
     const targetIds    = await resolveDeviceIds(tid, targetType, targetId);
     const candidateIds = await getCandidateIds(tid, targetIds);
     const snapOnline   = await SnapcastService.isSnapserverOnline(tid);
-    if (snapOnline) await SnapcastService.play({ type: "RADIO", source: { type: "stream", url }, tenantId: tid, title, persistent: true });
+    if (snapOnline) {
+      await SnapcastService.play({
+        type:               "RADIO",
+        source:             { type: "stream", url },
+        tenantId:           tid,
+        title,
+        deviceIdsToUnmute:  candidateIds,
+        persistent:         true,
+      });
+    }
     const onlineIds = candidateIds.filter(id => SyncEngine.isDeviceOnline(id));
     if (onlineIds.length > 0) {
       await SyncEngine.dispatchSync({
         tenantId: tid, commandId: randomUUID(), action: "PLAY_URL", url, title,
         durationMs: undefined, snapcastActive: snapOnline,
-        ...(targetIds !== null && { targetDeviceIds: onlineIds }),
+        targetDeviceIds: candidateIds,
       });
     }
     return res.json({ ok: true, snapcastActive: snapOnline });

@@ -151,12 +151,15 @@ async function scheduleDispatch(schedule: {
   const snapTimeout = setTimeout(async () => {
     const snapOnline = await SnapcastService.isSnapserverOnline(schedule.tenantId);
     if (snapOnline) {
+      // A célzott eszközöket unmutáljuk; a többi marad néma.
+      const targetIds = await resolveDeviceIds(schedule.tenantId, schedule.targetType, schedule.targetId);
       await SnapcastService.play({
-        type:       "RADIO",
-        source:     { type: "url", url: schedule.radioFile.fileUrl },
-        tenantId:   schedule.tenantId,
-        title:      schedule.radioFile.originalName,
-        persistent: false,
+        type:               "RADIO",
+        source:             { type: "url", url: schedule.radioFile.fileUrl },
+        tenantId:           schedule.tenantId,
+        title:              schedule.radioFile.originalName,
+        deviceIdsToUnmute:  targetIds,
+        persistent:         false,
       });
       console.log(`[RADIO-SCHEDULER] 📻 Snapcast START: "${schedule.radioFile.originalName}" @ ${new Date().toISOString()}`);
     } else {

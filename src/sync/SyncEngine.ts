@@ -10,22 +10,32 @@ import { env }                         from "../config/env";
 export type SyncAction = "BELL" | "TTS" | "PLAY_URL" | "STOP_PLAYBACK" | "SYNC_BELLS" | "OTA_UPDATE";
 
 export interface PreparePayload {
-  phase:           "PREPARE";
-  commandId:       string;
-  action:          SyncAction;
-  url?:            string;
-  text?:           string;
-  title?:          string;
-  prepareDeadline: string;
-  snapcastActive?: boolean;
+  phase:             "PREPARE";
+  commandId:         string;
+  action:            SyncAction;
+  url?:              string;
+  text?:             string;
+  title?:            string;
+  prepareDeadline:   string;
+  snapcastActive?:   boolean;
+  // Fordított targeting: a snap stream alapból néma; csak az itt felsorolt
+  // deviceId-k emelik fel a hangerőt. Ha üres / hiányzik → senki nem szól.
+  // Minden online tenant-kliensnek megy a payload (broadcast), így ha valaki
+  // nem értesül, alapból csendben marad.
+  unmutedDeviceIds?: string[];
+  // A pontos lejátszási idő már a PREPARE-ben benne van, hogy a kliens
+  // pre-bufferelhessen és pontos sleep-et indíthasson.
+  playAtMs?:         number;
+  durationMs?:       number;
 }
 
 export interface PlayPayload {
-  phase:       "PLAY";
-  commandId:   string;
-  playAt:      string;
-  playAtMs?:   number;
-  durationMs?: number;   // lejátszás hossza ms-ben – overlay timer-hez
+  phase:             "PLAY";
+  commandId:         string;
+  playAt:            string;
+  playAtMs?:         number;
+  durationMs?:       number;
+  unmutedDeviceIds?: string[];
 }
 
 export interface ReadyAck {
@@ -44,19 +54,20 @@ interface ConnectedClient {
 }
 
 interface PendingSync {
-  commandId:       string;
-  tenantId:        string;
-  action:          SyncAction;
-  url?:            string;
-  text?:           string;
-  title?:          string;
-  prepareDeadline: Date;
-  acks:            Map<string, ReadyAck>;
-  expectedDevices: Set<string>;
-  playAtTimer:     ReturnType<typeof setTimeout> | null;
-  resolved:        boolean;
-  fixedPlayAtMs?:  number;
-  durationMs?:     number;
+  commandId:        string;
+  tenantId:         string;
+  action:           SyncAction;
+  url?:             string;
+  text?:            string;
+  title?:           string;
+  prepareDeadline:  Date;
+  acks:             Map<string, ReadyAck>;
+  expectedDevices:  Set<string>;       // ACK-ot ezektől várjuk (a célzott set)
+  unmutedDeviceIds: string[];          // payload mezőhöz
+  playAtTimer:      ReturnType<typeof setTimeout> | null;
+  resolved:         boolean;
+  fixedPlayAtMs?:   number;
+  durationMs?:      number;
 }
 
 interface DeviceProfile {
@@ -178,43 +189,73 @@ class SyncEngineClass {
     url?:             string;
     text?:            string;
     title?:           string;
+    /** Fordított targeting: ezek az eszközök kapnak hangot. A snap stream
+     *  alapból néma; ők lesznek unmutálva. Üres → senki sem szól.
+     *  Minden online tenant-kliensnek megy a PREPARE (broadcast), de ACK-ot
+     *  csak ettől a halmaztól várunk. */
     targetDeviceIds?: string[];
     snapcastActive?:  boolean;
     playAtMs?:        number;
-    durationMs?:      number;   // ← lejátszás hossza, overlay timer-hez
+    durationMs?:      number;
   }): Promise<void> {
     const { tenantId, commandId, action, url, text, title,
             targetDeviceIds, snapcastActive, playAtMs, durationMs } = params;
 
-    const targets = this.getOnlineClients(tenantId, targetDeviceIds);
-    if (targets.length === 0) {
+    // Broadcast: minden online kliens értesül – ha nem szerepel az
+    // unmutedDeviceIds-ben, "tudja" hogy csendben kell maradnia.
+    const allOnline = this.getOnlineClients(tenantId);
+    if (allOnline.length === 0) {
       console.log(`[SyncEngine] ⚠️ Nincs online eszköz: tenant=${tenantId}`);
       return;
     }
 
-    const leadMs   = this.computeLeadTime(targets.map(c => c.deviceId));
+    const unmutedSet = new Set(targetDeviceIds && targetDeviceIds.length > 0
+      ? targetDeviceIds
+      : allOnline.map(c => c.deviceId));   // ha nincs szűkítés → mindenki
+
+    // ACK-ot csak az unmutált (célzott) klienesektől várunk – a többi nem
+    // is csinál semmit, tőlük nem kell ack.
+    const expected = allOnline
+      .filter(c => unmutedSet.has(c.deviceId))
+      .map(c => c.deviceId);
+
+    const leadMs   = this.computeLeadTime(expected.length > 0 ? expected : allOnline.map(c => c.deviceId));
     const deadline = new Date(Date.now() + this.PREPARE_WINDOW_MS);
+    const unmutedDeviceIds = Array.from(unmutedSet);
 
     const syncState: PendingSync = {
       commandId, tenantId, action, url, text, title,
-      prepareDeadline: deadline,
-      acks:            new Map(),
-      expectedDevices: new Set(targets.map(c => c.deviceId)),
-      playAtTimer:     null,
-      resolved:        false,
-      fixedPlayAtMs:   playAtMs,
+      prepareDeadline:  deadline,
+      acks:             new Map(),
+      expectedDevices:  new Set(expected),
+      unmutedDeviceIds,
+      playAtTimer:      null,
+      resolved:         false,
+      fixedPlayAtMs:    playAtMs,
       durationMs,
     };
     this.pending.set(commandId, syncState);
 
     const prepareMsg: PreparePayload = {
-      phase: "PREPARE", commandId, action, url, text, title,
-      prepareDeadline: deadline.toISOString(),
+      phase:             "PREPARE",
+      commandId,
+      action,
+      url, text, title,
+      prepareDeadline:   deadline.toISOString(),
       snapcastActive,
+      unmutedDeviceIds,
+      playAtMs,
+      durationMs,
     };
 
-    console.log(`[SyncEngine] 📤 PREPARE → ${targets.length} eszköz, commandId=${commandId}${durationMs ? ` dur=${durationMs}ms` : ""}`);
-    for (const client of targets) this.send(client.ws, prepareMsg);
+    console.log(`[SyncEngine] 📤 PREPARE broadcast → ${allOnline.length} kliens (unmuted: ${unmutedDeviceIds.length}, ackTól: ${expected.length}) cmd=${commandId}${durationMs ? ` dur=${durationMs}ms` : ""}`);
+    for (const client of allOnline) this.send(client.ws, prepareMsg);
+
+    // Ha senkitől nem várunk ACK-ot (pl. célzott kliens nincs online), azonnal lőjük a PLAY-t.
+    if (expected.length === 0) {
+      this.sendPlay(syncState, leadMs);
+      return;
+    }
 
     syncState.playAtTimer = setTimeout(() => {
       if (!syncState.resolved) {
@@ -255,15 +296,16 @@ class SyncEngineClass {
     }
 
     const playMsg: PlayPayload = {
-      phase:      "PLAY",
-      commandId:  syncState.commandId,
-      playAt:     playAt.toISOString(),
-      playAtMs:   playAt.getTime(),
-      durationMs: syncState.durationMs,
+      phase:             "PLAY",
+      commandId:         syncState.commandId,
+      playAt:            playAt.toISOString(),
+      playAtMs:          playAt.getTime(),
+      durationMs:        syncState.durationMs,
+      unmutedDeviceIds:  syncState.unmutedDeviceIds,
     };
 
     const targets = this.getOnlineClients(syncState.tenantId);
-    console.log(`[SyncEngine] 🎵 PLAY → ${targets.length} eszköz, playAt=${playAt.toISOString()}${syncState.durationMs ? ` dur=${syncState.durationMs}ms` : ""}`);
+    console.log(`[SyncEngine] 🎵 PLAY broadcast → ${targets.length} kliens, playAt=${playAt.toISOString()}${syncState.durationMs ? ` dur=${syncState.durationMs}ms` : ""}`);
     for (const client of targets) this.send(client.ws, playMsg);
 
     setTimeout(() => this.pending.delete(syncState.commandId), 30_000);

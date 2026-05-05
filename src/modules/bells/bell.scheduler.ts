@@ -190,9 +190,16 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
       try {
         const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
         if (snapOnline) {
+          // Csengetést minden tenant-eszköz hallja → unmute mindenkinek
+          const allDeviceIds = (await prisma.device.findMany({
+            where: { tenantId }, select: { id: true },
+          })).map(d => d.id);
           await SnapcastService.play({
-            type: "BELL", source: { type: "file", path: soundPath },
-            tenantId, title: `Csengetés ${bellTimeStr}`,
+            type:               "BELL",
+            source:             { type: "file", path: soundPath },
+            tenantId,
+            title:              `Csengetés ${bellTimeStr}`,
+            deviceIdsToUnmute:  allDeviceIds,
           });
           console.log(`[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr}`);
         }
