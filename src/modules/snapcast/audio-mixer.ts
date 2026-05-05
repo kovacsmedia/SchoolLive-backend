@@ -193,9 +193,15 @@ export class TenantAudioMixer extends EventEmitter {
     console.log(`[Mixer:${this.tenantId}] ➕ ${job.jobType} (prio=${job.priority}) | ${this.desc(job)}`);
 
     if (!this.active && !this.inGap) {
-      this.startSource(job);
-      return;
-    }
+  this.inGap = true;
+
+    setTimeout(() => {
+     this.inGap = false;
+     this.startSource(job);
+    }, 700);
+
+    return;
+  }
     if (this.active && job.priority < this.active.job.priority) {
       this.queue.unshift(job);
       this.beginFadeOut();
