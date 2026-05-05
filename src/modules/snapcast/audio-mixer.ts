@@ -259,6 +259,10 @@ export class TenantAudioMixer extends EventEmitter {
     };
     this.active = src;
 
+    if (!proc.stdout) {
+      console.error(`[Mixer:${this.tenantId}] ⚠️ proc.stdout NULL → ffmpeg nem kommunikál!`);
+    }
+
     // ── stdout → FIFO, gain alkalmazva per-chunk ───────────────────────────
     proc.stdout?.on("data", (raw: Buffer) => {
       if (this.active !== src || src.killed) return;
@@ -271,10 +275,29 @@ export class TenantAudioMixer extends EventEmitter {
       if (gain < 1) this.applyGain(chunk, gain);
 
       // Közvetlen írás a FIFO-ba; ha backpressure → pause ffmpeg, drain után resume
-      const ok = this.fifoStream?.write(chunk) ?? true;
+      const fifoExists = !!this.fifoStream;
+      const ok = fifoExists ? this.fifoStream!.write(chunk) : false;
+
+      // Diagnosztika: első chunk és minden ~1MB-ként
+      const isFirst = src.bytesWritten === 0;
+      if (isFirst) {
+        console.log(
+          `[Mixer:${this.tenantId}] 🎵 PCM első chunk: ${chunk.length}B → ` +
+          `fifoStream=${fifoExists ? "OK" : "NULL"}, write_ok=${ok}, gain=${gain.toFixed(2)}`
+        );
+      }
+
       if (!ok) {
-        proc.stdout?.pause();
-        this.fifoStream?.once("drain", () => { if (!src.killed) proc.stdout?.resume(); });
+        if (!fifoExists) {
+          // Csendben eldobtuk az adatot. Logoljuk hogy lássuk!
+          if (!(src as any)._warnedNoFifo) {
+            console.error(`[Mixer:${this.tenantId}] ❌ fifoStream NULL → ffmpeg PCM eldobva!`);
+            (src as any)._warnedNoFifo = true;
+          }
+        } else {
+          proc.stdout?.pause();
+          this.fifoStream?.once("drain", () => { if (!src.killed) proc.stdout?.resume(); });
+        }
       }
 
       src.bytesWritten += chunk.length;
@@ -297,7 +320,10 @@ export class TenantAudioMixer extends EventEmitter {
       if (this.active !== src || src.killed) return;
       // Természetes vég (pl. fájl végére ért)
       const reason: SourceEndReason = code === 0 ? "done" : "error";
-      console.log(`[Mixer:${this.tenantId}] ⏹ ${reason}: ${src.job.jobType}`);
+      console.log(
+        `[Mixer:${this.tenantId}] ⏹ ${reason}: ${src.job.jobType} ` +
+        `(összesen ${src.bytesWritten} B = ${(src.bytesWritten / BYTES_PER_SEC).toFixed(2)}s PCM kiírva)`
+      );
       this.active = null;
       this.emit("source:end", { jobId: src.job.id, jobType: src.job.jobType, reason, bytesWritten: src.bytesWritten });
       // Rövid gap után advance (csend-timer veszi át közben)
