@@ -156,12 +156,21 @@ class TenantSnapEngine {
     };
     this.jobs.set(job.id, job);
 
-    // TODO: fordított targeting snap RPC-vel (rpcSetUnmutedSet) – egyelőre
-    // ki van kapcsolva, mert az Android snap HELLO "ID" mezője (device.id)
-    // nem egyezik a snapserver által nyilvántartott kliens ID-kkal (MAC-cím).
-    // Amíg az ID-mapping nincs megoldva, minden kliens hangos marad, és a
-    // célzás csak WS alapú (localMuted logika az Android kliensen).
-    // void this.unmuteForDevices(params.deviceIdsToUnmute).catch(() => {});
+    // Minden lejátszás előtt unmute-oljuk az összes snap klienst.
+    // Az Android TARGET_BUFFER_MS=1000ms puffert tart, ez alatt az
+    // RPC call (~100ms) biztosan lefut → a kliensek hallani fogják a hangot.
+    //
+    // Miért kell ez? A snap server tárolja a per-kliens beállításokat
+    // (muted=true a korábbi session-ökből). Ha startup-kor nem volt
+    // csatlakozva a kliens, az rpcUnmuteAll() ott 0-t talált, és a
+    // tárolt muted=true megmaradt. Ez a hívás fix: minden hangindítás
+    // előtt biztosan tiszta állapotot csinál.
+    //
+    // TODO: per-device targeting (rpcSetUnmutedSet) ha az Android snap
+    // HELLO ID-ja = device.id lesz (jelenleg MAC-cím alapú az ID).
+    void rpcUnmuteAll(httpPort(this.snapPort)).then(n => {
+      if (n > 0) console.log(`[Snap:${this.snapPort}] 🔊 unmute all: ${n} kliens`);
+    }).catch(() => {});
 
     this.mixer.enqueue(job);
     return job.id;
