@@ -187,8 +187,28 @@ class TenantSnapEngine {
 
   // ── Eseményekre reagálás ────────────────────────────────────────────────
 
-  private onSourceStart(_e: { jobId: string; jobType: MixerJobType }): void {
-    // Itt jöhet metrikák, telemetria.
+  private onSourceStart(e: { jobId: string; jobType: MixerJobType }): void {
+    // Diagnosztika + ismételt unmute: a snap kliens néha néhány 100ms-cel
+    // KÉSŐBB csatlakozik a TCP porthoz, mint ahogy az enqueue-ban az
+    // rpcUnmuteAll fut. Ilyenkor a tárolt muted=true beállítással csatlakozik
+    // és nem kapja meg az unmute-ot. Megoldjuk: 0ms, 500ms, 1500ms időpontokban
+    // megnézzük hány kliens van, és mindegyiket unmute-oljuk.
+    const port = httpPort(this.snapPort);
+    const attempts = [0, 500, 1500];
+    for (const delay of attempts) {
+      setTimeout(async () => {
+        try {
+          const { rpcListClients } = await import("./snapcast-rpc");
+          const clients = await rpcListClients(port);
+          console.log(`[Snap:${this.snapPort}] onStart @${delay}ms: ${clients.length} snap kliens csatlakozva`);
+          if (clients.length > 0) {
+            const { rpcUnmuteAll } = await import("./snapcast-rpc");
+            const n = await rpcUnmuteAll(port);
+            if (n > 0) console.log(`[Snap:${this.snapPort}] 🔊 unmute @${delay}ms: ${n} kliens`);
+          }
+        } catch {}
+      }, delay);
+    }
   }
 
   private onSourceEnd(e: { jobId: string; jobType: MixerJobType; reason: SourceEndReason; bytesEmitted: number }): void {
