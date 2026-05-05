@@ -1,0 +1,25 @@
+{
+	"folders": [
+		{
+			"name": "SchoolLive-backend",
+			"path": "../.."
+		},
+		{
+			"name": "SchoolLive-frontend",
+			"path": "../../../SchoolLive-frontend"
+		},
+		{
+			"name": "SchoolLive-windows",
+			"path": "../../../SchoolLive-windows"
+		},
+		{
+			"name": "SchoolLive-linux",
+			"path": "../../../SchoolLive-linux"
+		},
+		{
+			"name": "SchoolLive-devices",
+			"path": "../../../SchoolLive-devices"
+		}
+	],
+	"settings": {}
+}
