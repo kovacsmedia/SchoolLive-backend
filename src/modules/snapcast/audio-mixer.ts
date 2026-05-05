@@ -275,13 +275,20 @@ export class TenantAudioMixer extends EventEmitter {
 
     proc.stdout?.on("data", (chunk: Buffer) => {
       if (this.active !== src) return;
+      // KRITIKUS: a Node Readable a 'data'-ban kiadott Buffer-t belső
+      // pool-ból veszi (Buffer.allocUnsafePool) és újrahasznosíthatja.
+      // Ha sima referenciát rakunk a queue-ba, a következő olvasás
+      // FELÜLÍRHATJA ugyanazt a memóriát → torzult / kevert PCM jut
+      // a snap streamre → érdes statikus zaj. Saját, független másolat
+      // kell.
+      const safe = Buffer.from(chunk);
       // Buffer korlát: ha túl sok PCM gyűlt fel, a legrégebbit eldobjuk
-      while (src.bufferedBytes + chunk.length > MAX_BUFFER_BYTES && src.buffer.length > 0) {
+      while (src.bufferedBytes + safe.length > MAX_BUFFER_BYTES && src.buffer.length > 0) {
         const drop = src.buffer.shift()!;
         src.bufferedBytes -= drop.length;
       }
-      src.buffer.push(chunk);
-      src.bufferedBytes += chunk.length;
+      src.buffer.push(safe);
+      src.bufferedBytes += safe.length;
     });
 
     proc.stderr?.on("data", (d: Buffer) => {
@@ -436,7 +443,9 @@ export class TenantAudioMixer extends EventEmitter {
     const a = this.active!;
     if (a.bufferedBytes < BYTES_PER_TICK) return null;
 
-    const out = Buffer.allocUnsafe(BYTES_PER_TICK);
+    // alloc (nem allocUnsafe) – ha bármi okból a copy nem teljes, a buffer
+    // 0-val van inicializálva, nem random memóriával.
+    const out = Buffer.alloc(BYTES_PER_TICK);
     let written = 0;
     while (written < BYTES_PER_TICK && a.buffer.length > 0) {
       const head = a.buffer[0];
