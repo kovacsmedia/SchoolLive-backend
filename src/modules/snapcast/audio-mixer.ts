@@ -156,13 +156,34 @@ export class TenantAudioMixer extends EventEmitter {
   }
 
   private openFifo(): void {
+    if (!this.running) return;
     try {
-      this.fifoStream = createWriteStream(this.fifoPath, { flags: "w" });
-      this.fifoStream.on("error", (e) =>
-        console.error(`[Mixer:${this.tenantId}] FIFO write hiba: ${e.message}`)
-      );
+      const stream = createWriteStream(this.fifoPath, { flags: "w" });
+
+      stream.once("error", (e) => {
+        // EPIPE vagy EPOLLHUP: a snapserver bezárta a FIFO olvasó végét
+        // (pl. újraindult). Azonnal nullozzuk ki a referenciát, hogy a
+        // silenceTimer és az esetlegesen futó ffmpeg data-eventjei ne
+        // próbáljanak tovább írni – különben ERR_STREAM_DESTROYED exception
+        // árad szét, amit Node.js unhandled-ként kezel → crash.
+        console.error(`[Mixer:${this.tenantId}] FIFO hiba (${e.message}) → 1s múlva újranyitás`);
+
+        if (this.fifoStream === stream) this.fifoStream = null;
+
+        // Az összes már-sorban-lévő async write végül ERR_STREAM_DESTROYED-dal
+        // tér vissza. Ezeket el kell nyelnünk, hogy ne legyenek unhandled.
+        // A stream listeners-eit töröltük a once() trigger után; adjunk vissza
+        // egy no-op swallower-t mielőtt bármi más sülne ki.
+        stream.removeAllListeners("error");
+        stream.on("error", () => { /* elnyelt */ });
+
+        if (this.running) setTimeout(() => this.openFifo(), 1000);
+      });
+
+      this.fifoStream = stream;
     } catch (e: any) {
       console.error(`[Mixer:${this.tenantId}] FIFO open hiba: ${e.message}`);
+      if (this.running) setTimeout(() => this.openFifo(), 2000);
     }
   }
 
