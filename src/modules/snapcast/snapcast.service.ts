@@ -23,7 +23,7 @@ import {
   SNAP_PRIORITY,
 } from "./snapcast.types";
 import {
-  rpcPing, rpcUnmuteAll, rpcListClients,
+  rpcPing, rpcUnmuteAll, rpcListClients, rpcSetClientVolume,
 } from "./snapcast-rpc";
 import { randomUUID }                                         from "crypto";
 
@@ -188,27 +188,26 @@ class TenantSnapEngine {
   // ── Eseményekre reagálás ────────────────────────────────────────────────
 
   private onSourceStart(_e: { jobId: string; jobType: MixerJobType }): void {
-    // Diagnosztika + ismételt unmute: a snap kliens néha néhány 100ms-cel
-    // KÉSŐBB csatlakozik, mint ahogy az enqueue-kori rpcUnmuteAll fut.
-    // Megoldjuk: 0ms, 500ms, 1500ms időpontokban ellenőrizzük és unmute-oljuk.
+    // Ismételt unmute: a snap kliens néha 100-500ms-cel KÉSŐBB csatlakozik,
+    // mint az enqueue-kori rpcUnmuteAll. 0ms/500ms/1500ms időpontokban próbáljuk.
+    // Az Android v1.3.2-től már a kliens sem alkalmazza a snap szerver mute-ját,
+    // de a RPC unmute is hasznos hogy a szerver tárolt állapotát tisztán tartsa.
     const port = httpPort(this.snapPort);
     for (const delay of [0, 500, 1500]) {
       setTimeout(() => {
-        // A console.log az async hívás ELŐTT: mindenképp lefut,
-        // így látjuk hogy a callback egyáltalán meg lett-e hívva.
-        console.log(`[Snap:${this.snapPort}] onStart @${delay}ms – RPC hívás...`);
+        // Lekérjük a klienseket, majd UGYANAZT A LISTÁT adjuk a SetVolume-oknak
+        // (nem hívjuk le újra), így az rpcListClients csak egyszer fut tickenként.
         rpcListClients(port)
           .then(clients => {
-            console.log(`[Snap:${this.snapPort}] onStart @${delay}ms: ${clients.length} snap kliens`);
-            if (clients.length > 0) {
-              return rpcUnmuteAll(port).then(n => {
-                console.log(`[Snap:${this.snapPort}] 🔊 unmute @${delay}ms: ${n} kliens`);
-              });
-            }
+            if (clients.length === 0) return;
+            console.log(`[Snap:${this.snapPort}] 🔊 unmute @${delay}ms – ${clients.length} kliens`);
+            return Promise.allSettled(
+              clients.map(c =>
+                rpcSetClientVolume(port, c.id, 100, false)
+              )
+            );
           })
-          .catch(err => {
-            console.log(`[Snap:${this.snapPort}] onStart @${delay}ms: RPC hiba – ${err.message}`);
-          });
+          .catch(() => { /* snapserver esetleg még nem válaszol */ });
       }, delay);
     }
   }
