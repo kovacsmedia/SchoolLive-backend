@@ -23,7 +23,7 @@ import {
   SNAP_PRIORITY,
 } from "./snapcast.types";
 import {
-  rpcPing, rpcMuteAll, rpcSetUnmutedSet, rpcResolveClientIdsForDevices,
+  rpcPing, rpcUnmuteAll,
 } from "./snapcast-rpc";
 import { randomUUID }                                         from "crypto";
 
@@ -69,8 +69,11 @@ class TenantSnapEngine {
     this.mixer.on("source:end",   (e: any) => this.onSourceEnd(e));
     this.mixer.start();
 
-    // Default állapot: minden snapclient muted (fail-safe)
-    void this.muteAllClients().catch(() => {});
+    // Korábbi RPC mute állapotok törlése (az előző session muteAllClients()-ei
+    // tartósan némíthatják a snap klienseket, ha nem volt közbülső unmute).
+    void rpcUnmuteAll(httpPort(this.snapPort)).then(n => {
+      if (n > 0) console.log(`[Snap:${this.snapPort}] 🔊 startup unmute: ${n} kliens`);
+    }).catch(() => {});
 
     this.inited = true;
   }
@@ -153,12 +156,12 @@ class TenantSnapEngine {
     };
     this.jobs.set(job.id, job);
 
-    // Fordított targeting: PRE-emelés a snap RPC-n a megadott eszközöknek.
-    // Így mire a mixer a bufferből kiad PCM-et, a célzott kliensek már
-    // hangosak; a többi marad muted (default).
-    if (params.deviceIdsToUnmute && params.deviceIdsToUnmute.length > 0) {
-      void this.unmuteForDevices(params.deviceIdsToUnmute).catch(() => {});
-    }
+    // TODO: fordított targeting snap RPC-vel (rpcSetUnmutedSet) – egyelőre
+    // ki van kapcsolva, mert az Android snap HELLO "ID" mezője (device.id)
+    // nem egyezik a snapserver által nyilvántartott kliens ID-kkal (MAC-cím).
+    // Amíg az ID-mapping nincs megoldva, minden kliens hangos marad, és a
+    // célzás csak WS alapú (localMuted logika az Android kliensen).
+    // void this.unmuteForDevices(params.deviceIdsToUnmute).catch(() => {});
 
     this.mixer.enqueue(job);
     return job.id;
@@ -166,7 +169,6 @@ class TenantSnapEngine {
 
   stopAll(): void {
     this.mixer?.stopAll();
-    void this.muteAllClients().catch(() => {});
   }
 
   stopByType(type: SnapJobType): void {
@@ -180,34 +182,9 @@ class TenantSnapEngine {
     // Itt jöhet metrikák, telemetria.
   }
 
-  private async onSourceEnd(e: { jobId: string; jobType: MixerJobType; reason: SourceEndReason; bytesEmitted: number }): Promise<void> {
+  private onSourceEnd(e: { jobId: string; jobType: MixerJobType; reason: SourceEndReason; bytesEmitted: number }): void {
     this.jobs.delete(e.jobId);
-    // Ha nincs aktív és a queue/pausedStack is üres → fail-safe re-mute
-    const st = this.mixer?.getStatus();
-    if (st && !st.current && st.paused.length === 0 && st.queue.length === 0) {
-      void this.muteAllClients().catch(() => {});
-    }
-  }
-
-  private async muteAllClients(): Promise<void> {
-    if (!this.snapOnline) this.snapOnline = await rpcPing(httpPort(this.snapPort));
-    if (!this.snapOnline) return;
-    const muted = await rpcMuteAll(httpPort(this.snapPort), 0);
-    if (muted > 0) console.log(`[Snap:${this.snapPort}] 🔇 default mute: ${muted} kliens`);
-  }
-
-  private async unmuteForDevices(deviceIds: string[]): Promise<void> {
-    if (!this.snapOnline) this.snapOnline = await rpcPing(httpPort(this.snapPort));
-    if (!this.snapOnline) return;
-    // A device.id alapján próbáljuk megtalálni a snap-kliens id-ját
-    // (vagy név/host.name egyezés). Ha nincs egyezés → semmi.
-    const snapClientIds = await rpcResolveClientIdsForDevices(httpPort(this.snapPort), deviceIds);
-    if (snapClientIds.length === 0) {
-      console.warn(`[Snap:${this.snapPort}] nincs snap-kliens illesztés ${deviceIds.length} device-hoz`);
-      return;
-    }
-    const r = await rpcSetUnmutedSet(httpPort(this.snapPort), snapClientIds, 100, 0);
-    console.log(`[Snap:${this.snapPort}] 🔊 unmute=${r.unmuted}, muted=${r.muted}`);
+    // Snap RPC per-kliens muting egyelőre kikapcsolva (lásd TODO fentebb).
   }
 
   getStatus() {

@@ -83,13 +83,27 @@ export async function rpcSetClientVolume(
   });
 }
 
-/** Minden klienst némítunk (default állapot). */
+/** Minden klienst némítunk. */
 export async function rpcMuteAll(httpPort: number, percent = 0): Promise<number> {
   let n = 0;
   try {
     const clients = await rpcListClients(httpPort);
     await Promise.allSettled(
       clients.map(c => rpcSetClientVolume(httpPort, c.id, percent, true).then(() => { n++; }))
+    );
+  } catch (e) { /* swallow */ }
+  return n;
+}
+
+/** Minden klienst teljes hangerőre állít (muted=false, volume=100).
+ *  Szerver-újraindítás vagy deploy után szükséges, hogy a korábbi
+ *  rpcMuteAll() által mentett mute állapotokat töröljük. */
+export async function rpcUnmuteAll(httpPort: number, percent = 100): Promise<number> {
+  let n = 0;
+  try {
+    const clients = await rpcListClients(httpPort);
+    await Promise.allSettled(
+      clients.map(c => rpcSetClientVolume(httpPort, c.id, percent, false).then(() => { n++; }))
     );
   } catch (e) { /* swallow */ }
   return n;
