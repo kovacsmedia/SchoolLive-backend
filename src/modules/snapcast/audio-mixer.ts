@@ -2,13 +2,13 @@
 //
 // SchoolLive backend audio mixer
 //
-// Cél:
-// - A snapserver felé mindig folyamatos, hiánytalan PCM stream menjen.
-// - Az ffmpeg stdout NE írjon közvetlenül a FIFO-ba.
-// - Az ffmpeg stdout egy belső PCM queue-ba kerül.
-// - A FIFO-t egy központi pumpa eteti.
-// - Ha nincs elég forrás PCM, a pumpa nullás PCM csenddel tölti ki.
-// - Így nincs 20 ms-os setInterval alapú csendírás, ami 50 Hz-es jitter/glitch forrás lehet.
+// Stabil, data-driven megközelítés:
+// - aktív forrás esetén az ffmpeg stdout ír közvetlenül a FIFO-ba;
+// - nincs 5 mp warmup;
+// - nincs saját PCM pumpa;
+// - nincs előretöltött csend;
+// - csendet csak akkor írunk, amikor nincs aktív forrás;
+// - a FIFO megnyitása előtt a running flag már true.
 
 import { spawn, ChildProcess } from "child_process";
 import { createWriteStream, WriteStream, existsSync } from "fs";
@@ -30,18 +30,12 @@ const FADE_OUT_BYTES = Math.round(BYTES_PER_SEC * 1.0); // 1 s fade-out
 const FADE_IN_BYTES = Math.round(BYTES_PER_SEC * 0.2); // 200 ms fade-in
 const POST_FADE_GAP_MS = 200;
 
-// A FIFO pumpa ekkora PCM blokkokat ír.
-// Nem szinkron-időzítés, csak írási blokk.
-// A snapserver ettől még saját chunk_ms szerint darabolhat.
-const PUMP_CHUNK_MS = 100;
-const PUMP_CHUNK_BYTES = alignToFrame(
-  Math.round((BYTES_PER_SEC * PUMP_CHUNK_MS) / 1000)
-);
+// ── Csend tick: csak akkor fut tényleges írás, ha nincs aktív forrás ─────────
 
-// Belső PCM queue limit.
-// Ha valamiért túl sok gyűlik fel, a legrégebbit dobjuk,
-// hogy ne nőjön végtelenül a késés.
-const MAX_PCM_QUEUE_BYTES = BYTES_PER_SEC * 3;
+const SILENCE_TICK_MS = 20;
+const SILENCE_TICK_BUF = Buffer.alloc(
+  Math.round((BYTES_PER_SEC * SILENCE_TICK_MS) / 1000)
+);
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public típusok
@@ -121,15 +115,11 @@ export class TenantAudioMixer extends EventEmitter {
   private pausedStack: PausedSource[] = [];
   private queue: MixerJob[] = [];
 
+  private silenceTimer: ReturnType<typeof setInterval> | null = null;
   private gapTimer: ReturnType<typeof setTimeout> | null = null;
 
   private running = false;
   private inGap = false;
-  private warmedUp = false;
-
-  private pumpRunning = false;
-  private pcmQueue: Buffer[] = [];
-  private pcmQueueBytes = 0;
 
   constructor(tenantId: string, fifoPath: string) {
     super();
@@ -147,10 +137,16 @@ export class TenantAudioMixer extends EventEmitter {
       return;
     }
 
+    // Fontos: ez az openFifo() előtt legyen,
+    // mert az openFifo() elején ellenőrizzük a running állapotot.
     this.running = true;
 
     this.openFifo();
-    this.startPump();
+
+    this.silenceTimer = setInterval(
+      () => this.tickSilence(),
+      SILENCE_TICK_MS
+    );
 
     console.log(`[Mixer:${this.tenantId}] ▶ stream INDUL → ${this.fifoPath}`);
   }
@@ -159,7 +155,11 @@ export class TenantAudioMixer extends EventEmitter {
     if (!this.running) return;
 
     this.running = false;
-    this.pumpRunning = false;
+
+    if (this.silenceTimer) {
+      clearInterval(this.silenceTimer);
+      this.silenceTimer = null;
+    }
 
     if (this.gapTimer) {
       clearTimeout(this.gapTimer);
@@ -170,12 +170,12 @@ export class TenantAudioMixer extends EventEmitter {
 
     this.queue = [];
     this.pausedStack = [];
-    this.pcmQueue = [];
-    this.pcmQueueBytes = 0;
 
     try {
       this.fifoStream?.destroy();
-    } catch {}
+    } catch {
+      // ignore
+    }
 
     this.fifoStream = null;
 
@@ -197,9 +197,11 @@ export class TenantAudioMixer extends EventEmitter {
           this.fifoStream = null;
         }
 
+        // Az esetleges későbbi async stream hibákat elnyeljük,
+        // hogy ne legyen unhandled exception.
         stream.removeAllListeners("error");
         stream.on("error", () => {
-          // elnyelt hiba
+          // ignore
         });
 
         if (this.running) {
@@ -228,27 +230,14 @@ export class TenantAudioMixer extends EventEmitter {
       `[Mixer:${this.tenantId}] ➕ ${job.jobType} (prio=${job.priority}) | ${this.desc(job)}`
     );
 
+    // Nincs 5 mp warmup.
+    // Ha nincs aktív forrás és nincs gap, azonnal indítunk.
     if (!this.active && !this.inGap) {
-      if (!this.warmedUp) {
-        this.warmedUp = true;
-        this.inGap = true;
-
-        console.log(`[Mixer:${this.tenantId}] ⏳ első hang előtt 5s warmup csend`);
-
-        setTimeout(() => {
-          if (!this.running) return;
-
-          this.inGap = false;
-          this.startSource(job);
-        }, 5000);
-
-        return;
-      }
-
       this.startSource(job);
       return;
     }
 
+    // Magasabb prioritású hang megszakítja az aktuálisat fade-outtal.
     if (this.active && job.priority < this.active.job.priority) {
       this.queue.unshift(job);
       this.beginFadeOut();
@@ -269,14 +258,13 @@ export class TenantAudioMixer extends EventEmitter {
     this.pausedStack = [];
 
     this.killActive("stopped");
-
-    this.pcmQueue = [];
-    this.pcmQueueBytes = 0;
   }
 
   stopByType(jobType: MixerJobType): void {
     this.queue = this.queue.filter((j) => j.jobType !== jobType);
-    this.pausedStack = this.pausedStack.filter((p) => p.job.jobType !== jobType);
+    this.pausedStack = this.pausedStack.filter(
+      (p) => p.job.jobType !== jobType
+    );
 
     if (this.active?.job.jobType === jobType) {
       this.killActive("stopped");
@@ -309,91 +297,17 @@ export class TenantAudioMixer extends EventEmitter {
     };
   }
 
-  // ── Stabil PCM queue + FIFO pumpa ───────────────────────────────────────
+  // ── Csend-timer: csak ha nincs aktív forrás ─────────────────────────────
 
-  private enqueuePcm(chunk: Buffer): void {
-    if (!chunk.length) return;
+  private tickSilence(): void {
+    if (this.active) return;
+    if (!this.fifoStream) return;
 
-    const alignedLength = chunk.length - (chunk.length % FRAME_BYTES);
-    if (alignedLength <= 0) return;
-
-    const copy = Buffer.from(chunk.subarray(0, alignedLength));
-
-    this.pcmQueue.push(copy);
-    this.pcmQueueBytes += copy.length;
-
-    while (this.pcmQueueBytes > MAX_PCM_QUEUE_BYTES && this.pcmQueue.length > 1) {
-      const dropped = this.pcmQueue.shift();
-
-      if (dropped) {
-        this.pcmQueueBytes -= dropped.length;
-      }
+    try {
+      this.fifoStream.write(SILENCE_TICK_BUF);
+    } catch {
+      // ignore
     }
-  }
-
-  private takePcmBytes(size: number): Buffer {
-    const alignedSize = alignToFrame(size);
-    const out = Buffer.alloc(alignedSize);
-
-    let written = 0;
-
-    while (written < alignedSize && this.pcmQueue.length > 0) {
-      const first = this.pcmQueue[0];
-      const need = alignedSize - written;
-
-      if (first.length <= need) {
-        first.copy(out, written);
-
-        written += first.length;
-        this.pcmQueue.shift();
-        this.pcmQueueBytes -= first.length;
-      } else {
-        first.copy(out, written, 0, need);
-
-        this.pcmQueue[0] = Buffer.from(first.subarray(need));
-        this.pcmQueueBytes -= need;
-        written += need;
-      }
-    }
-
-    // A maradék automatikusan nullás PCM csend, mert Buffer.alloc().
-    return out;
-  }
-
-  private startPump(): void {
-    if (this.pumpRunning) return;
-
-    this.pumpRunning = true;
-
-    const pump = () => {
-      if (!this.running || !this.pumpRunning) return;
-
-      if (!this.fifoStream) {
-        setTimeout(pump, 10);
-        return;
-      }
-
-      const chunk = this.takePcmBytes(PUMP_CHUNK_BYTES);
-
-      try {
-        const ok = this.fifoStream.write(chunk);
-
-        if (!ok) {
-          this.fifoStream.once("drain", pump);
-        } else {
-          setImmediate(pump);
-        }
-      } catch (e: any) {
-        console.warn(`[Mixer:${this.tenantId}] pump write hiba: ${e.message}`);
-        setTimeout(pump, 10);
-      }
-    };
-
-    pump();
-
-    console.log(
-      `[Mixer:${this.tenantId}] PCM pumpa elindult (${PUMP_CHUNK_MS}ms / ${PUMP_CHUNK_BYTES}B blokk)`
-    );
   }
 
   // ── Forrás indítás ───────────────────────────────────────────────────────
@@ -417,7 +331,9 @@ export class TenantAudioMixer extends EventEmitter {
     this.active = src;
 
     if (!proc.stdout) {
-      console.error(`[Mixer:${this.tenantId}] ⚠️ proc.stdout NULL → ffmpeg nem kommunikál!`);
+      console.error(
+        `[Mixer:${this.tenantId}] ⚠️ proc.stdout NULL → ffmpeg nem kommunikál!`
+      );
     }
 
     proc.stdout?.on("data", (raw: Buffer) => {
@@ -426,27 +342,40 @@ export class TenantAudioMixer extends EventEmitter {
       const chunk = Buffer.from(raw);
 
       const gain = this.computeGain(src, chunk.length);
+
       if (gain < 1) {
         this.applyGain(chunk, gain);
       }
 
       const fifoExists = !!this.fifoStream;
-      this.enqueuePcm(chunk);
+      const ok = fifoExists ? this.fifoStream!.write(chunk) : false;
 
       const isFirst = src.bytesWritten === 0;
 
       if (isFirst) {
         console.log(
           `[Mixer:${this.tenantId}] PCM első chunk: ${chunk.length}B → ` +
-            `fifoStream=${fifoExists ? "OK" : "NULL"}, queue=${this.pcmQueueBytes}B, gain=${gain.toFixed(2)}`
+            `fifoStream=${fifoExists ? "OK" : "NULL"}, write_ok=${ok}, gain=${gain.toFixed(2)}`
         );
       }
 
-      if (!fifoExists && !(src as any)._warnedNoFifo) {
-        console.warn(
-          `[Mixer:${this.tenantId}] FIFO még nincs nyitva, PCM belső pufferben vár`
-        );
-        (src as any)._warnedNoFifo = true;
+      if (!ok) {
+        if (!fifoExists) {
+          if (!(src as any)._warnedNoFifo) {
+            console.error(
+              `[Mixer:${this.tenantId}] ❌ fifoStream NULL → ffmpeg PCM eldobva!`
+            );
+            (src as any)._warnedNoFifo = true;
+          }
+        } else {
+          proc.stdout?.pause();
+
+          this.fifoStream?.once("drain", () => {
+            if (!src.killed) {
+              proc.stdout?.resume();
+            }
+          });
+        }
       }
 
       src.bytesWritten += chunk.length;
@@ -478,7 +407,7 @@ export class TenantAudioMixer extends EventEmitter {
 
       console.log(
         `[Mixer:${this.tenantId}] ⏹ ${reason}: ${src.job.jobType} ` +
-          `(összesen ${src.bytesWritten} B = ${(src.bytesWritten / BYTES_PER_SEC).toFixed(2)}s PCM)`
+          `(összesen ${src.bytesWritten} B = ${(src.bytesWritten / BYTES_PER_SEC).toFixed(2)}s PCM kiírva)`
       );
 
       this.active = null;
@@ -518,7 +447,9 @@ export class TenantAudioMixer extends EventEmitter {
 
     console.log(
       `[Mixer:${this.tenantId}] ▶ start: ${job.jobType} | ${this.desc(job)}` +
-        (job.resumeBytes ? ` | resume@${(job.resumeBytes / BYTES_PER_SEC).toFixed(2)}s` : "")
+        (job.resumeBytes
+          ? ` | resume@${(job.resumeBytes / BYTES_PER_SEC).toFixed(2)}s`
+          : "")
     );
   }
 
@@ -555,6 +486,9 @@ export class TenantAudioMixer extends EventEmitter {
     return 1;
   }
 
+  /**
+   * s16le sztereó in-place gain.
+   */
   private applyGain(buf: Buffer, gain: number): void {
     if (gain <= 0) {
       buf.fill(0);
@@ -591,7 +525,9 @@ export class TenantAudioMixer extends EventEmitter {
 
     try {
       src.proc.kill("SIGTERM");
-    } catch {}
+    } catch {
+      // ignore
+    }
 
     const resumeBytes =
       (src.job.resumeBytes ?? 0) +
@@ -608,7 +544,9 @@ export class TenantAudioMixer extends EventEmitter {
         `[Mixer:${this.tenantId}] ⏸ pause: ${src.job.jobType} @ ${(resumeBytes / BYTES_PER_SEC).toFixed(2)}s`
       );
     } else {
-      console.log(`[Mixer:${this.tenantId}] ⏸→drop stream: ${src.job.jobType}`);
+      console.log(
+        `[Mixer:${this.tenantId}] ⏸→drop stream (nem seekelhető): ${src.job.jobType}`
+      );
     }
 
     this.active = null;
@@ -632,7 +570,9 @@ export class TenantAudioMixer extends EventEmitter {
 
     try {
       src.proc.kill("SIGTERM");
-    } catch {}
+    } catch {
+      // ignore
+    }
 
     this.active = null;
 
@@ -684,8 +624,7 @@ export class TenantAudioMixer extends EventEmitter {
       return;
     }
 
-    // Nincs aktív forrás.
-    // A pumpa ilyenkor automatikusan nullás PCM csendet küld.
+    // Semmi nincs soron: a csend-timer veszi át.
   }
 
   private insertByPriority(job: MixerJob): void {
@@ -789,8 +728,4 @@ export class TenantAudioMixer extends EventEmitter {
 
 function clamp16(v: number): number {
   return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
-}
-
-function alignToFrame(v: number): number {
-  return v - (v % FRAME_BYTES);
 }
