@@ -76,6 +76,7 @@ export async function registerDevice(req: Request, res: Response) {
 
 export async function deviceBeacon(req: Request, res: Response) {
   const dev = (req as any).device as { id: string; tenantId: string };
+
   const { volume, muted, statusPayload, firmwareVersion } = req.body ?? {};
 
   const ipAddress =
@@ -94,10 +95,42 @@ export async function deviceBeacon(req: Request, res: Response) {
       muted: typeof muted === "boolean" ? muted : undefined,
       statusPayload: statusPayload ?? undefined,
     },
-    select: { id: true, online: true, lastSeenAt: true },
+    select: {
+      id: true,
+      online: true,
+      lastSeenAt: true,
+    },
   });
 
-  res.json({ ok: true, device: updated });
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: dev.tenantId },
+    select: {
+      snapPort: true,
+    },
+  });
+
+  const baseUrl = process.env.BASE_URL ?? "https://api.schoollive.hu";
+  const snapHost =
+    process.env.SNAP_HOST ??
+    (() => {
+      try {
+        return new URL(baseUrl).hostname;
+      } catch {
+        return "api.schoollive.hu";
+      }
+    })();
+
+  res.json({
+    ok: true,
+    device: updated,
+
+    // Android/ESP32 egyszerű perzisztáláshoz.
+    deviceId: updated.id,
+
+    // ESP32 Snapcast klienshez.
+    snapHost,
+    snapPort: tenant?.snapPort ?? null,
+  });
 }
 
 export async function createDeviceCommand(req: Request, res: Response) {
