@@ -109,13 +109,18 @@ class TenantSnapEngine {
   }
 
   private writeConfig(): void {
+    // Opus@192 kbps: ~8x kisebb hálózati terhelés mint PCM@1.5 Mbps,
+    // gyakorlatilag transzparens audio minőség. Ezt minden hivatalos
+    // snapclient (linux/windows) és minden Opus-képes saját kliens dekódolja.
+    // FIGYELEM: a PCM-only saját klienseink (Android, ESP32) ettől a
+    // beállítástól nem fognak hangot lejátszani, amíg át nem állnak Opus-ra.
     const cfg = [
       `[server]`,
       `threads = -1`,
       ``,
       `[stream]`,
       `port = ${this.snapPort}`,
-      `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=pcm&chunk_ms=20`,
+      `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=opus&bitrate=192&chunk_ms=20`,
       ``,
       `[http]`,
       `enabled = true`,

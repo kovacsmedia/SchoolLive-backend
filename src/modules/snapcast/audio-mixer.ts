@@ -30,6 +30,21 @@ const FADE_OUT_BYTES = Math.round(BYTES_PER_SEC * 1.0); // 1 s fade-out
 const FADE_IN_BYTES = Math.round(BYTES_PER_SEC * 0.2); // 200 ms fade-in
 const POST_FADE_GAP_MS = 200;
 
+// ── Pre/post silence ────────────────────────────────────────────────────────
+//
+// PRE_SILENCE_MS: minden új job előtt ennyi csend megy a FIFO-ba a tényleges
+// hang előtt. Ez fedi a klienseken átfutó unmute / volume RPC-ket
+// (különösen a python klienseket, amik kill+restart-tal alkalmazzák a
+// volume változást), így a hang eleje nem vágódik le.
+//
+// A source:start event a csend ELEJÉN tüzel, így a snapcast.service.ts
+// célzási retry mechanizmusa (0/500/1500 ms) mind a csend alatt fut le.
+//
+// POST_SILENCE_MS: a job vége után ennyi csend, hogy a kliensek pufferei
+// kiürülhessenek mielőtt egy újabb forrás indulna ugyanitt.
+const PRE_SILENCE_MS = 1000;
+const POST_SILENCE_MS = 500;
+
 // ── Csend tick: csak akkor fut tényleges írás, ha nincs aktív forrás ─────────
 
 const SILENCE_TICK_MS = 20;
@@ -71,6 +86,10 @@ export interface MixerStatus {
     fadingOut: boolean;
     fadingIn: boolean;
   };
+  pending: null | {
+    jobType: MixerJobType;
+    title?: string;
+  };
   paused: Array<{
     jobType: MixerJobType;
     title?: string;
@@ -81,6 +100,7 @@ export interface MixerStatus {
     title?: string;
   }>;
   inGap: boolean;
+  inPreSilence: boolean;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -103,6 +123,11 @@ interface PausedSource {
   pausedAt: number;
 }
 
+interface PendingStart {
+  job: MixerJob;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 
 export class TenantAudioMixer extends EventEmitter {
@@ -112,6 +137,7 @@ export class TenantAudioMixer extends EventEmitter {
   private fifoStream: WriteStream | null = null;
 
   private active: ActiveSource | null = null;
+  private pending: PendingStart | null = null;
   private pausedStack: PausedSource[] = [];
   private queue: MixerJob[] = [];
 
@@ -166,6 +192,7 @@ export class TenantAudioMixer extends EventEmitter {
       this.gapTimer = null;
     }
 
+    this.cancelPending("stopped");
     this.killActive("stopped");
 
     this.queue = [];
@@ -230,10 +257,9 @@ export class TenantAudioMixer extends EventEmitter {
       `[Mixer:${this.tenantId}] ➕ ${job.jobType} (prio=${job.priority}) | ${this.desc(job)}`
     );
 
-    // Nincs 5 mp warmup.
-    // Ha nincs aktív forrás és nincs gap, azonnal indítunk.
-    if (!this.active && !this.inGap) {
-      this.startSource(job);
+    // Sem aktív forrás, sem pending start, sem gap → pre-silence-szel indítunk.
+    if (!this.active && !this.pending && !this.inGap) {
+      this.beginPendingStart(job);
       return;
     }
 
@@ -244,7 +270,58 @@ export class TenantAudioMixer extends EventEmitter {
       return;
     }
 
+    // Magasabb prioritású hang felülír egy még meg nem szólalt pending jobot.
+    // A felülírt job a queue elejére kerül, hogy később még szóljon.
+    // Nem tüzelünk source:end-et, mert a job továbbra is élő — csak később indul.
+    if (this.pending && job.priority < this.pending.job.priority) {
+      const old = this.pending.job;
+
+      clearTimeout(this.pending.timer);
+      this.pending = null;
+
+      this.queue.unshift(old);
+
+      console.log(
+        `[Mixer:${this.tenantId}] ↩ pending átugorva magasabb prio miatt: ` +
+          `${old.jobType} → ${job.jobType}`
+      );
+
+      this.beginPendingStart(job);
+      return;
+    }
+
     this.insertByPriority(job);
+  }
+
+  // ── Pre-silence indítás ─────────────────────────────────────────────────
+  //
+  // A pending fázis alatt nincs aktív forrás, így a tickSilence() automatikusan
+  // ír 0-kat a FIFO-ba. A source:start event ITT tüzel, hogy a snapcast.service.ts
+  // célzási retry-jei (0/500/1500 ms) mind a csend alatt fussanak le, mielőtt
+  // a tényleges PCM elkezdődik.
+  private beginPendingStart(job: MixerJob): void {
+    this.emit("source:start", {
+      jobId: job.id,
+      jobType: job.jobType,
+      title: job.title,
+    });
+
+    console.log(
+      `[Mixer:${this.tenantId}] ⏳ pre-silence ${PRE_SILENCE_MS}ms: ${job.jobType} | ${this.desc(job)}`
+    );
+
+    const timer = setTimeout(() => {
+      // Védelem: ha közben leálltunk vagy a pending kicserélődött, ne indítsunk.
+      if (!this.running) return;
+      if (!this.pending || this.pending.job.id !== job.id) return;
+
+      const j = this.pending.job;
+      this.pending = null;
+
+      this.startSource(j);
+    }, PRE_SILENCE_MS);
+
+    this.pending = { job, timer };
   }
 
   stopAll(): void {
@@ -257,6 +334,7 @@ export class TenantAudioMixer extends EventEmitter {
     this.queue = [];
     this.pausedStack = [];
 
+    this.cancelPending("stopped");
     this.killActive("stopped");
   }
 
@@ -266,9 +344,34 @@ export class TenantAudioMixer extends EventEmitter {
       (p) => p.job.jobType !== jobType
     );
 
+    if (this.pending?.job.jobType === jobType) {
+      this.cancelPending("stopped");
+    }
+
     if (this.active?.job.jobType === jobType) {
       this.killActive("stopped");
     }
+  }
+
+  // Aktív pending start törlése. Tüzeli a source:end eseményt, hogy a
+  // service.ts a job memóriát (jobs map, jobTargets map) tisztítsa.
+  private cancelPending(reason: SourceEndReason): void {
+    if (!this.pending) return;
+
+    const { job, timer } = this.pending;
+    clearTimeout(timer);
+    this.pending = null;
+
+    this.emit("source:end", {
+      jobId: job.id,
+      jobType: job.jobType,
+      reason,
+      bytesWritten: 0,
+    });
+
+    console.log(
+      `[Mixer:${this.tenantId}] ✖ pending törölve (${reason}): ${job.jobType}`
+    );
   }
 
   getStatus(): MixerStatus {
@@ -284,6 +387,12 @@ export class TenantAudioMixer extends EventEmitter {
             fadingIn: this.active.fadeInActive,
           }
         : null,
+      pending: this.pending
+        ? {
+            jobType: this.pending.job.jobType,
+            title: this.pending.job.title,
+          }
+        : null,
       paused: this.pausedStack.map((p) => ({
         jobType: p.job.jobType,
         title: p.job.title,
@@ -294,6 +403,7 @@ export class TenantAudioMixer extends EventEmitter {
         title: j.title,
       })),
       inGap: this.inGap,
+      inPreSilence: this.pending !== null,
     };
   }
 
@@ -419,7 +529,7 @@ export class TenantAudioMixer extends EventEmitter {
         bytesWritten: src.bytesWritten,
       });
 
-      this.scheduleAdvance(reason === "error" ? POST_FADE_GAP_MS : 50);
+      this.scheduleAdvance(reason === "error" ? POST_FADE_GAP_MS : POST_SILENCE_MS);
     });
 
     proc.on("error", (err) => {
@@ -437,12 +547,6 @@ export class TenantAudioMixer extends EventEmitter {
 
         this.scheduleAdvance(POST_FADE_GAP_MS);
       }
-    });
-
-    this.emit("source:start", {
-      jobId: job.id,
-      jobType: job.jobType,
-      title: job.title,
     });
 
     console.log(
@@ -609,14 +713,14 @@ export class TenantAudioMixer extends EventEmitter {
 
     if (nxt && (!top || nxt.priority < top.job.priority)) {
       this.queue.shift();
-      this.startSource(nxt);
+      this.beginPendingStart(nxt);
       return;
     }
 
     if (top) {
       this.pausedStack.pop();
 
-      this.startSource({
+      this.beginPendingStart({
         ...top.job,
         resumeBytes: top.resumeBytes,
       });
