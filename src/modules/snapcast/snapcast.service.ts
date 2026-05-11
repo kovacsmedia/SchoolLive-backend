@@ -14,7 +14,7 @@
 // Csak ezután indul a tényleges audio mixer job.
 
 import { execSync } from "child_process";
-import { existsSync, mkdirSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import {
   TenantAudioMixer,
   MixerJob,
@@ -58,6 +58,7 @@ class TenantSnapEngine {
   private mixer: TenantAudioMixer | null = null;
   private snapOnline = false;
   private inited = false;
+  private configChangedOnInit = false;
 
   private jobs = new Map<string, MixerJob>();
   private jobTargets = new Map<string, string[] | undefined>();
@@ -130,11 +131,67 @@ class TenantSnapEngine {
       `enabled = false`,
     ].join("\n");
 
-    writeFileSync(this.cfgPath, cfg);
+    // Csak akkor írjuk és jelöljük "változott"-nak, ha a tartalom valóban más.
+    // Így a futó snapservert csak akkor kell pm2-vel újraindítani, ha a
+    // konfiguráció (pl. codec=opus váltás) ténylegesen módosult.
+    let previous: string | null = null;
+    if (existsSync(this.cfgPath)) {
+      try {
+        previous = readFileSync(this.cfgPath, "utf8");
+      } catch {
+        previous = null;
+      }
+    }
+
+    if (previous !== cfg) {
+      writeFileSync(this.cfgPath, cfg);
+      this.configChangedOnInit = true;
+
+      console.log(
+        `[Snap:${this.snapPort}] config frissítve (${previous === null ? "új" : "változott"}): ${this.cfgPath}`
+      );
+    }
   }
 
   private async ensureSnapserver(): Promise<void> {
-    if (await rpcPing(httpPort(this.snapPort))) {
+    const alreadyRunning = await rpcPing(httpPort(this.snapPort));
+
+    if (alreadyRunning) {
+      // Ha fut, de a config most változott (pl. új codec=opus deploy után),
+      // pm2-vel újraindítjuk, hogy biztosan az új beállításokkal menjen.
+      if (this.configChangedOnInit) {
+        console.log(
+          `[Snap:${this.snapPort}] config változott, snapserver pm2 restart`
+        );
+
+        try {
+          execSync(
+            `sudo -u deploy pm2 restart snapserver-${this.snapPort}`,
+            { stdio: "pipe" }
+          );
+        } catch (e) {
+          console.error(`[Snap:${this.snapPort}] PM2 restart hiba:`, e);
+        }
+
+        // Várjuk meg, hogy az RPC újra válaszoljon.
+        for (let i = 0; i < 20; i++) {
+          await sleep(300);
+
+          if (await rpcPing(httpPort(this.snapPort))) {
+            this.snapOnline = true;
+            console.log(
+              `[Snap:${this.snapPort}] snapserver újraindult új configgal`
+            );
+            return;
+          }
+        }
+
+        console.warn(
+          `[Snap:${this.snapPort}] restart után RPC nem válaszol`
+        );
+        return;
+      }
+
       this.snapOnline = true;
       console.log(`[Snap:${this.snapPort}] Snapserver már fut`);
       return;
