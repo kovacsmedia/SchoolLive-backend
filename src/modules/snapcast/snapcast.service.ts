@@ -360,23 +360,16 @@ class TenantSnapEngine {
   private onSourceStart(e: { jobId: string; jobType: MixerJobType }): void {
     const targets = this.jobTargets.get(e.jobId);
 
-    /*
-     * EGY célzás-hívás elég.
-     *
-     * A `prepareClientsForPlayback` (enqueue előtt) MÁR megvárja a célzott
-     * klienseket és beállítja a mute/unmute-ot, plus 500 ms stabilizálás.
-     * Itt csak egyszer ráerősítünk, közvetlenül a pre-silence elején.
-     *
-     * A korábbi 3-szori retry (0/500/1500 ms) sok párhuzamos HTTP RPC-t
-     * generált, ami a snap szerver localhost ControlServer-jét terhelte
-     * (sok 'Failed to shudown socket' error, 600+ ms-os FIFO-reader csúszás).
-     * A snap szerver eközben 'No data since 120 ms' miatt idle-be ment,
-     * 304+ ms-os onResync ugrással, ami a kliensen audible glitch-et okoz
-     * a TTS elején.
-     */
-    this.applyTargetingToClients(targets).catch(() => {
-      // snapserver esetleg átmenetileg nem válaszol
-    });
+    // Nem unmute-olunk vakon mindenkit.
+    // Ugyanazt a célzást alkalmazzuk újra néhány késleltetett pillanatban,
+    // hogy a késve megjelenő kliensek se maradjanak rossz állapotban.
+    for (const delay of [0, 500, 1500]) {
+      setTimeout(() => {
+        this.applyTargetingToClients(targets).catch(() => {
+          // snapserver esetleg átmenetileg nem válaszol
+        });
+      }, delay);
+    }
   }
 
   private onSourceEnd(e: {

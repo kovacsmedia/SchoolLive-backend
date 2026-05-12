@@ -66,11 +66,29 @@ export async function rpcPing(httpPort: number): Promise<boolean> {
   catch { return false; }
 }
 
-/** Összes kliens listája. */
+/** Aktívan csatlakozott kliensek listája.
+ *
+ * FIGYELEM: szándékosan kizárjuk a disconnected klienseket. A snapserver a
+ * server.json-ban hosszú távon tárolja minden korábbi klienst (akár hetekkel
+ * korábban csatlakozottakat is). Ha mindegyikre `Client.SetVolume`-ot küldünk,
+ * az `applyTargetingToClients` egy TTS-re 30-100+ HTTP RPC-t generálhat a
+ * helyi snapserver ControlServer-jére, ami:
+ *  - sok 'Failed to shudown socket: system:107' errort okoz,
+ *  - 600+ ms-ig terheli a snapserver eseménykezelőjét,
+ *  - eközben a PipeStream reader szál nem olvas a FIFO-ból elég gyorsan,
+ *  - a snapserver "No data since 120 ms, switching to idle" miatt idle-be megy,
+ *  - idle->playing átmenetnél 300-700 ms-os onResync ugrás van,
+ *  - amit a kliensek (ESP, Android, Linux) audible glitch-ként látnak a TTS elején.
+ *
+ * Csak a `connected: true` kliensekre szólunk - ezek azok, amelyek aktívan
+ * fogyasztják a streamet és tényleg mute/unmute célzást igényelnek.
+ */
 export async function rpcListClients(httpPort: number): Promise<RpcClient[]> {
   const result = await rpcCall(httpPort, "Server.GetStatus");
   const groups: RpcGroup[] = result?.server?.groups ?? [];
-  return groups.flatMap(g => g.clients ?? []);
+  return groups
+    .flatMap(g => g.clients ?? [])
+    .filter(c => c.connected === true);
 }
 
 /** Egy kliens hangerő/mute beállítása. */
