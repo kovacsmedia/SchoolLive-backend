@@ -875,43 +875,39 @@ export class TenantAudioMixer extends EventEmitter {
     const seek = resumeSec > 0.5 ? ["-ss", resumeSec.toFixed(3)] : [];
 
     /*
-     * Broadcast-style audio processing chain — minden forrás (TTS, MP3 fájl,
-     * internet rádió, mic) ugyanazon a 3 lépcsőn megy keresztül, hogy a
-     * loudness konzisztens legyen, és a peak-ek ne clip-eljenek.
+     * Broadcast-style audio processing chain (opt-in).
      *
-     * 1) loudnorm = I:-16 (target Integrated Loudness, LUFS)
-     *    TP:-1.5 (True Peak ceiling dBTP)
-     *    LRA:11 (target Loudness Range, LU)
-     *      EBU R128 standard. Single-pass mode (linear=false) - real-time
-     *      streamre alkalmas, dinamikusan követi a loudness-t.
-     *      -16 LUFS = streaming default (Spotify/YouTube/Apple Music szint),
-     *      hangosabb mint a -23 LUFS broadcast TV szabvány, de halkabb
-     *      mint a -10..-12 LUFS "loudness war" pop master.
+     * A jelen állapotban DEFAULT KIKAPCSOLVA, mert a `loudnorm` filter
+     * single-pass módban dinamikus belső buffer adagolást végez (FFT-alapú
+     * loudness analízis 3 másodperces ablakkal), ami időnként nem pontosan
+     * 20 ms-os chunk-okat ad ki - ez minden ~2 másodpercben 100-120 ms-os
+     * jittert okozott a klienseken (RESYNCING HARD 2: age -99..-119ms).
      *
-     * 2) acompressor = threshold:-18dB ratio:4 attack:20ms release:250ms
-     *      Dinamikus tartomány tömörítés. Soft-knee, a halk passzázsokat
-     *      kiemelve, a hangosakat tompítva. Klasszikus broadcast comp.
+     * Bekapcsolás: BACKEND_ENABLE_NORMALIZE=1 env változó. Ekkor egy
+     * egyszerűbb chain fut, ami nem tartalmazza a problémás loudnorm-ot:
      *
-     * 3) alimiter = level_in:1 level_out:1 limit:0.95
-     *      Brick-wall peak limiter -0.45 dBFS ceiling-gel. Az Opus encoder
-     *      előtt feltétlenül szükséges, mert kompresszor + loudnorm után
-     *      előfordulhatnak rövid túllendülések.
+     *   acompressor = threshold:-18dB ratio:4 attack:20ms release:250ms
+     *     Dinamikus tartomány tömörítés. A halk passzázsokat kiemeli,
+     *     a hangosakat tompítja.
      *
-     * Megjegyzés: a `loudnorm` single-pass módban a kezdeti ~200 ms alatt
-     * "tanulja" a forrás loudness-jét. A PRE_SILENCE_MS=2000 elég nagy ahhoz
-     * hogy ez a learning ne ütközzön a tényleges audio kezdetével.
+     *   alimiter = level_in:1 level_out:1 limit:0.95
+     *     Brick-wall peak limiter -0.45 dBFS ceiling-gel. Az Opus encoder
+     *     előtt megakadályozza a clipping-et.
      *
-     * Override env-en át: BACKEND_DISABLE_LOUDNORM=1 esetén a chain kikapcsol
-     * (debugoláshoz vagy CPU-takarékos módhoz).
+     * Ez a két filter csekély (sub-ms) processing latency-vel jár, így
+     * nem zavarja a snap szerver oldali ütemezést.
+     *
+     * A loudness normalizációt (EBU R128 / -16 LUFS) később adjuk vissza,
+     * amikor megoldjuk a timing jitter problémát (pl. két-passos offline
+     * normalizációval a hangfájlok feltöltésekor, vagy más megközelítéssel).
      */
     const AUDIO_NORMALIZE_FILTER =
-      "loudnorm=I=-16:TP=-1.5:LRA=11," +
       "acompressor=threshold=-18dB:ratio=4:attack=20:release=250," +
       "alimiter=level_in=1:level_out=1:limit=0.95";
 
-    const audioFilter = process.env.BACKEND_DISABLE_LOUDNORM === "1"
-      ? []
-      : ["-af", AUDIO_NORMALIZE_FILTER];
+    const audioFilter = process.env.BACKEND_ENABLE_NORMALIZE === "1"
+      ? ["-af", AUDIO_NORMALIZE_FILTER]
+      : [];
 
     const out = [
       ...audioFilter,
