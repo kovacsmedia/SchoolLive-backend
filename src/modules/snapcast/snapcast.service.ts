@@ -115,13 +115,28 @@ class TenantSnapEngine {
     // snapclient (linux/windows) és minden Opus-képes saját kliens dekódolja.
     // FIGYELEM: a PCM-only saját klienseink (Android, ESP32) ettől a
     // beállítástól nem fognak hangot lejátszani, amíg át nem állnak Opus-ra.
+    //
+    // dryout_ms=5000:
+    // A pipe:// source non-blocking, és ha 120 ms-ig nem érkezik új adat,
+    // alapból idle állapotba megy. Amikor utána új adat (pl. TTS) érkezik,
+    // 500-700 ms-os hard resync csinál a klienseken (lásd: snapserver
+    // "PcmStream: State changed: idle => playing" + "onResync 604 ms"),
+    // ami a beszéd első ~1 másodpercét megakasztja.
+    //
+    // A dryout_ms=5000 hatására a snapserver 5 másodpercig CSENDES PCM/Opus
+    // chunkokat továbbít a klienseknek, így nem megy idle-be, és nincs
+    // idle→playing átmenet. A klienseink folyamatos streamet kapnak, a
+    // szinkron nem szakad meg.
+    //
+    // 5 másodperc bőven elég a Node.js setInterval(20ms) tickek esetleges
+    // GC-szüneteire is.
     const cfg = [
       `[server]`,
       `threads = -1`,
       ``,
       `[stream]`,
       `port = ${this.snapPort}`,
-      `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=opus&bitrate=192&chunk_ms=20`,
+      `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=opus&bitrate=192&chunk_ms=20&dryout_ms=5000`,
       ``,
       `[http]`,
       `enabled = true`,
