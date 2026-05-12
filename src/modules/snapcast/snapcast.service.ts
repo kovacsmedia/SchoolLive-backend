@@ -115,29 +115,9 @@ class TenantSnapEngine {
     // snapclient (linux/windows) és minden Opus-képes saját kliens dekódolja.
     // FIGYELEM: a PCM-only saját klienseink (Android, ESP32) ettől a
     // beállítástól nem fognak hangot lejátszani, amíg át nem állnak Opus-ra.
-    //
-    // Buffer + dryout megfontolások:
-    //
-    // 1) [server] buffer = 1500
-    //    A snapserver a client_settings üzenetben elküldi a klienseknek a
-    //    jitter buffer méretét (buf_ms). Az ESP klienseink alapja 1000 ms
-    //    volt, ami szoros idle→playing átmenetnél kevésnek bizonyult: a
-    //    snapserver 376 ms-os resync-jét nem tudta lenyelni glitch nélkül,
-    //    így ~500 ms-os megakadás keletkezett a TTS elején.
-    //    1500 ms-ra emelve a kliens 50%-kal több toleranciát kap, a kezdeti
-    //    átmenetek nem érik el a buffer alját.
-    //
-    // 2) dryout_ms (pipe:// source paraméter)
-    //    A snapcast pipe:// source 120 ms-ig vár adatra, utána idle-be megy.
-    //    A 120 ms threshold hardkódolt a snapserver-ben (nem dryout_ms-szel
-    //    szabályozható). A dryout_ms a "csendes átmeneti buffer" méretét
-    //    állítja a state-váltás után. Túl nagy érték (5000) NEM oldotta meg
-    //    az idle→playing resync-et, ezért visszatérünk a default 2000-re
-    //    (a paramétert explicit ki sem írjuk).
     const cfg = [
       `[server]`,
       `threads = -1`,
-      `buffer = 1500`,
       ``,
       `[stream]`,
       `port = ${this.snapPort}`,
@@ -380,16 +360,23 @@ class TenantSnapEngine {
   private onSourceStart(e: { jobId: string; jobType: MixerJobType }): void {
     const targets = this.jobTargets.get(e.jobId);
 
-    // Nem unmute-olunk vakon mindenkit.
-    // Ugyanazt a célzást alkalmazzuk újra néhány késleltetett pillanatban,
-    // hogy a késve megjelenő kliensek se maradjanak rossz állapotban.
-    for (const delay of [0, 500, 1500]) {
-      setTimeout(() => {
-        this.applyTargetingToClients(targets).catch(() => {
-          // snapserver esetleg átmenetileg nem válaszol
-        });
-      }, delay);
-    }
+    /*
+     * EGY célzás-hívás elég.
+     *
+     * A `prepareClientsForPlayback` (enqueue előtt) MÁR megvárja a célzott
+     * klienseket és beállítja a mute/unmute-ot, plus 500 ms stabilizálás.
+     * Itt csak egyszer ráerősítünk, közvetlenül a pre-silence elején.
+     *
+     * A korábbi 3-szori retry (0/500/1500 ms) sok párhuzamos HTTP RPC-t
+     * generált, ami a snap szerver localhost ControlServer-jét terhelte
+     * (sok 'Failed to shudown socket' error, 600+ ms-os FIFO-reader csúszás).
+     * A snap szerver eközben 'No data since 120 ms' miatt idle-be ment,
+     * 304+ ms-os onResync ugrással, ami a kliensen audible glitch-et okoz
+     * a TTS elején.
+     */
+    this.applyTargetingToClients(targets).catch(() => {
+      // snapserver esetleg átmenetileg nem válaszol
+    });
   }
 
   private onSourceEnd(e: {
