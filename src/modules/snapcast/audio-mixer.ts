@@ -874,7 +874,47 @@ export class TenantAudioMixer extends EventEmitter {
     const resumeSec = job.resumeBytes ? job.resumeBytes / BYTES_PER_SEC : 0;
     const seek = resumeSec > 0.5 ? ["-ss", resumeSec.toFixed(3)] : [];
 
+    /*
+     * Broadcast-style audio processing chain — minden forrás (TTS, MP3 fájl,
+     * internet rádió, mic) ugyanazon a 3 lépcsőn megy keresztül, hogy a
+     * loudness konzisztens legyen, és a peak-ek ne clip-eljenek.
+     *
+     * 1) loudnorm = I:-16 (target Integrated Loudness, LUFS)
+     *    TP:-1.5 (True Peak ceiling dBTP)
+     *    LRA:11 (target Loudness Range, LU)
+     *      EBU R128 standard. Single-pass mode (linear=false) - real-time
+     *      streamre alkalmas, dinamikusan követi a loudness-t.
+     *      -16 LUFS = streaming default (Spotify/YouTube/Apple Music szint),
+     *      hangosabb mint a -23 LUFS broadcast TV szabvány, de halkabb
+     *      mint a -10..-12 LUFS "loudness war" pop master.
+     *
+     * 2) acompressor = threshold:-18dB ratio:4 attack:20ms release:250ms
+     *      Dinamikus tartomány tömörítés. Soft-knee, a halk passzázsokat
+     *      kiemelve, a hangosakat tompítva. Klasszikus broadcast comp.
+     *
+     * 3) alimiter = level_in:1 level_out:1 limit:0.95
+     *      Brick-wall peak limiter -0.45 dBFS ceiling-gel. Az Opus encoder
+     *      előtt feltétlenül szükséges, mert kompresszor + loudnorm után
+     *      előfordulhatnak rövid túllendülések.
+     *
+     * Megjegyzés: a `loudnorm` single-pass módban a kezdeti ~200 ms alatt
+     * "tanulja" a forrás loudness-jét. A PRE_SILENCE_MS=2000 elég nagy ahhoz
+     * hogy ez a learning ne ütközzön a tényleges audio kezdetével.
+     *
+     * Override env-en át: BACKEND_DISABLE_LOUDNORM=1 esetén a chain kikapcsol
+     * (debugoláshoz vagy CPU-takarékos módhoz).
+     */
+    const AUDIO_NORMALIZE_FILTER =
+      "loudnorm=I=-16:TP=-1.5:LRA=11," +
+      "acompressor=threshold=-18dB:ratio=4:attack=20:release=250," +
+      "alimiter=level_in=1:level_out=1:limit=0.95";
+
+    const audioFilter = process.env.BACKEND_DISABLE_LOUDNORM === "1"
+      ? []
+      : ["-af", AUDIO_NORMALIZE_FILTER];
+
     const out = [
+      ...audioFilter,
       "-f",
       "s16le",
       "-ar",
