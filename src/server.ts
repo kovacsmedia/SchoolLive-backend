@@ -9,6 +9,7 @@ import { app }                  from "./app";
 import { env }                  from "./config/env";
 import { startBellsScheduler }  from "./modules/bells/bell.scheduler";
 import { startRadioScheduler }  from "./modules/radio/radio.scheduler";
+import { startDeviceLifecycleScheduler } from "./modules/devices/device.lifecycle";
 import { SyncEngine }           from "./sync/SyncEngine";
 import usersAdminRoutes         from "./modules/users/users.admin.routes";
 
@@ -29,6 +30,7 @@ SyncEngine.init(wss);
 // ── Schedulers ────────────────────────────────────────────────────────────────
 startBellsScheduler();
 startRadioScheduler();
+startDeviceLifecycleScheduler();
 
 app.use("/admin/users", usersAdminRoutes);
 

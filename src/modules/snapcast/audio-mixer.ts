@@ -45,12 +45,33 @@ const POST_FADE_GAP_MS = 200;
 const PRE_SILENCE_MS = 1000;
 const POST_SILENCE_MS = 500;
 
-// ── Csend tick: csak akkor fut tényleges írás, ha nincs aktív forrás ─────────
-
-const SILENCE_TICK_MS = 20;
-const SILENCE_TICK_BUF = Buffer.alloc(
-  Math.round((BYTES_PER_SEC * SILENCE_TICK_MS) / 1000)
-);
+// ── Háttér silence ffmpeg subprocess ─────────────────────────────────────────
+//
+// Egy ffmpeg subprocess folyamatosan ír real-time (-re flag) csendet
+// (anullsrc forrást) a snap FIFO-ra. A Node event loop blokkolása NEM
+// érinti a snap szerver FIFO-olvasását, mert a kernel közvetlenül viszi
+// a PCM-et az ffmpeg-ből a snap szerverbe.
+//
+// Job indulásakor SIGSTOP-pal megáll, a Node-middleware (a meglévő fade-rel)
+// veszi át az írást a fifoStream-re. Job végén SIGCONT-tal újraindul.
+// Soha nem ír párhuzamosan a fifoStream-mel — a SIGSTOP atomic.
+//
+// A korábbi setInterval(20ms) tickSilence Node-on át írt, ami a Node main
+// loop GC-szüneteire és egyéb blokkolásokra érzékeny volt: 120 ms+ csúszás
+// = snap szerver "No data since 120 ms" → idle → 400+ ms onResync ugrás
+// a klienseken (audible glitch a TTS elején).
+const SILENCE_FFMPEG_ARGS = (fifoPath: string) => [
+  "-hide_banner",
+  "-loglevel", "error",
+  "-re",
+  "-f", "lavfi",
+  "-i", `anullsrc=channel_layout=stereo:sample_rate=${SAMPLE_RATE}`,
+  "-f", "s16le",
+  "-ar", String(SAMPLE_RATE),
+  "-ac", String(CHANNELS),
+  "-y",
+  fifoPath,
+];
 
 // ────────────────────────────────────────────────────────────────────────────
 // Public típusok
@@ -141,7 +162,9 @@ export class TenantAudioMixer extends EventEmitter {
   private pausedStack: PausedSource[] = [];
   private queue: MixerJob[] = [];
 
-  private silenceTimer: ReturnType<typeof setInterval> | null = null;
+  private silenceProc: ChildProcess | null = null;
+  private silencePaused: boolean = false;
+
   private gapTimer: ReturnType<typeof setTimeout> | null = null;
 
   private running = false;
@@ -169,10 +192,9 @@ export class TenantAudioMixer extends EventEmitter {
 
     this.openFifo();
 
-    this.silenceTimer = setInterval(
-      () => this.tickSilence(),
-      SILENCE_TICK_MS
-    );
+    // Háttér silence ffmpeg - real-time csendet pumpál a FIFO-ra mindaddig,
+    // amíg nincs aktív job (vagyis a Node middleware nem ír a fifoStream-re).
+    this.startSilenceProc();
 
     console.log(`[Mixer:${this.tenantId}] ▶ stream INDUL → ${this.fifoPath}`);
   }
@@ -182,10 +204,7 @@ export class TenantAudioMixer extends EventEmitter {
 
     this.running = false;
 
-    if (this.silenceTimer) {
-      clearInterval(this.silenceTimer);
-      this.silenceTimer = null;
-    }
+    this.stopSilenceProc();
 
     if (this.gapTimer) {
       clearTimeout(this.gapTimer);
@@ -295,10 +314,11 @@ export class TenantAudioMixer extends EventEmitter {
 
   // ── Pre-silence indítás ─────────────────────────────────────────────────
   //
-  // A pending fázis alatt nincs aktív forrás, így a tickSilence() automatikusan
-  // ír 0-kat a FIFO-ba. A source:start event ITT tüzel, hogy a snapcast.service.ts
-  // célzási retry-jei (0/500/1500 ms) mind a csend alatt fussanak le, mielőtt
-  // a tényleges PCM elkezdődik.
+  // A pending fázis alatt nincs aktív forrás, így a háttér silence ffmpeg
+  // subprocess automatikusan írja a csendet a FIFO-ra (real-time, a Node
+  // main loop-tól függetlenül). A source:start event ITT tüzel, hogy a
+  // snapcast.service.ts célzási retry-jei (0/500/1500 ms) mind a csend
+  // alatt fussanak le, mielőtt a tényleges PCM elkezdődik.
   private beginPendingStart(job: MixerJob): void {
     this.emit("source:start", {
       jobId: job.id,
@@ -407,22 +427,101 @@ export class TenantAudioMixer extends EventEmitter {
     };
   }
 
-  // ── Csend-timer: csak ha nincs aktív forrás ─────────────────────────────
+  // ── Silence subprocess életciklus ───────────────────────────────────────
 
-  private tickSilence(): void {
-    if (this.active) return;
-    if (!this.fifoStream) return;
+  private startSilenceProc(): void {
+    if (this.silenceProc) return;
+
+    const proc = spawn(FFMPEG_BIN, SILENCE_FFMPEG_ARGS(this.fifoPath), {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    proc.stderr?.on("data", (d: Buffer) => {
+      const txt = d.toString().trim();
+      if (txt && !/Stream mapping|Output|Press|frame=|time=|size=/.test(txt)) {
+        console.warn(`[Mixer:${this.tenantId}/silence] ${txt}`);
+      }
+    });
+
+    proc.on("exit", (code, signal) => {
+      const wasIntentional = !this.running || signal === "SIGTERM";
+      if (this.silenceProc === proc) {
+        this.silenceProc = null;
+        this.silencePaused = false;
+      }
+
+      if (wasIntentional) {
+        return;
+      }
+
+      // Váratlanul kilőtt - automatikus újraindítás 500 ms múlva,
+      // hogy ne pörögjön végtelen crash-loopban.
+      console.warn(
+        `[Mixer:${this.tenantId}] silence ffmpeg unexpectedly exited (code=${code} signal=${signal}), restart in 500ms`
+      );
+      setTimeout(() => {
+        if (this.running && !this.active) {
+          this.startSilenceProc();
+        }
+      }, 500);
+    });
+
+    this.silenceProc = proc;
+    this.silencePaused = false;
+    console.log(`[Mixer:${this.tenantId}] silence ffmpeg started (pid=${proc.pid})`);
+  }
+
+  private stopSilenceProc(): void {
+    if (!this.silenceProc) return;
 
     try {
-      this.fifoStream.write(SILENCE_TICK_BUF);
+      // Ha STOP állapotban van, először CONT, hogy a SIGTERM kézbesülhessen.
+      if (this.silencePaused) {
+        this.silenceProc.kill("SIGCONT");
+      }
+      this.silenceProc.kill("SIGTERM");
     } catch {
       // ignore
+    }
+
+    this.silenceProc = null;
+    this.silencePaused = false;
+  }
+
+  /** Job indulása előtt: silence ffmpeg megáll, hogy ne ütközzön a
+   *  Node-middleware írásával ugyanazon FIFO-ra. */
+  private pauseSilence(): void {
+    if (!this.silenceProc || this.silencePaused) return;
+
+    try {
+      this.silenceProc.kill("SIGSTOP");
+      this.silencePaused = true;
+    } catch (e: any) {
+      console.warn(`[Mixer:${this.tenantId}] silence pause hiba: ${e.message}`);
+    }
+  }
+
+  /** Job vége után: silence ffmpeg folytatja, hogy a snap szerver folyamatosan
+   *  kapjon adatot a FIFO-ról (ne legyen "No data since 120 ms" idle). */
+  private resumeSilence(): void {
+    if (!this.silenceProc || !this.silencePaused) return;
+
+    try {
+      this.silenceProc.kill("SIGCONT");
+      this.silencePaused = false;
+    } catch (e: any) {
+      console.warn(`[Mixer:${this.tenantId}] silence resume hiba: ${e.message}`);
     }
   }
 
   // ── Forrás indítás ───────────────────────────────────────────────────────
 
   private startSource(job: MixerJob): void {
+    // KRITIKUS: a háttér silence ffmpeg megáll mielőtt a Node-middleware
+    // a fifoStream-re kezdene írni. Két writer ugyanazon FIFO-n soha
+    // egyszerre nem ír - SIGSTOP atomic kernel-szintű.
+    this.pauseSilence();
+
     const args = this.buildFfmpegArgs(job);
 
     const proc = spawn(FFMPEG_BIN, args, {
@@ -522,6 +621,12 @@ export class TenantAudioMixer extends EventEmitter {
 
       this.active = null;
 
+      // Job véget ért - a háttér silence ffmpeg folytatja a FIFO-ra írást
+      // azonnal, hogy a snap szerver ne érzékelje "No data since 120 ms"-t.
+      // Ha a következő job rögtön jön (advance() pending), az újra
+      // pauseSilence-t hív - rövid resume/pause cikus elviselhető.
+      this.resumeSilence();
+
       this.emit("source:end", {
         jobId: src.job.id,
         jobType: src.job.jobType,
@@ -537,6 +642,7 @@ export class TenantAudioMixer extends EventEmitter {
 
       if (this.active === src) {
         this.active = null;
+        this.resumeSilence();
 
         this.emit("source:end", {
           jobId: src.job.id,
@@ -679,6 +785,9 @@ export class TenantAudioMixer extends EventEmitter {
     }
 
     this.active = null;
+
+    // Job végén/megszakításnál a háttér silence ffmpeg folytatja az írást.
+    this.resumeSilence();
 
     this.emit("source:end", {
       jobId: src.job.id,

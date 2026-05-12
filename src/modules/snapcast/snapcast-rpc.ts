@@ -66,11 +66,29 @@ export async function rpcPing(httpPort: number): Promise<boolean> {
   catch { return false; }
 }
 
-/** Összes kliens listája. */
+/** Aktívan csatlakozott kliensek listája.
+ *
+ * FONTOS: szándékosan kizárjuk a disconnected klienseket. A snapserver a
+ * server.json-ban hosszú távon tárolja minden korábbi klienst (akár hetekkel
+ * korábban csatlakozottakat is). Ha mindegyikre `Client.SetVolume`-ot küldünk,
+ * az `applyTargetingToClients` egy TTS-re 30-100+ HTTP RPC-t generálhat a
+ * helyi snapserver ControlServer-jére, ami:
+ *  - sok 'Failed to shudown socket: system:107' errort okoz,
+ *  - 600+ ms-ig terheli a snapserver eseménykezelőjét,
+ *  - eközben a PipeStream reader szál nem olvas a FIFO-ból elég gyorsan,
+ *  - a snapserver "No data since 120 ms, switching to idle" miatt idle-be megy,
+ *  - idle->playing átmenetnél 300-500 ms-os onResync ugrás van,
+ *  - amit a kliensek (ESP, Android, Linux) audible glitch-ként látnak a TTS elején.
+ *
+ * Csak a `connected: true` kliensekre szólunk - ezek azok, amelyek aktívan
+ * fogyasztják a streamet és tényleg mute/unmute célzást igényelnek.
+ */
 export async function rpcListClients(httpPort: number): Promise<RpcClient[]> {
   const result = await rpcCall(httpPort, "Server.GetStatus");
   const groups: RpcGroup[] = result?.server?.groups ?? [];
-  return groups.flatMap(g => g.clients ?? []);
+  return groups
+    .flatMap(g => g.clients ?? [])
+    .filter(c => c.connected === true);
 }
 
 /** Egy kliens hangerő/mute beállítása. */
@@ -128,6 +146,21 @@ export async function rpcSetUnmutedSet(
     }));
   } catch (e) { /* swallow */ }
   return { unmuted, muted };
+}
+
+/** Kliens végleges törlése a snapserver state-jéből.
+ *  Akkor használjuk, amikor a backend Device lifecycle 48 óra offline után
+ *  törli az eszközt - a snapserver server.json-jából is távolítsuk el,
+ *  hogy a rpcListClients ne adja vissza zombi sessionökként.
+ *  A snapserver "Server.DeleteClient" RPC-je némán is sikeres ha a kliens
+ *  már nem létezik. */
+export async function rpcDeleteClient(httpPort: number, clientId: string): Promise<boolean> {
+  try {
+    await rpcCall(httpPort, "Server.DeleteClient", { id: clientId });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Egy snapclient megfeleltetése egy device.id-nak: id, config.name, host.name
