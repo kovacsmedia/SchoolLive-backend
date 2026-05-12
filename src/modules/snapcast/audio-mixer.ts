@@ -40,9 +40,13 @@ const POST_FADE_GAP_MS = 200;
 // A source:start event a csend ELEJÉN tüzel, így a snapcast.service.ts
 // célzási retry mechanizmusa (0/500/1500 ms) mind a csend alatt fut le.
 //
+// 2000 ms: bőven lefedi a `applyTargetingToClients` retry-sorozatát
+// (0/500/1500 ms), a snap szerver ControlServer socket-cleanup-ját, és a
+// stabilizáláshoz használt sleep(500)-at.
+//
 // POST_SILENCE_MS: a job vége után ennyi csend, hogy a kliensek pufferei
 // kiürülhessenek mielőtt egy újabb forrás indulna ugyanitt.
-const PRE_SILENCE_MS = 1000;
+const PRE_SILENCE_MS = 2000;
 const POST_SILENCE_MS = 500;
 
 // ── Háttér silence ffmpeg subprocess ─────────────────────────────────────────
@@ -517,10 +521,14 @@ export class TenantAudioMixer extends EventEmitter {
   // ── Forrás indítás ───────────────────────────────────────────────────────
 
   private startSource(job: MixerJob): void {
-    // KRITIKUS: a háttér silence ffmpeg megáll mielőtt a Node-middleware
-    // a fifoStream-re kezdene írni. Két writer ugyanazon FIFO-n soha
-    // egyszerre nem ír - SIGSTOP atomic kernel-szintű.
-    this.pauseSilence();
+    // KRITIKUS: a háttér silence ffmpeg megállítását NEM itt rögtön,
+    // hanem a job-ffmpeg ELSŐ PCM chunk-jának érkezésekor csináljuk.
+    // Így a silence-ffmpeg a job-ffmpeg startup latency-je (spawn +
+    // ffmpeg init + first chunk = 50-200 ms) ALATT IS folyamatosan ír
+    // csendet a FIFO-ra. Soha nincs "no data" rés.
+    //
+    // A first chunk event utáni SIGSTOP atomic, és csak akkor fut, amikor
+    // a job-ffmpeg már garantáltan ír.
 
     const args = this.buildFfmpegArgs(job);
 
@@ -550,6 +558,17 @@ export class TenantAudioMixer extends EventEmitter {
 
       const chunk = Buffer.from(raw);
 
+      const isFirst = src.bytesWritten === 0;
+
+      // KRITIKUS overlap fix:
+      // A háttér silence-ffmpeg MOST áll meg, MIELŐTT az első job-PCM chunk
+      // a fifoStream-re kerül. Eddig a silence-ffmpeg ír real-time csendet
+      // a FIFO-ra (a job-ffmpeg spawn-startup latency-je alatt - 50-200 ms).
+      // Egy chunk-frame ATOMIC-an cserélünk forrást.
+      if (isFirst) {
+        this.pauseSilence();
+      }
+
       const gain = this.computeGain(src, chunk.length);
 
       if (gain < 1) {
@@ -558,8 +577,6 @@ export class TenantAudioMixer extends EventEmitter {
 
       const fifoExists = !!this.fifoStream;
       const ok = fifoExists ? this.fifoStream!.write(chunk) : false;
-
-      const isFirst = src.bytesWritten === 0;
 
       if (isFirst) {
         console.log(
