@@ -116,27 +116,32 @@ class TenantSnapEngine {
     // FIGYELEM: a PCM-only saját klienseink (Android, ESP32) ettől a
     // beállítástól nem fognak hangot lejátszani, amíg át nem állnak Opus-ra.
     //
-    // dryout_ms=5000:
-    // A pipe:// source non-blocking, és ha 120 ms-ig nem érkezik új adat,
-    // alapból idle állapotba megy. Amikor utána új adat (pl. TTS) érkezik,
-    // 500-700 ms-os hard resync csinál a klienseken (lásd: snapserver
-    // "PcmStream: State changed: idle => playing" + "onResync 604 ms"),
-    // ami a beszéd első ~1 másodpercét megakasztja.
+    // Buffer + dryout megfontolások:
     //
-    // A dryout_ms=5000 hatására a snapserver 5 másodpercig CSENDES PCM/Opus
-    // chunkokat továbbít a klienseknek, így nem megy idle-be, és nincs
-    // idle→playing átmenet. A klienseink folyamatos streamet kapnak, a
-    // szinkron nem szakad meg.
+    // 1) [server] buffer = 1500
+    //    A snapserver a client_settings üzenetben elküldi a klienseknek a
+    //    jitter buffer méretét (buf_ms). Az ESP klienseink alapja 1000 ms
+    //    volt, ami szoros idle→playing átmenetnél kevésnek bizonyult: a
+    //    snapserver 376 ms-os resync-jét nem tudta lenyelni glitch nélkül,
+    //    így ~500 ms-os megakadás keletkezett a TTS elején.
+    //    1500 ms-ra emelve a kliens 50%-kal több toleranciát kap, a kezdeti
+    //    átmenetek nem érik el a buffer alját.
     //
-    // 5 másodperc bőven elég a Node.js setInterval(20ms) tickek esetleges
-    // GC-szüneteire is.
+    // 2) dryout_ms (pipe:// source paraméter)
+    //    A snapcast pipe:// source 120 ms-ig vár adatra, utána idle-be megy.
+    //    A 120 ms threshold hardkódolt a snapserver-ben (nem dryout_ms-szel
+    //    szabályozható). A dryout_ms a "csendes átmeneti buffer" méretét
+    //    állítja a state-váltás után. Túl nagy érték (5000) NEM oldotta meg
+    //    az idle→playing resync-et, ezért visszatérünk a default 2000-re
+    //    (a paramétert explicit ki sem írjuk).
     const cfg = [
       `[server]`,
       `threads = -1`,
+      `buffer = 1500`,
       ``,
       `[stream]`,
       `port = ${this.snapPort}`,
-      `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=opus&bitrate=192&chunk_ms=20&dryout_ms=5000`,
+      `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=opus&bitrate=192&chunk_ms=20`,
       ``,
       `[http]`,
       `enabled = true`,
