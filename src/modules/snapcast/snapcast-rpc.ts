@@ -12,6 +12,34 @@
 
 import http from "http";
 
+/**
+ * Keep-alive HTTP agent a snap szerver JSON-RPC endpoint-ja felé.
+ *
+ * Probléma:
+ * Minden Server.GetStatus / Client.SetVolume RPC alapesetben új TCP
+ * connection-t nyit a snap szerver ControlServer-én (localhost:280X).
+ * Egy TTS körüli targeting cycle 8+ RPC-t generál, és a snap szerver
+ * minden TCP close-nál szövegszerűen "Failed to shudown socket: system:107
+ * (ENOTCONN)" hibát logol (a kliens már elment, mire a snap szerver
+ * shutdown()-ozni próbál). A log megtelt zajt ad, és bár nem szakít hangot,
+ * lassítja a snap szerver eseménykezelőjét.
+ *
+ * Megoldás:
+ * Egy keep-alive Agent perzisztens connection pool-t tart. Az első RPC után
+ * a TCP socket visszakerül a pool-ba, és a következő RPC ugyanazt használja
+ * újra (a snap szerver oldali shutdown soha nem fut). 5 másodperces idle
+ * timeout után a connection magától elhal.
+ *
+ * Eredmény:
+ * 30+ open/close esemény → 1-2 db connection lifecycle event egy TTS alatt.
+ */
+const rpcAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 5000,
+  maxSockets: 4,
+  maxFreeSockets: 2,
+});
+
 interface RpcVolume { muted: boolean; percent: number; }
 interface RpcClient {
   id:       string;
@@ -39,8 +67,13 @@ async function rpcCall(httpPort: number, method: string, params?: object): Promi
       port:     httpPort,
       path:     "/jsonrpc",
       method:   "POST",
-      headers:  { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
+      headers:  {
+        "Content-Type":   "application/json",
+        "Content-Length": Buffer.byteLength(body),
+        "Connection":     "keep-alive",
+      },
       timeout:  RPC_TIMEOUT_MS,
+      agent:    rpcAgent,
     }, (res) => {
       const chunks: Buffer[] = [];
       res.on("data", c => chunks.push(c));
