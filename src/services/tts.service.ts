@@ -102,7 +102,11 @@ export async function generateTTS(
 
   const hash       = crypto.randomBytes(8).toString("hex");
   const speechFile = path.join(AUDIO_DIR, `tts_speech_${hash}.wav`);
-  const finalFile  = path.join(AUDIO_DIR, `tts_${hash}.wav`);
+  // A klienseknek a snap streamen át megy a hang, és a snapserver Opus
+  // codec-kel sugároz – ezért a backend is Opus-ban tárolja a render output-ot.
+  // Helytakarékos (1/10–1/20 a WAV-hoz képest), és a snapserver natívan
+  // fogadja file-source-ként.
+  const finalFile  = path.join(AUDIO_DIR, `tts_${hash}.opus`);
 
   // 1. Szöveg → WAV (Piper)
   await runProcess(PIPER_BIN, [
@@ -116,8 +120,19 @@ export async function generateTTS(
     : (fs.existsSync(DINGDONG_WAV) ? DINGDONG_WAV : null);
 
   // 3. Render-pipeline:
-  //    a) ha van intro → concat (intro + speech) majd normalize+compress
-  //    b) ha nincs intro → csak normalize+compress a speech-en
+  //    a) ha van intro → concat (intro + speech) majd normalize+compress → opus
+  //    b) ha nincs intro → csak normalize+compress a speech-en → opus
+  //
+  // A végső kódolás: libopus, 48 kbps voip preset – elég kiváló érthető
+  // beszédhez, ugyanakkor kis fájlméret a snapserver fogadásához.
+  const OPUS_ARGS = [
+    "-c:a", "libopus",
+    "-b:a", "48k",
+    "-application", "voip",
+    "-ar", "48000",   // libopus 48k input ajánlott
+    "-ac", "1",
+  ];
+
   if (introPath) {
     const concatList = path.join(AUDIO_DIR, `concat_${hash}.txt`);
     const concatWav  = path.join(AUDIO_DIR, `concat_${hash}.wav`);
@@ -131,20 +146,20 @@ export async function generateTTS(
     ]);
     fs.unlinkSync(concatList);
     fs.unlinkSync(speechFile);
-    // 3.a/2: normalize + compressor a concat-ra
+    // 3.a/2: normalize + compressor + libopus encode a concat-ra
     await runProcess("ffmpeg", [
       "-y", "-i", concatWav,
       "-af", NORMALIZE_COMPRESS_FILTER,
-      "-ar", "22050", "-ac", "1",
+      ...OPUS_ARGS,
       finalFile,
     ]);
     fs.unlinkSync(concatWav);
   } else {
-    // 3.b: csak normalize+compress
+    // 3.b: csak normalize+compress + libopus encode
     await runProcess("ffmpeg", [
       "-y", "-i", speechFile,
       "-af", NORMALIZE_COMPRESS_FILTER,
-      "-ar", "22050", "-ac", "1",
+      ...OPUS_ARGS,
       finalFile,
     ]);
     fs.unlinkSync(speechFile);

@@ -542,10 +542,19 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
       }
       const concatFile = path.join(tmpDir, "concat.txt");
       fs.writeFileSync(concatFile, downloadedFiles.map(f => `file '${f}'`).join("\n"));
-      const hash = crypto.randomBytes(12).toString("hex"); const filename = `radio_custom_${hash}.mp3`; const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
-      await runCmd("ffmpeg", ["-y","-f","concat","-safe","0","-i",concatFile,"-codec:a","libmp3lame","-b:a","128k",outputPath]);
+      // Opus output – a snap stream natívan opus codec-kel megy a klienseknek,
+      // és a kis fájlméret is előnyös. 96 kbps "audio" alkalmazás (zenére jó).
+      const hash = crypto.randomBytes(12).toString("hex");
+      const filename = `radio_custom_${hash}.opus`;
+      const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
+      await runCmd("ffmpeg", [
+        "-y", "-f", "concat", "-safe", "0", "-i", concatFile,
+        "-c:a", "libopus", "-b:a", "96k", "-application", "audio",
+        "-ar", "48000",
+        outputPath,
+      ]);
       const sizeBytes = fs.statSync(outputPath).size; const durationSec = await getAudioDurationSec(outputPath); const fileUrl = `${baseUrl()}/uploads/radio/${filename}`;
-      const radioFile = await prisma.radioFile.create({ data: { tenantId, createdById, filename, originalName: fixEncoding(`${name.trim()}.mp3`), sizeBytes, durationSec, fileUrl } });
+      const radioFile = await prisma.radioFile.create({ data: { tenantId, createdById, filename, originalName: fixEncoding(`${name.trim()}.opus`), sizeBytes, durationSec, fileUrl } });
       buildStatusMap.set(buildId, { status: "DONE", fileUrl, name: radioFile.originalName });
       buildStatusMap.set(`${buildId}_fileId`, { status: "DONE", fileUrl, name: radioFile.id });
     } catch (err: any) { console.error("[CUSTOM-BUILD] Error:", err?.message); buildStatusMap.set(buildId, { status: "ERROR", errorMsg: err?.message }); }
@@ -561,4 +570,139 @@ router.get("/ytplaylists/build-status/:fileId", authJwt, requireTenant, async (r
   let fileId: string | undefined;
   if (status.status === "DONE") fileId = buildStatusMap.get(`${buildId}_fileId`)?.name;
   return res.json({ ok: true, status: status.status, fileUrl: status.fileUrl, name: status.name, fileId, errorMsg: status.errorMsg });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTERNET RÁDIÓ – stream URL forwarding a snap pipe-ba
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A user a frontend "📻 Internetrádió" tabján kiválaszt egy preset stream-et
+// (vagy beír egyet), és az itt indul el a tenant snap-server-én. A klienseknek
+// továbbra is a snap stream-en érkezik a hang – nincs kliens-oldali változás.
+
+router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const { url, title, targetType = "ALL", targetId } = req.body ?? {};
+    if (!url || typeof url !== "string" || !url.trim()) {
+      return res.status(400).json({ error: "url kötelező" });
+    }
+    if (!/^https?:\/\//i.test(url.trim())) {
+      return res.status(400).json({ error: "url-nek http(s) URL-nek kell lennie" });
+    }
+
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    const { SyncEngine }      = await import("../../sync/SyncEngine");
+
+    // Target eszközök meghatározása (a tenant minden online eszköze,
+    // vagy a megadott device / group).
+    let candidateIds: string[];
+    if (targetType === "DEVICE" && targetId) {
+      candidateIds = [String(targetId)];
+    } else if (targetType === "GROUP" && targetId) {
+      candidateIds = (await prisma.deviceGroupMember.findMany({
+        where:  { groupId: String(targetId) },
+        select: { deviceId: true },
+      })).map(m => m.deviceId);
+    } else {
+      candidateIds = (await prisma.device.findMany({
+        where:  { tenantId: tid(req), online: true },
+        select: { id: true },
+      })).map(d => d.id);
+    }
+
+    const snapOnline = await SnapcastService.isSnapserverOnline(tid(req));
+    if (snapOnline) {
+      await SnapcastService.play({
+        type:              "RADIO",
+        source:            { type: "stream", url: url.trim() },
+        tenantId:          tid(req),
+        title:             title?.trim() || "Internetrádió",
+        deviceIdsToUnmute: candidateIds,
+        persistent:        true,
+      });
+    }
+
+    // Online klienseknek SyncEngine broadcast (a kliens "PLAY_URL" action-t
+    // ACK-ol, és a hangot a snap streamen át kapja).
+    const onlineIds = candidateIds.filter(id => SyncEngine.isDeviceOnline(id));
+    if (onlineIds.length > 0) {
+      SyncEngine.dispatchSync({
+        tenantId:        tid(req),
+        commandId:       crypto.randomUUID(),
+        action:          "PLAY_URL",
+        url:             url.trim(),
+        title:           title?.trim() || "Internetrádió",
+        targetDeviceIds: candidateIds,
+        snapcastActive:  snapOnline,
+      }).catch(e => console.error("[RADIO/play-stream] SyncEngine hiba:", e));
+    }
+
+    return res.json({ ok: true, snapcastActive: snapOnline, targets: candidateIds.length });
+  } catch (err: any) {
+    console.error("[RADIO/play-stream] error:", err);
+    return res.status(500).json({ error: err?.message || "Failed to start stream" });
+  }
+});
+
+// POST /radio/files/:id/play-now – azonnali lejátszás egy meglévő RadioFile-ból
+// (a frontend "Azonnali lejátszás" gombja ezt hívja, scheduling helyett).
+router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const fileId = paramId(req);
+    const { targetType = "ALL", targetId } = req.body ?? {};
+
+    const file = await prisma.radioFile.findFirst({
+      where:  { id: fileId, tenantId: tid(req) },
+      select: { id: true, fileUrl: true, originalName: true, durationSec: true },
+    });
+    if (!file) return res.status(404).json({ error: "RadioFile nem található" });
+
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    const { SyncEngine }      = await import("../../sync/SyncEngine");
+
+    let candidateIds: string[];
+    if (targetType === "DEVICE" && targetId) {
+      candidateIds = [String(targetId)];
+    } else if (targetType === "GROUP" && targetId) {
+      candidateIds = (await prisma.deviceGroupMember.findMany({
+        where:  { groupId: String(targetId) },
+        select: { deviceId: true },
+      })).map(m => m.deviceId);
+    } else {
+      candidateIds = (await prisma.device.findMany({
+        where:  { tenantId: tid(req), online: true },
+        select: { id: true },
+      })).map(d => d.id);
+    }
+
+    const snapOnline = await SnapcastService.isSnapserverOnline(tid(req));
+    if (snapOnline) {
+      await SnapcastService.play({
+        type:              "RADIO",
+        source:            { type: "url", url: file.fileUrl },
+        tenantId:          tid(req),
+        title:             file.originalName,
+        deviceIdsToUnmute: candidateIds,
+      });
+    }
+    const onlineIds = candidateIds.filter(id => SyncEngine.isDeviceOnline(id));
+    if (onlineIds.length > 0) {
+      SyncEngine.dispatchSync({
+        tenantId:        tid(req),
+        commandId:       crypto.randomUUID(),
+        action:          "PLAY_URL",
+        url:             file.fileUrl,
+        title:           file.originalName,
+        durationMs:      file.durationSec ? file.durationSec * 1000 : undefined,
+        targetDeviceIds: candidateIds,
+        snapcastActive:  snapOnline,
+      }).catch(e => console.error("[RADIO/play-now] SyncEngine hiba:", e));
+    }
+    return res.json({ ok: true, snapcastActive: snapOnline, targets: candidateIds.length });
+  } catch (err: any) {
+    console.error("[RADIO/play-now] error:", err);
+    return res.status(500).json({ error: err?.message || "Failed to play file" });
+  }
 });

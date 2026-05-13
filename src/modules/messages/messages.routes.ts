@@ -33,7 +33,8 @@ async function processRecording(
 ): Promise<string> {
   const hash         = randomUUID().slice(0, 8);
   const concatWav    = path.join(AUDIO_DIR, `rec_concat_${hash}.wav`);
-  const finalWav     = path.join(AUDIO_DIR, `rec_${hash}.wav`);
+  // Opus kimenet – a snapserver natívan fogadja, kis fájlméret.
+  const finalOpus    = path.join(AUDIO_DIR, `rec_${hash}.opus`);
   const concatList   = path.join(AUDIO_DIR, `rec_concat_${hash}.txt`);
   const defaultDing  = path.join(AUDIO_DIR, "dingdong.wav");
 
@@ -67,18 +68,19 @@ async function processRecording(
       preFilterWav = rawWav;
     }
 
-    // 3. Normalize + compressor filter chain
+    // 3. Normalize + compressor filter chain → libopus encode (48 kbps voip)
     execFileSync("ffmpeg", [
       "-y", "-i", preFilterWav,
       "-af", NORMALIZE_COMPRESS_FILTER,
-      "-ar", "22050", "-ac", "1",
-      finalWav,
+      "-c:a", "libopus", "-b:a", "48k", "-application", "voip",
+      "-ar", "48000", "-ac", "1",
+      finalOpus,
     ]);
     try { fs.unlinkSync(preFilterWav); } catch {}
 
     // Eredeti webm törlése
     try { fs.unlinkSync(inputPath); } catch {}
-    return finalWav;
+    return finalOpus;
 
   } catch (err) {
     // Cleanup
