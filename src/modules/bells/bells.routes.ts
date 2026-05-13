@@ -37,7 +37,10 @@ function todayInBudapest(): Date {
 }
 
 const AUDIO_DIR = path.join(process.cwd(), "audio", "bells");
-const MAX_TOTAL_BYTES = 500 * 1024;
+// 4 MB tárhely – az ESP32-S3-N16R8 (16MB flash) particionálásában az
+// /audio LittleFS partíción kb. ennyi marad a firmware + littlefs +
+// updater partíciók mellett.
+const MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 const DEFAULT_SOUNDS = ["jelzocsengo.mp3", "kibecsengo.mp3"];
 
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
@@ -305,31 +308,33 @@ bellsRouter.get("/calendar", authJwt, canEdit, async (req: Request, res: Respons
 bellsRouter.post("/calendar/init", authJwt, canEdit, async (req: Request, res: Response) => {
   const year = parseInt(req.body.year) || new Date().getFullYear();
   try {
+    // CSAK a tényleges munkaszüneti napokat töltjük be (kb. 13 nap):
+    // - jan 1 (Újév), márc 15, nagypéntek, húsvét hétfő, máj 1, pünkösd hétfő,
+    //   aug 20, okt 23, nov 1, dec 25, 26, stb.
+    // A hétvégéket NEM tesszük a DB-be – a frontend a getDay()===0|6 alapján
+    // amúgy is pirosan jelöli őket, és nem érdemes ~100 fölösleges rekorddal
+    // szennyezni a BellCalendarDay táblát (a "104 szünnap" bug oka eddig az
+    // volt, hogy a weekendet is hozzáadtuk).
     const resp = await axios.get(`https://szunetnapok.hu/api/?year=${year}&country=hu`);
     const holidays: string[] = resp.data?.holidays || [];
 
-    const weekends: string[] = [];
-    const d = new Date(`${year}-01-01`);
-    while (d.getFullYear() === year) {
-      if (d.getDay() === 0 || d.getDay() === 6) {
-        weekends.push(d.toISOString().split("T")[0]);
-      }
-      d.setDate(d.getDate() + 1);
-    }
-
-    const allHolidays = [...new Set([...holidays, ...weekends])];
-    for (const dateStr of allHolidays) {
+    let imported = 0;
+    for (const dateStr of holidays) {
+      // A hétvégi munkaszüneti nap is hétvége – azt is mentjük (pl. ha aug 20
+      // szombatra esik, a naptárban legyen explicit "SZÜNNAP" jelölés is, ne
+      // csak "HÉTVÉGE").
       await prisma.bellCalendarDay.upsert({
-        where: { tenantId_date: { tenantId: tid(req), date: new Date(dateStr) } },
+        where:  { tenantId_date: { tenantId: tid(req), date: new Date(dateStr) } },
         update: { isHoliday: true },
         create: { tenantId: tid(req), date: new Date(dateStr), isHoliday: true },
       });
+      imported++;
     }
 
     // Naptár inicializálásakor is értesítjük a klienseket
     notifyAllClients(tid(req));
 
-    res.json({ ok: true, imported: allHolidays.length });
+    res.json({ ok: true, imported });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Failed to fetch holidays" });
@@ -337,14 +342,32 @@ bellsRouter.post("/calendar/init", authJwt, canEdit, async (req: Request, res: R
 });
 
 bellsRouter.put("/calendar/:date", authJwt, canEdit, async (req: Request, res: Response) => {
-  const { isHoliday, templateId } = req.body;
+  const { isHoliday, templateId, note } = req.body;
   const dateStr = req.params.date as string;
   const date    = new Date(dateStr);
 
+  // Note: 16 karakter max, ékezetek megengedettek (a naptár-megjegyzés
+  // megjelenítő stringnél nem szabunk fájlnév-szerű korlátot). Az üres
+  // / null érték eltávolítja a megjegyzést.
+  let cleanNote: string | null = null;
+  if (typeof note === "string") {
+    const t = note.trim();
+    if (t.length > 0) cleanNote = t.slice(0, 16);
+  }
+
   const day = await prisma.bellCalendarDay.upsert({
     where: { tenantId_date: { tenantId: tid(req), date } },
-    update: { isHoliday: isHoliday ?? false, templateId: templateId ?? null },
-    create: { tenantId: tid(req), date, isHoliday: isHoliday ?? false, templateId: templateId ?? null },
+    update: {
+      isHoliday:  isHoliday ?? false,
+      templateId: templateId ?? null,
+      note:       cleanNote,
+    },
+    create: {
+      tenantId: tid(req), date,
+      isHoliday:  isHoliday ?? false,
+      templateId: templateId ?? null,
+      note:       cleanNote,
+    },
     include: { template: true },
   });
 

@@ -380,6 +380,9 @@ model BellCalendarDay {
   date       DateTime @db.Date
   isHoliday  Boolean  @default(false)
   templateId String?
+  // 16 karakteres opcionális megjegyzés, ami a naptár-cellában is látszik
+  // (pl. "Tanévnyitó", "Felmérő", "Ülésrend"). Üres / null = nincs jegyzet.
+  note       String?  @db.VarChar(16)
 
   tenant   Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   template BellScheduleTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
