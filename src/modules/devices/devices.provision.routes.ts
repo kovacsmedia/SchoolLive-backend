@@ -94,7 +94,9 @@ router.get("/status/:pendingId", async (req, res) => {
         deviceName: device.name,
         wifiSsid: session.wifiSsid,
         wifiPassword: session.wifiPassword,
-        deviceKey: session.pendingDeviceKey ?? "",  // ← ÚJ
+        wifiSecurity: session.wifiSecurity,   // "WPA2_PERSONAL" | "WPA2_ENTERPRISE"
+        wifiUser: session.wifiUser,           // ESP enterprise módban használja
+        deviceKey: session.pendingDeviceKey ?? "",
       },
     };
 
@@ -142,7 +144,15 @@ router.get("/pending", authJwt, async (req, res) => {
 /**
  * POST /provision/activate
  * Admin aktiválja a kiválasztott eszközt.
- * Body: { pendingId, tenantId, name, deviceClass, wifiSsid, wifiPassword, orgUnitId? }
+ *
+ * Body:
+ *   pendingId, tenantId, name, deviceClass, wifiSsid, wifiPassword
+ *
+ * Opcionális:
+ *   orgUnitId           - eszközcsoport azonosító
+ *   wifiSecurity        - "WPA2_PERSONAL" (default) | "WPA2_ENTERPRISE"
+ *   wifiUser            - WPA2 Enterprise (eduroam) felhasználónév (email)
+ *                         CSAK akkor kell, ha wifiSecurity = "WPA2_ENTERPRISE"
  */
 router.post("/activate", authJwt, async (req, res) => {
   try {
@@ -152,11 +162,26 @@ router.post("/activate", authJwt, async (req, res) => {
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    const { pendingId, tenantId, name, deviceClass, wifiSsid, wifiPassword, orgUnitId } =
-      req.body ?? {};
+    const {
+      pendingId, tenantId, name, deviceClass,
+      wifiSsid, wifiPassword, orgUnitId,
+      wifiSecurity, wifiUser,
+    } = req.body ?? {};
 
     if (!pendingId || !tenantId || !name || !deviceClass || !wifiSsid || !wifiPassword) {
       return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    // Security normalize: alapérték WPA2_PERSONAL, csak WPA2_ENTERPRISE-t fogadunk eltérésre.
+    const normalizedSecurity =
+      wifiSecurity === "WPA2_ENTERPRISE" ? "WPA2_ENTERPRISE" : "WPA2_PERSONAL";
+
+    // WPA2 Enterprise esetén kötelező a wifiUser (email formátum), enélkül az
+    // eduroam-szerű hálózatokra a PEAP handshake nem tud lefutni.
+    if (normalizedSecurity === "WPA2_ENTERPRISE" && (!wifiUser || typeof wifiUser !== "string" || wifiUser.length === 0)) {
+      return res.status(400).json({
+        error: "wifiUser kötelező WPA2_ENTERPRISE security esetén (email formátumú felhasználónév)",
+      });
     }
 
     const pending = await prisma.pendingDevice.findUnique({
@@ -205,10 +230,12 @@ router.post("/activate", authJwt, async (req, res) => {
         name,
         wifiSsid,
         wifiPassword,
-        pendingDeviceKey: deviceKey,  // ← ÚJ
+        wifiSecurity: normalizedSecurity,
+        wifiUser: normalizedSecurity === "WPA2_ENTERPRISE" ? wifiUser : "",
+        pendingDeviceKey: deviceKey,
         expiresAt: new Date(Date.now() + 10 * 60 * 1000),
-  },
-});
+      },
+    });
 
     // PendingDevice törlése – az ESP32 status poll-nál látja hogy aktivált
     await prisma.pendingDevice.delete({ where: { id: pendingId } });
