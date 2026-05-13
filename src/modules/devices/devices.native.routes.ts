@@ -172,17 +172,34 @@ router.post("/beacon", async (req: Request, res: Response) => {
     const ipAddress = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
       ?? req.socket.remoteAddress ?? null;
 
+    // ESP-uniform telemetria mezők: volume (0-10), muted (bool), statusPayload (JSON).
+    // A Python kliens 0-10 skálán küldi a volume-ot (ESP konvencióval egyezik).
+    const rawVolume        = req.body?.volume;
+    const rawMuted         = req.body?.muted;
+    const rawStatusPayload = req.body?.statusPayload;
+
+    const safeVolume: number | undefined =
+      typeof rawVolume === "number" && rawVolume >= 0 && rawVolume <= 10
+        ? Math.round(rawVolume)
+        : undefined;
+
+    const safeMuted: boolean | undefined =
+      typeof rawMuted === "boolean" ? rawMuted : undefined;
+
     await prisma.device.update({
       where: { id: deviceId },
       data: {
-       online:          true,
-       lastSeenAt:      new Date(),
-       ipAddress:       ipAddress ?? undefined,
-       firmwareVersion: req.body?.platform
-        ? `${req.body.platform}/${req.body.appVersion ?? '?'}`
-        : undefined,
-   },
-});
+        online:          true,
+        lastSeenAt:      new Date(),
+        ipAddress:       ipAddress ?? undefined,
+        firmwareVersion: req.body?.platform
+          ? `${req.body.platform}/${req.body.appVersion ?? '?'}`
+          : undefined,
+        volume:          safeVolume,
+        muted:           safeMuted,
+        statusPayload:   rawStatusPayload ?? undefined,
+      },
+    });
 
     // deviceId visszaadva – kliens cachelti ha még nincs meg
     return res.json({ ok: true, deviceId });
