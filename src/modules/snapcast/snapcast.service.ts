@@ -409,9 +409,9 @@ class TenantSnapEngine {
 }
 
 function sourceToMixer(s: SnapAudioSource): MixerSource {
-  if (s.type === "file") return { type: "file", path: s.path };
-  if (s.type === "url") return { type: "url", url: s.url };
-  if (s.type === "stream") return { type: "stream", url: s.url };
+  if (s.type === "file")   return { type: "file",   path: s.path, volume: s.volume };
+  if (s.type === "url")    return { type: "url",    url:  s.url,  volume: s.volume };
+  if (s.type === "stream") return { type: "stream", url:  s.url,  volume: s.volume };
 
   throw new Error(`Ismeretlen SnapAudioSource: ${JSON.stringify(s)}`);
 }

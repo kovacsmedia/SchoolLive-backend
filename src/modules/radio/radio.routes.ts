@@ -583,13 +583,19 @@ router.get("/ytplaylists/build-status/:fileId", authJwt, requireTenant, async (r
 router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
-    const { url, title, targetType = "ALL", targetId } = req.body ?? {};
+    const { url, title, targetType = "ALL", targetId, streamVolume } = req.body ?? {};
     if (!url || typeof url !== "string" || !url.trim()) {
       return res.status(400).json({ error: "url kötelező" });
     }
     if (!/^https?:\/\//i.test(url.trim())) {
       return res.status(400).json({ error: "url-nek http(s) URL-nek kell lennie" });
     }
+
+    // streamVolume: 0..10 frontendről → 0..1 lineáris az ffmpeg-nek.
+    // Ha hiányzik vagy érvénytelen → undefined (no pre-gain → eredeti hangerő).
+    const sv = (typeof streamVolume === "number" && streamVolume >= 0 && streamVolume <= 10)
+      ? streamVolume / 10
+      : undefined;
 
     const { SnapcastService } = await import("../snapcast/snapcast.service");
     const { SyncEngine }      = await import("../../sync/SyncEngine");
@@ -615,7 +621,7 @@ router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Re
     if (snapOnline) {
       await SnapcastService.play({
         type:              "RADIO",
-        source:            { type: "stream", url: url.trim() },
+        source:            { type: "stream", url: url.trim(), volume: sv },
         tenantId:          tid(req),
         title:             title?.trim() || "Internetrádió",
         deviceIdsToUnmute: candidateIds,
@@ -651,7 +657,11 @@ router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, 
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
     const fileId = paramId(req);
-    const { targetType = "ALL", targetId } = req.body ?? {};
+    const { targetType = "ALL", targetId, streamVolume } = req.body ?? {};
+    // streamVolume: 0..10 → 0..1 (lásd /play-stream kommentet).
+    const sv = (typeof streamVolume === "number" && streamVolume >= 0 && streamVolume <= 10)
+      ? streamVolume / 10
+      : undefined;
 
     const file = await prisma.radioFile.findFirst({
       where:  { id: fileId, tenantId: tid(req) },
@@ -681,7 +691,7 @@ router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, 
     if (snapOnline) {
       await SnapcastService.play({
         type:              "RADIO",
-        source:            { type: "url", url: file.fileUrl },
+        source:            { type: "url", url: file.fileUrl, volume: sv },
         tenantId:          tid(req),
         title:             file.originalName,
         deviceIdsToUnmute: candidateIds,

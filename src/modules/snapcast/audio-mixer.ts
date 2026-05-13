@@ -87,6 +87,10 @@ export interface MixerSource {
   type: "file" | "url" | "stream";
   path?: string;
   url?: string;
+  // Pre-gain érték 0..1 (lineáris). A `buildFfmpegArgs` egy `volume=X`
+  // filter-szegmenst illeszt be a chain elejére, így csak ezt a forrást
+  // érinti. Csengetésre/üzenetekre nincs hatás (külön job-ok, külön gain).
+  volume?: number;
 }
 
 export interface MixerJob {
@@ -795,8 +799,12 @@ export class TenantAudioMixer extends EventEmitter {
 
     src.killed = true;
 
+    // User-initiated stop esetén SIGKILL – azonnali, az ffmpeg nem tudja
+    // a buffer-ét még pár száz ms-ig kiírni. Fade-out scenariókban a
+    // `onFadeOutComplete` SIGTERM-mel megy ettől függetlenül.
+    const signal: NodeJS.Signals = reason === "stopped" ? "SIGKILL" : "SIGTERM";
     try {
-      src.proc.kill("SIGTERM");
+      src.proc.kill(signal);
     } catch {
       // ignore
     }
@@ -905,9 +913,18 @@ export class TenantAudioMixer extends EventEmitter {
       "acompressor=threshold=-18dB:ratio=4:attack=20:release=250," +
       "alimiter=level_in=1:level_out=1:limit=0.95";
 
-    const audioFilter = process.env.BACKEND_ENABLE_NORMALIZE === "1"
-      ? ["-af", AUDIO_NORMALIZE_FILTER]
-      : [];
+    // Forrás-szintű pre-gain (csak ha explicit meg van adva). A `volume=`
+    // filter értéke 0..1 lineáris, és a snapserver felé NEM küldi tovább,
+    // csak a saját ffmpeg stream-jét gyengíti/erősíti. Default érték: 1
+    // (= nincs change). Ha 0, néma stream (de a job lefut).
+    const v = typeof src.volume === "number" ? Math.max(0, Math.min(1, src.volume)) : null;
+    const preGain = v !== null && v !== 1 ? `volume=${v.toFixed(2)}` : null;
+
+    const chain: string[] = [];
+    if (preGain) chain.push(preGain);
+    if (process.env.BACKEND_ENABLE_NORMALIZE === "1") chain.push(AUDIO_NORMALIZE_FILTER);
+
+    const audioFilter = chain.length > 0 ? ["-af", chain.join(",")] : [];
 
     const out = [
       ...audioFilter,

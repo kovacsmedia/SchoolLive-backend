@@ -1,9 +1,11 @@
 // src/modules/snapcast/snapcast.types.ts
 
+// Pre-gain érték 0..1 lineáris – csak az adott forrást érinti
+// (csengetésre/üzenetekre nincs hatás, mert külön job-ok).
 export type SnapAudioSource =
-  | { type: "file";   path: string;  }   // Bell: lokális fájl
-  | { type: "url";    url:  string;  }   // TTS: generált MP3 URL
-  | { type: "stream"; url:  string;  };  // Rádió: élő stream URL
+  | { type: "file";   path: string; volume?: number; }   // Bell: lokális fájl
+  | { type: "url";    url:  string; volume?: number; }   // TTS / play-now URL
+  | { type: "stream"; url:  string; volume?: number; };  // Rádió: élő stream URL
 
 export type SnapJobType = "BELL" | "TTS" | "RADIO";
 
