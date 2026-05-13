@@ -71,13 +71,17 @@ model Tenant {
   domain    String?  @unique
   isActive  Boolean  @default(true)
   createdAt DateTime @default(now())
-  snapPort  Int?     @unique 
+  snapPort  Int?     @unique
 
   address        String?
   directorName   String?
   directorPhone  String?
   directorEmail  String?
   eduId          String?
+  // Tenant-szintű internetrádió preset lista (admin által beállított
+  // "alapértelmezett"). Új felhasználó / új böngésző ezt látja először,
+  // ha még nincs local-only szerkesztett listája.
+  netRadioPresetsJson Json?
   messageTemplates MessageTemplate[]
   bellTemplates    BellScheduleTemplate[]
   bellCalendar     BellCalendarDay[]

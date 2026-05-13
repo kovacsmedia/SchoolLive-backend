@@ -282,4 +282,72 @@ router.delete("/:id", authJwt, async (req, res) => {
   }
 });
 
+// ─── Tenant-szintű internetrádió preset lista ────────────────────────────────
+// Az admin a SchoolRadio oldalon elmenti a current netrádió listát default-nak,
+// és új felhasználók (új böngészők) automatikusan ezt töltik be először.
+// A user-szerkesztések továbbra is böngésző-lokálisan (localStorage), és csak
+// ha még nincs lokális adat, esik vissza a tenant default-ra.
+
+// GET /tenants/me/netradio-presets – az aktív tenant default listája
+router.get("/me/netradio-presets", authJwt, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!user?.tenantId) return res.status(400).json({ error: "No active tenant" });
+    const t = await prisma.tenant.findUnique({
+      where:  { id: user.tenantId },
+      select: { netRadioPresetsJson: true },
+    });
+    if (!t) return res.status(404).json({ error: "Tenant not found" });
+    return res.json({ ok: true, presets: t.netRadioPresetsJson ?? null });
+  } catch (err) {
+    console.error("[GET /tenants/me/netradio-presets]", err);
+    return res.status(500).json({ error: "Failed to fetch presets" });
+  }
+});
+
+// PUT /tenants/me/netradio-presets – TENANT_ADMIN/SUPER_ADMIN beállítja a default listát
+router.put("/me/netradio-presets", authJwt, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!user?.tenantId) return res.status(400).json({ error: "No active tenant" });
+    if (user.role !== "TENANT_ADMIN" && user.role !== "SUPER_ADMIN") {
+      return res.status(403).json({ error: "Forbidden: TENANT_ADMIN or SUPER_ADMIN only" });
+    }
+    const { presets } = req.body ?? {};
+    if (!Array.isArray(presets)) {
+      return res.status(400).json({ error: "presets must be an array" });
+    }
+    // Light validation: minden elemnek string id+name + non-empty streams kell.
+    const sanitized = presets
+      .filter((r: any) =>
+        r && typeof r.id === "string" && typeof r.name === "string"
+        && Array.isArray(r.streams) && r.streams.length > 0)
+      .map((r: any) => ({
+        id:      String(r.id),
+        name:    String(r.name),
+        genre:   String(r.genre ?? ""),
+        streams: r.streams
+          .filter((s: any) => s && typeof s.label === "string")
+          .map((s: any) => ({
+            label: String(s.label),
+            url:   String(s.url ?? ""),
+          })),
+      }))
+      .filter((r: any) => r.streams.length > 0);
+
+    if (sanitized.length === 0) {
+      return res.status(400).json({ error: "Empty/invalid presets array" });
+    }
+
+    await prisma.tenant.update({
+      where: { id: user.tenantId },
+      data:  { netRadioPresetsJson: sanitized },
+    });
+    return res.json({ ok: true, count: sanitized.length });
+  } catch (err) {
+    console.error("[PUT /tenants/me/netradio-presets]", err);
+    return res.status(500).json({ error: "Failed to save presets" });
+  }
+});
+
 export default router;
