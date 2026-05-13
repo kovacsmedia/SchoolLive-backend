@@ -4,7 +4,8 @@ import { Router, Request, Response } from "express";
 import { prisma }          from "../../prisma/client";
 import { authJwt }         from "../../middleware/authJwt";
 import { requireTenant }   from "../../middleware/tenant";
-import { generateTTS }     from "../../services/tts.service";
+import { generateTTS, NORMALIZE_COMPRESS_FILTER } from "../../services/tts.service";
+import { resolveIntroSoundPath } from "../bells/bells.routes";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
 import { randomUUID }      from "crypto";
@@ -18,45 +19,70 @@ const router = Router();
 const AUDIO_DIR = path.join(process.cwd(), "audio");
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 
-// Hangfelvétel feldolgozása: csend levágás + hangnormalizálás + dingdong elejére
-async function processRecording(inputPath: string): Promise<string> {
+// Hangfelvétel feldolgozása:
+//   1. Intro hang (default dingdong vagy a user által választott MESSAGE_INTRO)
+//      elejére fűzése.
+//   2. Acompressor + loudnorm filter chain: a halkabb beszéd kiemelve, a
+//      kicsapódó csúcsok lefogva, végül EBU R128 normalize.
+//
+// Az `introSoundPath` opcionális – ha null, a default `audio/dingdong.wav`-ot
+// használjuk, vagy ha az sincs, csak normalizálunk intro nélkül.
+async function processRecording(
+  inputPath: string,
+  introSoundPath?: string | null,
+): Promise<string> {
   const hash         = randomUUID().slice(0, 8);
-  const tmpWav       = path.join(AUDIO_DIR, `rec_tmp_${hash}.wav`);
+  const concatWav    = path.join(AUDIO_DIR, `rec_concat_${hash}.wav`);
   const finalWav     = path.join(AUDIO_DIR, `rec_${hash}.wav`);
-  const concatList   = path.join(AUDIO_DIR, `concat_${hash}.txt`);
-  const dingdongWav  = path.join(AUDIO_DIR, "dingdong.wav");
+  const concatList   = path.join(AUDIO_DIR, `rec_concat_${hash}.txt`);
+  const defaultDing  = path.join(AUDIO_DIR, "dingdong.wav");
+
+  const introPath = introSoundPath && fs.existsSync(introSoundPath)
+    ? introSoundPath
+    : (fs.existsSync(defaultDing) ? defaultDing : null);
 
   try {
-    // 1. Hangnormalizálás
+    // 1. Eredeti webm-et először 22050 mono WAV-ra konvertáljuk (concat-hoz)
+    const rawWav = path.join(AUDIO_DIR, `rec_raw_${hash}.wav`);
     execFileSync("ffmpeg", [
       "-y", "-i", inputPath,
-      "-af", "loudnorm",
       "-ar", "22050", "-ac", "1",
-      tmpWav,
+      rawWav,
     ]);
 
-    // 2. Dingdong elejére fűzése (ha létezik)
-    if (fs.existsSync(dingdongWav)) {
-      fs.writeFileSync(concatList, `file '${dingdongWav}'\nfile '${tmpWav}'\n`);
+    // 2. Ha van intro → concat (intro + recording), különben csak a raw
+    let preFilterWav: string;
+    if (introPath) {
+      fs.writeFileSync(concatList, `file '${introPath}'\nfile '${rawWav}'\n`);
       execFileSync("ffmpeg", [
         "-y", "-f", "concat", "-safe", "0",
         "-i", concatList,
         "-ar", "22050", "-ac", "1",
-        finalWav,
+        concatWav,
       ]);
       fs.unlinkSync(concatList);
-      fs.unlinkSync(tmpWav);
+      fs.unlinkSync(rawWav);
+      preFilterWav = concatWav;
     } else {
-      fs.renameSync(tmpWav, finalWav);
+      preFilterWav = rawWav;
     }
 
+    // 3. Normalize + compressor filter chain
+    execFileSync("ffmpeg", [
+      "-y", "-i", preFilterWav,
+      "-af", NORMALIZE_COMPRESS_FILTER,
+      "-ar", "22050", "-ac", "1",
+      finalWav,
+    ]);
+    try { fs.unlinkSync(preFilterWav); } catch {}
+
     // Eredeti webm törlése
-    fs.unlinkSync(inputPath);
+    try { fs.unlinkSync(inputPath); } catch {}
     return finalWav;
 
   } catch (err) {
     // Cleanup
-    for (const f of [tmpWav, concatList]) { try { fs.unlinkSync(f); } catch {} }
+    for (const f of [concatWav, concatList]) { try { fs.unlinkSync(f); } catch {} }
     throw err;
   }
 }
@@ -178,12 +204,18 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
   try {
     const tid = tenantId(req);
     const uid = userId(req);
-    const { text, voice = "anna", targetType, targetId, scheduledAt } = req.body;
+    const { text, voice = "anna", targetType, targetId, scheduledAt, preBellSoundId } = req.body;
 
     if (!text?.trim())  return res.status(400).json({ error: "Text is required" });
     if (!targetType)    return res.status(400).json({ error: "targetType is required" });
 
-    const { filename, durationMs } = await generateTTS(text.trim(), voice);
+    // Opcionális üzenet-előtti intro hang (BellSoundFile, kind=MESSAGE_INTRO).
+    // Ha nincs/érvénytelen → null, a TTS service a default dingdong-ra esik vissza.
+    const introPath = (typeof preBellSoundId === "string" && preBellSoundId.trim())
+      ? await resolveIntroSoundPath(tid, preBellSoundId.trim())
+      : null;
+
+    const { filename, durationMs } = await generateTTS(text.trim(), voice, introPath);
     const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${filename}`;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
     const isImmediate   = !scheduledTime || scheduledTime <= new Date();
@@ -255,12 +287,17 @@ router.post("/audio", authJwt, requireTenant, audioUpload.single("audio"), async
 
     if (!req.file) return res.status(400).json({ error: "Hangfájl megadása kötelező." });
 
-    const { targetType = "ALL", targetId, scheduledAt } = req.body ?? {};
+    const { targetType = "ALL", targetId, scheduledAt, preBellSoundId } = req.body ?? {};
 
-    // Feldolgozás: csend levágás + normalizálás + dingdong
+    // Opcionális intro hang (lásd /messages POST hasonló logikát).
+    const introPath = (typeof preBellSoundId === "string" && preBellSoundId.trim())
+      ? await resolveIntroSoundPath(tid, preBellSoundId.trim())
+      : null;
+
+    // Feldolgozás: intro prepend + normalize + compressor
     let processedFilename = req.file.filename;
     try {
-      const processedPath = await processRecording(req.file.path);
+      const processedPath = await processRecording(req.file.path, introPath);
       processedFilename = path.basename(processedPath);
       console.log(`[MESSAGES] Hangfelvétel feldolgozva: ${processedFilename}`);
     } catch (procErr) {
@@ -370,6 +407,100 @@ router.post("/stop", authJwt, requireTenant, async (req: Request, res: Response)
     SyncEngine.broadcastImmediate(tid, { action: "STOP_PLAYBACK", commandId: randomUUID() });
     return res.json({ ok: true });
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to stop playback" }); }
+});
+
+// POST /messages/:id/replay
+// Egy korábbi üzenet újra-bemondatása. A tárolt fileUrl-t újra elindítjuk
+// az aktuális (vagy megadott) cél eszközökre. FONTOS: NEM hozunk létre új
+// renderet, NEM prepend-eljük a bell hangot újra – a fájl már tartalmazza.
+// Az eredeti Message rekord `playedAt` mezőjét frissítjük az új lejátszás
+// időbélyegével (audit szempontjából a "legutóbbi lejátszás" látszik).
+router.post("/:id/replay", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const tid = tenantId(req);
+    const id  = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+    const original = await prisma.message.findFirst({
+      where:  { id, tenantId: tid },
+      select: { id: true, title: true, text: true, fileUrl: true, targetType: true, targetId: true },
+    });
+    if (!original) return res.status(404).json({ error: "Message not found" });
+    if (!original.fileUrl) {
+      return res.status(400).json({ error: "Az üzenetnek nincs eltárolt fájlja (replay nem lehetséges)" });
+    }
+
+    // A body-ból kérhető új cél/időpont, különben az eredeti üzenetéé.
+    const targetType: string =
+      (req.body?.targetType as string) || original.targetType || "ALL";
+    const targetId: string | undefined =
+      typeof req.body?.targetId === "string" ? req.body.targetId : (original.targetId ?? undefined);
+    const scheduledTime: Date | null =
+      req.body?.scheduledAt ? new Date(req.body.scheduledAt) : null;
+    const isImmediate = !scheduledTime || scheduledTime <= new Date();
+
+    const targetIds    = await resolveDeviceIds(tid, targetType, targetId);
+    if (targetIds !== null && targetIds.length === 0) {
+      return res.status(200).json({ ok: true, replayed: false, reason: "No target devices" });
+    }
+    const candidateIds = await getCandidateIds(tid, targetIds);
+
+    if (isImmediate) {
+      const snapOnline = await SnapcastService.isSnapserverOnline(tid);
+      if (snapOnline) {
+        await SnapcastService.play({
+          type:              "TTS",
+          source:            { type: "url", url: original.fileUrl },
+          tenantId:          tid,
+          title:             original.title ?? "Üzenet",
+          text:              original.text  ?? undefined,
+          deviceIdsToUnmute: candidateIds,
+        });
+      }
+      const onlineIds  = candidateIds.filter(d => SyncEngine.isDeviceOnline(d));
+      const offlineIds = candidateIds.filter(d => !SyncEngine.isDeviceOnline(d));
+
+      if (onlineIds.length > 0) {
+        SyncEngine.dispatchSync({
+          tenantId:        tid,
+          commandId:       `replay-${original.id}-${Date.now()}`,
+          action:          "TTS",
+          url:             original.fileUrl,
+          text:            original.text ?? undefined,
+          title:           original.title ?? "Üzenet",
+          targetDeviceIds: candidateIds,
+          snapcastActive:  snapOnline,
+        }).catch(e => console.error("[MESSAGES/replay] SyncEngine hiba:", e));
+      }
+      if (offlineIds.length > 0) {
+        await prisma.deviceCommand.createMany({
+          data: offlineIds.map(deviceId => ({
+            tenantId: tid, deviceId, messageId: original.id, status: "QUEUED" as const,
+            payload: { action: "TTS", url: original.fileUrl, text: original.text ?? undefined,
+                       title: original.title ?? "Üzenet", scheduledAt: null },
+          })),
+        });
+      }
+      // Eredeti üzenet `playedAt` frissítése
+      await prisma.message.update({ where: { id: original.id }, data: { playedAt: new Date() } });
+    } else {
+      const scheduledCandidates = targetIds === null
+        ? (await prisma.device.findMany({ where: { tenantId: tid }, select: { id: true } })).map(d => d.id)
+        : targetIds;
+      await prisma.deviceCommand.createMany({
+        data: scheduledCandidates.map(deviceId => ({
+          tenantId: tid, deviceId, messageId: original.id, status: "QUEUED" as const,
+          payload: { action: "TTS", url: original.fileUrl, text: original.text ?? undefined,
+                     title: original.title ?? "Üzenet",
+                     scheduledAt: scheduledTime?.toISOString() ?? null },
+        })),
+      });
+    }
+
+    return res.json({ ok: true, replayed: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to replay message" });
+  }
 });
 
 // GET /messages/:id

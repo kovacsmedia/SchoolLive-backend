@@ -4,9 +4,23 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import axios from "axios";
+import { execSync } from "child_process";
 import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
 import { broadcastSyncBells } from "./bell.scheduler";
+
+/** ffprobe alapú hossz-mérés ms-ben. Hiba/elérhetetlenség esetén null. */
+function probeDurationMs(filePath: string): number | null {
+  try {
+    const out = execSync(
+      `ffprobe -v quiet -show_entries format=duration -of csv=p=0 "${filePath}"`,
+      { timeout: 3000 }
+    ).toString().trim();
+    const sec = parseFloat(out);
+    if (isFinite(sec) && sec > 0) return Math.round(sec * 1000);
+  } catch {}
+  return null;
+}
 
 export const bellsRouter = Router();
 
@@ -395,6 +409,101 @@ bellsRouter.delete("/sounds/:id", authJwt, canEdit, async (req: Request, res: Re
 
   res.json({ ok: true });
 });
+
+// ── Üzenet-intro hangok (max 7s, dingdong helyettesítő) ────────────────────
+// Külön audio-dir hogy a csengetési rend (SCHEDULE) hangok ne keveredjenek.
+
+const INTRO_AUDIO_DIR    = path.join(process.cwd(), "audio", "intros");
+const INTRO_MAX_DURATION_MS = 7_000;   // 7 mp – user kérés szerint
+const INTRO_MAX_BYTES       = 200 * 1024; // 200KB – elég 7s mp3-hoz
+if (!fs.existsSync(INTRO_AUDIO_DIR)) fs.mkdirSync(INTRO_AUDIO_DIR, { recursive: true });
+
+const introStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, INTRO_AUDIO_DIR),
+  filename:    (_req, file, cb) => {
+    // Egyedi prefix-szel, hogy a több tenant ne ütközzön azonos eredeti névnél
+    const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    cb(null, `${Date.now()}_${safe}`);
+  },
+});
+const introUpload = multer({
+  storage: introStorage,
+  limits:  { fileSize: INTRO_MAX_BYTES },
+  fileFilter: (_req, file, cb) => {
+    // MP3, WAV, OGG audio elfogadva
+    if (file.mimetype.startsWith("audio/")) cb(null, true);
+    else cb(new Error("Only audio files allowed"));
+  },
+});
+
+bellsRouter.get("/intro-sounds", authJwt, canEdit, async (req: Request, res: Response) => {
+  const sounds = await prisma.bellSoundFile.findMany({
+    where:   { tenantId: tid(req), kind: "MESSAGE_INTRO" },
+    orderBy: [{ createdAt: "asc" }],
+  });
+  res.json({ ok: true, sounds });
+});
+
+bellsRouter.post("/intro-sounds", authJwt, canEdit, introUpload.single("file"), async (req: Request, res: Response) => {
+  const file = (req as any).file as Express.Multer.File | undefined;
+  if (!file) return res.status(400).json({ error: "No file uploaded" });
+
+  // ffprobe duration check – max 7s
+  const durationMs = probeDurationMs(file.path);
+  if (durationMs === null) {
+    try { fs.unlinkSync(file.path); } catch {}
+    return res.status(400).json({ error: "Cannot read audio duration" });
+  }
+  if (durationMs > INTRO_MAX_DURATION_MS) {
+    try { fs.unlinkSync(file.path); } catch {}
+    return res.status(400).json({
+      error: `Túl hosszú: ${(durationMs/1000).toFixed(1)}s, max ${INTRO_MAX_DURATION_MS/1000}s engedélyezett.`,
+    });
+  }
+
+  const sound = await prisma.bellSoundFile.create({
+    data: {
+      tenantId:   tid(req),
+      filename:   file.filename,
+      sizeBytes:  file.size,
+      isDefault:  false,
+      kind:       "MESSAGE_INTRO",
+      durationMs,
+    },
+  });
+
+  res.status(201).json({ ok: true, sound });
+});
+
+bellsRouter.delete("/intro-sounds/:id", authJwt, canEdit, async (req: Request, res: Response) => {
+  const soundId = req.params.id as string;
+  const sound   = await prisma.bellSoundFile.findFirst({
+    where: { id: soundId, tenantId: tid(req), kind: "MESSAGE_INTRO" },
+  });
+  if (!sound) return res.status(404).json({ error: "Not found" });
+
+  const filePath = path.join(INTRO_AUDIO_DIR, sound.filename);
+  if (fs.existsSync(filePath)) { try { fs.unlinkSync(filePath); } catch {} }
+
+  await prisma.bellSoundFile.delete({ where: { id: sound.id } });
+  res.json({ ok: true });
+});
+
+/**
+ * Belső helper a `messages.routes.ts` számára: visszaadja az intro hang
+ * abszolút path-ját egy MESSAGE_INTRO kind-ú BellSoundFile id alapján,
+ * tenant-szigorúan. Ha nincs találat, null-t ad → a hívó fallback-elhet
+ * a default `dingdong.wav`-ra.
+ */
+export async function resolveIntroSoundPath(tenantId: string, soundId: string): Promise<string | null> {
+  const sound = await prisma.bellSoundFile.findFirst({
+    where: { id: soundId, tenantId, kind: "MESSAGE_INTRO" },
+  });
+  if (!sound) return null;
+  const fp = path.join(INTRO_AUDIO_DIR, sound.filename);
+  if (!fs.existsSync(fp)) return null;
+  return fp;
+}
 
 // ── Szerkesztési zár ───────────────────────────────────────────────────────
 

@@ -60,12 +60,36 @@ async function ensureDingdongWav(): Promise<void> {
   console.log("[TTS] dingdong.wav elkészítve");
 }
 
+// ── Audio "polírozó" filter chain ─────────────────────────────────────────────
+// 1) acompressor: dinamika-kompresszor, a halkabb részeket felemeli, a
+//    csúcsokat lefogja → érthetőbb beszéd hangszórón.
+// 2) loudnorm: EBU R128 normalizáció (-16 LUFS integrated, -1.5 dBTP cap)
+//    → konzisztens hangerő, nem törli el a kompresszor előnyét.
+//
+// A sorrend lényeges: ELSŐ a kompresszor (dinamika tömörítés), MÁSODIK a
+// loudnorm (érthetőbb beszéd után normalizáljuk a végső szintet). Ezt az
+// üzenetek (TTS + recording) lejátszás előtti rendereléséhez használjuk.
+//
+// Megjegyzés: az újrajátszandó üzeneteknél (replay) ezt NEM alkalmazzuk,
+// mert a tárolt fájl már egyszer átment ezen a filteren.
+export const NORMALIZE_COMPRESS_FILTER =
+  "acompressor=threshold=-18dB:ratio=3:attack=20:release=250:makeup=4," +
+  "loudnorm=I=-16:TP=-1.5:LRA=11";
+
 // ── generateTTS ───────────────────────────────────────────────────────────────
 // Visszaad: { filename, durationMs }
 // filename = az /audio/ könyvtárban lévő WAV fájl neve
+//
+// Paraméterek:
+//   - text:           a felolvasandó szöveg
+//   - voice:          Piper hang (anna/berta/imre)
+//   - introSoundPath: opcionális override, ha a felhasználó saját intro
+//                     hangot választott (BellSoundFile MESSAGE_INTRO).
+//                     Ha null/undefined → default dingdong.wav.
 export async function generateTTS(
   text:  string,
   voice: string = "anna",
+  introSoundPath?: string | null,
 ): Promise<{ filename: string; durationMs: number | null }> {
   await ensureDingdongWav();
 
@@ -86,25 +110,49 @@ export async function generateTTS(
     "--output_file", speechFile,
   ], text);
 
-  // 2. Dingdong + speech concat (ha van dingdong)
-  if (fs.existsSync(DINGDONG_WAV)) {
+  // 2. Intro hang választása: explicit override > default dingdong > nincs
+  const introPath = introSoundPath && fs.existsSync(introSoundPath)
+    ? introSoundPath
+    : (fs.existsSync(DINGDONG_WAV) ? DINGDONG_WAV : null);
+
+  // 3. Render-pipeline:
+  //    a) ha van intro → concat (intro + speech) majd normalize+compress
+  //    b) ha nincs intro → csak normalize+compress a speech-en
+  if (introPath) {
     const concatList = path.join(AUDIO_DIR, `concat_${hash}.txt`);
-    fs.writeFileSync(concatList, `file '${DINGDONG_WAV}'\nfile '${speechFile}'\n`);
+    const concatWav  = path.join(AUDIO_DIR, `concat_${hash}.wav`);
+    fs.writeFileSync(concatList, `file '${introPath}'\nfile '${speechFile}'\n`);
+    // 3.a/1: concat → 22050 mono raw wav
     await runProcess("ffmpeg", [
       "-y", "-f", "concat", "-safe", "0",
       "-i", concatList,
       "-ar", "22050", "-ac", "1",
-      finalFile,
+      concatWav,
     ]);
     fs.unlinkSync(concatList);
     fs.unlinkSync(speechFile);
+    // 3.a/2: normalize + compressor a concat-ra
+    await runProcess("ffmpeg", [
+      "-y", "-i", concatWav,
+      "-af", NORMALIZE_COMPRESS_FILTER,
+      "-ar", "22050", "-ac", "1",
+      finalFile,
+    ]);
+    fs.unlinkSync(concatWav);
   } else {
-    fs.renameSync(speechFile, finalFile);
+    // 3.b: csak normalize+compress
+    await runProcess("ffmpeg", [
+      "-y", "-i", speechFile,
+      "-af", NORMALIZE_COMPRESS_FILTER,
+      "-ar", "22050", "-ac", "1",
+      finalFile,
+    ]);
+    fs.unlinkSync(speechFile);
   }
 
   const filename   = path.basename(finalFile);
   const durationMs = getFileDurationMs(finalFile);
 
-  console.log(`[TTS] Generálva: ${filename} (${durationMs}ms)`);
+  console.log(`[TTS] Generálva: ${filename} (${durationMs}ms) intro=${introPath ? path.basename(introPath) : "none"}`);
   return { filename, durationMs };
 }

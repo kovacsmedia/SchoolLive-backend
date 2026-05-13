@@ -393,9 +393,18 @@ model BellSoundFile {
   isDefault Boolean  @default(false)
   createdAt DateTime @default(now())
 
+  // "SCHEDULE"      – csengetési rendben használt hangok (jelzocsengo, kibecsengo, …)
+  // "MESSAGE_INTRO" – üzenetek előtt lejátszandó "dingdong"-szerű intro hangok
+  //                   (max 7s, a felhasználó az üzenetszerkesztőben választja ki)
+  kind      String   @default("SCHEDULE")
+  // ffprobe-val mért tényleges hossz (csak az intro hangoknál tartjuk számon,
+  // 7 mp-es limit-ellenőrzéshez). SCHEDULE típusnál null is lehet.
+  durationMs Int?
+
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId])
+  @@index([tenantId, kind])
   @@unique([tenantId, filename])
 }
 
