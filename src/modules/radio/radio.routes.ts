@@ -27,8 +27,19 @@ const storage = multer.diskStorage({
   },
 });
 
+import { stripAccents } from "../../utils/text";
+
 function fixEncoding(name: string): string {
-  try { return Buffer.from(name, "latin1").toString("utf8"); } catch { return name; }
+  // 1) latin1→utf8 hiba-javítás (multer alapesetben latin1-ben dekódolja
+  //    a multipart filename mezőt, ha a kliens nem ad explicit utf8 jelzést)
+  // 2) ékezet-mentesítés (a SchoolLive admin UI minden fájl-/lista-nevet
+  //    ékezet nélkül tárol, hogy a downstream pipeline-okban ne legyen baj)
+  try {
+    const fixed = Buffer.from(name, "latin1").toString("utf8");
+    return stripAccents(fixed);
+  } catch {
+    return stripAccents(name);
+  }
 }
 
 const upload = multer({
@@ -619,6 +630,11 @@ router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Re
 
     const snapOnline = await SnapcastService.isSnapserverOnline(tid(req));
     if (snapOnline) {
+      // Auto-stop: ha bármi RADIO típusú forrás játszik (másik netrádió
+      // vagy egy "play-now" fájl), azt SIGKILL-lel azonnal megszakítjuk,
+      // és nem queue-ba tesszük az újat. A user-élmény: ▶ kattintásra
+      // a régi rögtön némul, az új azonnal indul.
+      await SnapcastService.stopRadio(tid(req));
       await SnapcastService.play({
         type:              "RADIO",
         source:            { type: "stream", url: url.trim(), volume: sv },
@@ -689,6 +705,9 @@ router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, 
 
     const snapOnline = await SnapcastService.isSnapserverOnline(tid(req));
     if (snapOnline) {
+      // Auto-stop: ha bármi RADIO forrás (netrádió vagy másik play-now)
+      // szól, azt azonnal megszakítjuk, és nem queue-ba tesszük az újat.
+      await SnapcastService.stopRadio(tid(req));
       await SnapcastService.play({
         type:              "RADIO",
         source:            { type: "url", url: file.fileUrl, volume: sv },

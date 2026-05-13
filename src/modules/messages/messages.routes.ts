@@ -6,6 +6,7 @@ import { authJwt }         from "../../middleware/authJwt";
 import { requireTenant }   from "../../middleware/tenant";
 import { generateTTS, NORMALIZE_COMPRESS_FILTER } from "../../services/tts.service";
 import { resolveIntroSoundPath } from "../bells/bells.routes";
+import { stripAccents }    from "../../utils/text";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
 import { randomUUID }      from "crypto";
@@ -221,7 +222,11 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
     const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${filename}`;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
     const isImmediate   = !scheduledTime || scheduledTime <= new Date();
-    const title         = text.trim().substring(0, 64);
+    // Title: a TTS forrásszöveg első 64 karaktere ékezet nélkül.
+    // FIGYELEM: a Message.text mező (felolvasandó szöveg) MEGMARAD ékezetesen –
+    // azt a Piper TTS pontosan az ékezetek alapján mondja ki. Csak a `title`,
+    // ami a Now-Playing kijelzőre és a fájlnév-szerű kontextusra kerül, tisztul.
+    const title         = stripAccents(text.trim().substring(0, 64));
 
     const message = await prisma.message.create({
       data: {
@@ -308,7 +313,7 @@ router.post("/audio", authJwt, requireTenant, audioUpload.single("audio"), async
     const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${processedFilename}`;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
     const isImmediate   = !scheduledTime || scheduledTime <= new Date();
-    const title         = "Hangfelvétel";
+    const title         = stripAccents("Hangfelvétel");
 
     // TTS típust használunk – a hangfelvétel ugyanolyan lejátszási logikát igényel
     const message = await prisma.message.create({

@@ -8,6 +8,7 @@ import { execSync } from "child_process";
 import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
 import { broadcastSyncBells } from "./bell.scheduler";
+import { stripAccents } from "../../utils/text";
 
 /** ffprobe alapú hossz-mérés ms-ben. Hiba/elérhetetlenség esetén null. */
 function probeDurationMs(filePath: string): number | null {
@@ -43,7 +44,9 @@ if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, AUDIO_DIR),
-  filename: (_req, file, cb) => cb(null, file.originalname),
+  // Ékezetmentes fájlnév – a downstream eszközöknek (ESP / Python kliens /
+  // snapclient) így biztosan nem lesz baja a "csengő.mp3" típusú nevekkel.
+  filename: (_req, file, cb) => cb(null, stripAccents(file.originalname)),
 });
 
 const upload = multer({
@@ -375,14 +378,17 @@ bellsRouter.post("/sounds", authJwt, canEdit, upload.single("file"), async (req:
     });
   }
 
+  // A multer `filename` setter már ékezet-mentesítette → ugyanazt használjuk
+  // a DB-ben, hogy a lookup egyezzen a fájlrendszerrel.
+  const cleanName = stripAccents(file.originalname);
   const sound = await prisma.bellSoundFile.upsert({
-    where: { tenantId_filename: { tenantId: tid(req), filename: file.originalname } },
+    where: { tenantId_filename: { tenantId: tid(req), filename: cleanName } },
     update: { sizeBytes: file.size },
     create: {
       tenantId:  tid(req),
-      filename:  file.originalname,
+      filename:  cleanName,
       sizeBytes: file.size,
-      isDefault: DEFAULT_SOUNDS.includes(file.originalname),
+      isDefault: DEFAULT_SOUNDS.includes(cleanName),
     },
   });
 
@@ -421,8 +427,9 @@ if (!fs.existsSync(INTRO_AUDIO_DIR)) fs.mkdirSync(INTRO_AUDIO_DIR, { recursive: 
 const introStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, INTRO_AUDIO_DIR),
   filename:    (_req, file, cb) => {
-    // Egyedi prefix-szel, hogy a több tenant ne ütközzön azonos eredeti névnél
-    const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
+    // Egyedi prefix-szel, hogy a több tenant ne ütközzön azonos eredeti névnél.
+    // Először ékezet-mentesítés, aztán nem alfanumerikus karakter-szűrés.
+    const safe = stripAccents(file.originalname).replace(/[^a-zA-Z0-9._-]/g, "_");
     cb(null, `${Date.now()}_${safe}`);
   },
 });
