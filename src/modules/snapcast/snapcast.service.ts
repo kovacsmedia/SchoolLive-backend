@@ -380,6 +380,28 @@ class TenantSnapEngine {
   }): void {
     this.jobs.delete(e.jobId);
     this.jobTargets.delete(e.jobId);
+
+    // KRITIKUS: a klienseket explicit értesítjük, hogy a job véget ért.
+    // A natív kliensek (ESP DeviceAgent, Linux/Windows DeviceAgent, Android
+    // player) erre kilépnek a "playback quiet" módból, és a HUD/overlay
+    // azonnal eltűnik. E nélkül stream esetén (durationMs ismeretlen) a
+    // klienst-side timeout sosem érné el, és a HUD végtelen ideig fent
+    // maradna – ezért találkozott a felhasználó "HUD fent marad" tünettel,
+    // ami csak a snap server reset után tűnt el.
+    //
+    // Dinamikus import a circular dep elkerülésére (SyncEngine →
+    // snapcast.service → SyncEngine bizonyos kódutakon).
+    import("../../sync/SyncEngine")
+      .then(({ SyncEngine }) => {
+        SyncEngine.broadcastImmediate(this.tenantId, {
+          action:    "STOP_PLAYBACK",
+          commandId: `${e.jobId}:end`,
+          // diagnosztika a kliens-naplóhoz – mit fejeztünk be
+          jobType:   e.jobType,
+          reason:    e.reason,
+        });
+      })
+      .catch(err => console.error(`[Snap:${this.tenantId}] SyncEngine STOP broadcast hiba:`, err));
   }
 
   getStatus() {
