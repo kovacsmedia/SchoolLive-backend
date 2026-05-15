@@ -36,40 +36,53 @@ async function processRecording(
   const concatWav    = path.join(AUDIO_DIR, `rec_concat_${hash}.wav`);
   // Opus kimenet – a snapserver natívan fogadja, kis fájlméret.
   const finalOpus    = path.join(AUDIO_DIR, `rec_${hash}.opus`);
-  const concatList   = path.join(AUDIO_DIR, `rec_concat_${hash}.txt`);
   const defaultDing  = path.join(AUDIO_DIR, "dingdong.wav");
 
   const introPath = introSoundPath && fs.existsSync(introSoundPath)
     ? introSoundPath
     : (fs.existsSync(defaultDing) ? defaultDing : null);
 
+  // 1. Eredeti webm-et először 22050 mono WAV-ra konvertáljuk (közös formátum
+  //    a kompresszor-pipeline elé). A concat filter is auto-resample-elne,
+  //    de így a no-intro ágon közvetlenül normalizálhatunk egyetlen wav-ról.
+  const rawWav = path.join(AUDIO_DIR, `rec_raw_${hash}.wav`);
+
   try {
-    // 1. Eredeti webm-et először 22050 mono WAV-ra konvertáljuk (concat-hoz)
-    const rawWav = path.join(AUDIO_DIR, `rec_raw_${hash}.wav`);
     execFileSync("ffmpeg", [
       "-y", "-i", inputPath,
       "-ar", "22050", "-ac", "1",
       rawWav,
     ]);
 
-    // 2. Ha van intro → concat (intro + recording), különben csak a raw
+    // 2. Ha van intro → concat FILTER-rel fűzzük össze (NEM demuxer-rel!).
+    //
+    // A concat demuxer azonos formátumú streamet vár, és csendben dobja
+    // a második inputot, ha eltér – ez okozta a "csak intro szól, üzenet
+    // nem" bug-ot, amikor a user nem-default MESSAGE_INTRO fájlt választott.
+    // A filter változat auto-resample-eli mindkét streamet, és minden
+    // intro-formátummal (MP3/OGG/M4A/stereo/44.1kHz) működik.
     let preFilterWav: string;
     if (introPath) {
-      fs.writeFileSync(concatList, `file '${introPath}'\nfile '${rawWav}'\n`);
       execFileSync("ffmpeg", [
-        "-y", "-f", "concat", "-safe", "0",
-        "-i", concatList,
+        "-y",
+        "-i", introPath,
+        "-i", rawWav,
+        "-filter_complex",
+          "[0:a]aresample=22050,aformat=channel_layouts=mono[a0];" +
+          "[1:a]aresample=22050,aformat=channel_layouts=mono[a1];" +
+          "[a0][a1]concat=n=2:v=0:a=1[out]",
+        "-map", "[out]",
         "-ar", "22050", "-ac", "1",
         concatWav,
       ]);
-      fs.unlinkSync(concatList);
       fs.unlinkSync(rawWav);
       preFilterWav = concatWav;
     } else {
       preFilterWav = rawWav;
     }
 
-    // 3. Normalize + compressor filter chain → libopus encode (48 kbps voip)
+    // 3. Normalize + compressor + brick-wall limiter filter chain →
+    //    libopus encode (48 kbps voip)
     execFileSync("ffmpeg", [
       "-y", "-i", preFilterWav,
       "-af", NORMALIZE_COMPRESS_FILTER,
@@ -85,7 +98,7 @@ async function processRecording(
 
   } catch (err) {
     // Cleanup
-    for (const f of [concatWav, concatList]) { try { fs.unlinkSync(f); } catch {} }
+    for (const f of [concatWav, rawWav]) { try { fs.unlinkSync(f); } catch {} }
     throw err;
   }
 }

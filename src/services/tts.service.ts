@@ -61,20 +61,31 @@ async function ensureDingdongWav(): Promise<void> {
 }
 
 // ── Audio "polírozó" filter chain ─────────────────────────────────────────────
-// 1) acompressor: dinamika-kompresszor, a halkabb részeket felemeli, a
-//    csúcsokat lefogja → érthetőbb beszéd hangszórón.
-// 2) loudnorm: EBU R128 normalizáció (-16 LUFS integrated, -1.5 dBTP cap)
-//    → konzisztens hangerő, nem törli el a kompresszor előnyét.
+// Rádió-broadcast stílusú feldolgozás, hogy az iskolai bemondás MINDIG
+// erőteljes, érthető és konzisztensen hangos legyen, függetlenül a forrás
+// hangerő-szintjétől (halk Piper TTS, csendben felvett mikrofonos hangfelvétel
+// stb.).
 //
-// A sorrend lényeges: ELSŐ a kompresszor (dinamika tömörítés), MÁSODIK a
-// loudnorm (érthetőbb beszéd után normalizáljuk a végső szintet). Ezt az
-// üzenetek (TTS + recording) lejátszás előtti rendereléséhez használjuk.
+// 1) acompressor – erős dinamika-tömörítés: a halkabb szótagokat felemeli,
+//    a csúcsokat lefogja → minden szó egyenletesen hangos. A korábbi
+//    threshold=-18/ratio=3-hez képest agresszívebb (−22/4/+6 makeup) hogy
+//    még a felvevő-mikrofon távoli halk részeit is felhúzza.
+// 2) loudnorm – EBU R128 normalizáció: target −12 LUFS (rádiós szint,
+//    NEM broadcast −16) és TP=−1.0 dBTP (0.5 dB-vel magasabb mint a
+//    broadcast cap), LRA=7 (szorosabb loudness range = állandó hangerő).
+// 3) alimiter – brick-wall limiter 0.97 (≈ −0.26 dBFS) ceiling-en: az
+//    R128 utáni esetleges csúcsokat lefogja, így a kimenet maximálisan
+//    "maxed out" a klipping veszélye nélkül. Ez a "maximalizálás" lépés.
+//
+// A sorrend lényeges: kompresszor → loudnorm → limiter. Ezt az üzenetek
+// (TTS + recording) lejátszás-előtti rendereléséhez használjuk.
 //
 // Megjegyzés: az újrajátszandó üzeneteknél (replay) ezt NEM alkalmazzuk,
 // mert a tárolt fájl már egyszer átment ezen a filteren.
 export const NORMALIZE_COMPRESS_FILTER =
-  "acompressor=threshold=-18dB:ratio=3:attack=20:release=250:makeup=4," +
-  "loudnorm=I=-16:TP=-1.5:LRA=11";
+  "acompressor=threshold=-22dB:ratio=4:attack=10:release=180:makeup=6," +
+  "loudnorm=I=-12:TP=-1.0:LRA=7," +
+  "alimiter=limit=0.97:attack=5:release=50";
 
 // ── generateTTS ───────────────────────────────────────────────────────────────
 // Visszaad: { filename, durationMs }
@@ -134,17 +145,31 @@ export async function generateTTS(
   ];
 
   if (introPath) {
-    const concatList = path.join(AUDIO_DIR, `concat_${hash}.txt`);
     const concatWav  = path.join(AUDIO_DIR, `concat_${hash}.wav`);
-    fs.writeFileSync(concatList, `file '${introPath}'\nfile '${speechFile}'\n`);
-    // 3.a/1: concat → 22050 mono raw wav
+    // 3.a/1: concat FILTER (NEM demuxer!).
+    //
+    // A concat demuxer (`-f concat -i list.txt`) elvárja, hogy MINDEN input
+    // ugyanolyan formátumú legyen (codec, sample rate, csatorna). A user
+    // által feltöltött MESSAGE_INTRO bármilyen audio lehet (MP3 stereo
+    // 44.1kHz, OGG, M4A stb.), míg a Piper TTS output 22050Hz mono WAV.
+    // Ezzel a régi koddal a concat csendesen csak az intro-t adta vissza,
+    // a TTS rész elveszett → "csak az üzenet-előtti hang szól" bug.
+    //
+    // A concat FILTER (`-filter_complex ...concat=...`) viszont mindkét
+    // streamet előbb auto-resample-eli a közös formátumra (22050 mono),
+    // majd koncatenál. Robust mindenféle intro-formátumra.
     await runProcess("ffmpeg", [
-      "-y", "-f", "concat", "-safe", "0",
-      "-i", concatList,
+      "-y",
+      "-i", introPath,
+      "-i", speechFile,
+      "-filter_complex",
+        "[0:a]aresample=22050,aformat=channel_layouts=mono[a0];" +
+        "[1:a]aresample=22050,aformat=channel_layouts=mono[a1];" +
+        "[a0][a1]concat=n=2:v=0:a=1[out]",
+      "-map", "[out]",
       "-ar", "22050", "-ac", "1",
       concatWav,
     ]);
-    fs.unlinkSync(concatList);
     fs.unlinkSync(speechFile);
     // 3.a/2: normalize + compressor + libopus encode a concat-ra
     await runProcess("ffmpeg", [
