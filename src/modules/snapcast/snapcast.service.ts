@@ -410,13 +410,27 @@ class TenantSnapEngine {
     reason: SourceEndReason;
     bytesWritten: number;
   }): void {
-    this.jobs.delete(e.jobId);
-    this.jobTargets.delete(e.jobId);
+    // CSAK akkor töröljük a `jobs` és `jobTargets` map-eket, ha a job
+    // TÉNYLEGESEN véget ért – "interrupted" (pl. magasabb prio audio
+    // megszakította fade-outtal) esetén a job a pausedStack-en él tovább,
+    // és resume-on az EREDETI targeting (deviceIdsToUnmute) kell, hogy
+    // a snap server megfelelően mute-olja a nem-célzott eszközöket.
+    //
+    // Korábban itt minden reason-on töröltünk → resume után az `onSourceStart`
+    // `jobTargets.get(jobId) === undefined` → applyTargetingToClients(undefined)
+    // ami MINDEN klienst unmute-elt – ezért szólalt meg a netrádió a
+    // nem-célzott eszközökön (pl. ESP-n) a resume-kor.
+    if (e.reason !== "interrupted") {
+      this.jobs.delete(e.jobId);
+      this.jobTargets.delete(e.jobId);
+    }
 
     // Késleltetett STOP_PLAYBACK broadcast: 1.5 sec késéssel megy ki, hogy a
     // kliens snap puffere lejátsza a hang utolsó pillanatait MIELŐTT a
     // Linux/Windows app.py snap-restart-ot indít. Ha közben új forrás indul
     // (source:start), a timer törlődik – nem áll le a stream, csak váltás.
+    // Interrupted esetén is megy a setTimeout, de az onSourceStart úgyis
+    // törli, ha a paused job pár száz ms múlva újra-aktiválódik.
     if (this.stopBroadcastTimer) clearTimeout(this.stopBroadcastTimer);
     this.stopBroadcastTimer = setTimeout(() => {
       this.stopBroadcastTimer = null;

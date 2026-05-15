@@ -375,6 +375,13 @@ export class TenantAudioMixer extends EventEmitter {
     }
 
     this.inGap = false;
+
+    // Source:end event-et emit-elünk minden eldobandó job-ra, hogy a
+    // service.ts a `jobs`/`jobTargets` Map-eket cleanup-olni tudja.
+    // ("interrupted" reason-nal nem törölnek, de "stopped"-on igen.)
+    for (const j of this.queue) this.emitStopped(j);
+    for (const p of this.pausedStack) this.emitStopped(p.job);
+
     this.queue = [];
     this.pausedStack = [];
 
@@ -383,10 +390,13 @@ export class TenantAudioMixer extends EventEmitter {
   }
 
   stopByType(jobType: MixerJobType): void {
-    this.queue = this.queue.filter((j) => j.jobType !== jobType);
-    this.pausedStack = this.pausedStack.filter(
-      (p) => p.job.jobType !== jobType
-    );
+    // A típushoz tartozó queue- és pausedStack-bejegyzésekre emit-elünk
+    // source:end stopped-et, hogy a service.ts ki tudja takarítani őket.
+    for (const j of this.queue.filter(q => q.jobType === jobType)) this.emitStopped(j);
+    for (const p of this.pausedStack.filter(ps => ps.job.jobType === jobType)) this.emitStopped(p.job);
+
+    this.queue       = this.queue.filter((j) => j.jobType !== jobType);
+    this.pausedStack = this.pausedStack.filter((p) => p.job.jobType !== jobType);
 
     if (this.pending?.job.jobType === jobType) {
       this.cancelPending("stopped");
@@ -395,6 +405,16 @@ export class TenantAudioMixer extends EventEmitter {
     if (this.active?.job.jobType === jobType) {
       this.killActive("stopped");
     }
+  }
+
+  /** Helper: source:end stopped event a service.ts cleanup-jához. */
+  private emitStopped(job: MixerJob): void {
+    this.emit("source:end", {
+      jobId:        job.id,
+      jobType:      job.jobType,
+      reason:       "stopped" as SourceEndReason,
+      bytesWritten: 0,
+    });
   }
 
   // Aktív pending start törlése. Tüzeli a source:end eseményt, hogy a
