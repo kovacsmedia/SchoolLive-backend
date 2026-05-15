@@ -42,15 +42,19 @@ async function processRecording(
     ? introSoundPath
     : (fs.existsSync(defaultDing) ? defaultDing : null);
 
-  // 1. Eredeti webm-et először 22050 mono WAV-ra konvertáljuk (közös formátum
-  //    a kompresszor-pipeline elé). A concat filter is auto-resample-elne,
-  //    de így a no-intro ágon közvetlenül normalizálhatunk egyetlen wav-ról.
+  // 1. Eredeti webm-et 48000 mono WAV-ra konvertáljuk (közös formátum a
+  //    kompresszor-pipeline elé). A böngésző MediaRecorder általában 48 kHz
+  //    stereo Opus-t küld, így a downsample-t kihagyjuk – a beszéd tisztább
+  //    marad (sziszegő mássalhangzók, "s", "sz", "c" élesebbek), és a végső
+  //    libopus encode (48 kbps voip) is 48 kHz-en megy → nincs felesleges
+  //    re-sample. A TTS-ág a `tts.service.ts`-ben Piper natív 22050 Hz-en
+  //    marad, mert a Piper modell amúgy sem produkál többet.
   const rawWav = path.join(AUDIO_DIR, `rec_raw_${hash}.wav`);
 
   try {
     execFileSync("ffmpeg", [
       "-y", "-i", inputPath,
-      "-ar", "22050", "-ac", "1",
+      "-ar", "48000", "-ac", "1",
       rawWav,
     ]);
 
@@ -59,8 +63,8 @@ async function processRecording(
     // A concat demuxer azonos formátumú streamet vár, és csendben dobja
     // a második inputot, ha eltér – ez okozta a "csak intro szól, üzenet
     // nem" bug-ot, amikor a user nem-default MESSAGE_INTRO fájlt választott.
-    // A filter változat auto-resample-eli mindkét streamet, és minden
-    // intro-formátummal (MP3/OGG/M4A/stereo/44.1kHz) működik.
+    // A filter változat auto-resample-eli mindkét streamet 48000 mono-ra,
+    // és minden intro-formátummal (MP3/OGG/M4A/stereo/44.1kHz) működik.
     let preFilterWav: string;
     if (introPath) {
       execFileSync("ffmpeg", [
@@ -68,11 +72,11 @@ async function processRecording(
         "-i", introPath,
         "-i", rawWav,
         "-filter_complex",
-          "[0:a]aresample=22050,aformat=channel_layouts=mono[a0];" +
-          "[1:a]aresample=22050,aformat=channel_layouts=mono[a1];" +
+          "[0:a]aresample=48000,aformat=channel_layouts=mono[a0];" +
+          "[1:a]aresample=48000,aformat=channel_layouts=mono[a1];" +
           "[a0][a1]concat=n=2:v=0:a=1[out]",
         "-map", "[out]",
-        "-ar", "22050", "-ac", "1",
+        "-ar", "48000", "-ac", "1",
         concatWav,
       ]);
       fs.unlinkSync(rawWav);
