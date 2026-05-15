@@ -26,8 +26,13 @@ const BYTES_PER_SEC = SAMPLE_RATE * FRAME_BYTES; // 192000 byte/s
 
 // ── Fade/gap paraméterek ────────────────────────────────────────────────────
 
-const FADE_OUT_BYTES = Math.round(BYTES_PER_SEC * 1.0); // 1 s fade-out
-const FADE_IN_BYTES = Math.round(BYTES_PER_SEC * 0.2); // 200 ms fade-in
+const FADE_OUT_BYTES = Math.round(BYTES_PER_SEC * 1.0); // 1 s fade-out (mindenre)
+// Default fade-in értékek source.type szerint:
+//   - "file" / "url" (bell, TTS, lokális rádió fájl) → 0 (azonnal teljes)
+//   - "stream"      (internet rádió)               → 1 sec
+// A `MixerJob.fadeInMs` opcionális mezővel a hívó felülírhatja per-job.
+const FADE_IN_BYTES_STREAM = Math.round(BYTES_PER_SEC * 1.0);
+const FADE_IN_BYTES_NONE   = 0;
 const POST_FADE_GAP_MS = 200;
 
 // ── Pre/post silence ────────────────────────────────────────────────────────
@@ -46,7 +51,11 @@ const POST_FADE_GAP_MS = 200;
 //
 // POST_SILENCE_MS: a job vége után ennyi csend, hogy a kliensek pufferei
 // kiürülhessenek mielőtt egy újabb forrás indulna ugyanitt.
-const PRE_SILENCE_MS = 2000;
+// PRE_SILENCE_MS: az új job ffmpeg-startja előtti csend. A snap server
+// puffer + a kliens-célzás RPC-i mind elférnek 1 sec alatt – 2 sec felesleges
+// volt. Forrás-csere esetén a hang-rés ezzel kb. 1 sec-re csökken, a kliens
+// snap pufferből kihúzható.
+const PRE_SILENCE_MS = 1000;
 const POST_SILENCE_MS = 500;
 
 // ── Háttér silence ffmpeg subprocess ─────────────────────────────────────────
@@ -101,6 +110,9 @@ export interface MixerJob {
   title?: string;
   text?: string;
   resumeBytes?: number;
+  // Opcionális per-job fade-in. Ha nincs megadva: stream forrásra 1 sec,
+  // egyébként 0 (azonnal teljes amplitúdóval szól – chime, üzenet).
+  fadeInMs?: number;
 }
 
 export type SourceEndReason = "done" | "interrupted" | "error" | "stopped";
@@ -142,6 +154,10 @@ interface ActiveSource {
   bytesWritten: number;
 
   fadeInActive: boolean;
+  // Per-job fade-in hossz byte-ban. 0 = nincs fade-in (chime/üzenet
+  // azonnal teljes amplitúdóval szól). A startSource számítja ki a
+  // job.fadeInMs vagy default (stream→1s, egyéb→0) alapján.
+  fadeInBytes: number;
   fadeOutStart: number | null;
   killed: boolean;
 }
@@ -540,11 +556,17 @@ export class TenantAudioMixer extends EventEmitter {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
+    // Fade-in byte-szám: explicit override > stream default (1 sec) > 0 (nincs).
+    const fadeInBytes = typeof job.fadeInMs === "number"
+      ? Math.max(0, Math.round(BYTES_PER_SEC * job.fadeInMs / 1000))
+      : (job.source.type === "stream" ? FADE_IN_BYTES_STREAM : FADE_IN_BYTES_NONE);
+
     const src: ActiveSource = {
       job,
       proc,
       bytesWritten: 0,
-      fadeInActive: true,
+      fadeInActive: fadeInBytes > 0,
+      fadeInBytes,
       fadeOutStart: null,
       killed: false,
     };
@@ -696,8 +718,8 @@ export class TenantAudioMixer extends EventEmitter {
       return (start + end) / 2;
     }
 
-    if (src.fadeInActive) {
-      const prog = src.bytesWritten / FADE_IN_BYTES;
+    if (src.fadeInActive && src.fadeInBytes > 0) {
+      const prog = src.bytesWritten / src.fadeInBytes;
 
       if (prog >= 1) {
         src.fadeInActive = false;
@@ -705,7 +727,7 @@ export class TenantAudioMixer extends EventEmitter {
       }
 
       const start = prog;
-      const end = Math.min(1, (src.bytesWritten + chunkLen) / FADE_IN_BYTES);
+      const end = Math.min(1, (src.bytesWritten + chunkLen) / src.fadeInBytes);
 
       if (end >= 1) {
         src.fadeInActive = false;
@@ -714,6 +736,7 @@ export class TenantAudioMixer extends EventEmitter {
       return (start + end) / 2;
     }
 
+    // fadeInBytes === 0 → azonnal teljes amplitúdó (chime / üzenet)
     return 1;
   }
 

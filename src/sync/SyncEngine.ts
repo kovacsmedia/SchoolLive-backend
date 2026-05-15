@@ -7,7 +7,11 @@ import jwt                             from "jsonwebtoken";
 import bcrypt                          from "bcrypt";
 import { env }                         from "../config/env";
 
-export type SyncAction = "BELL" | "TTS" | "PLAY_URL" | "STOP_PLAYBACK" | "SYNC_BELLS" | "OTA_UPDATE";
+export type SyncAction = "BELL" | "TTS" | "PLAY_URL" | "STOP_PLAYBACK" | "SYNC_BELLS" | "OTA_UPDATE"
+  // NOW_PLAYING_INFO: a backend audio mixer onSourceStart event-jéből megy ki,
+  // hogy a kliens HUD pontosan az aktuálisan szóló forrás nevét/típusát mutassa
+  // (különösen forrás-csere esetén, amikor a stream tovább megy).
+  | "NOW_PLAYING_INFO";
 
 export interface PreparePayload {
   phase:             "PREPARE";

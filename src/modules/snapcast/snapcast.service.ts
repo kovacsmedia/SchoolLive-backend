@@ -63,6 +63,14 @@ class TenantSnapEngine {
   private jobs = new Map<string, MixerJob>();
   private jobTargets = new Map<string, string[] | undefined>();
 
+  // STOP_PLAYBACK broadcast késleltetése a snap drain idejére: a `source:end`
+  // event után 1.5 sec-cel megy ki, hogy a kliens snap puffere lejátssza a
+  // hang végét MIELŐTT a Linux/Windows app.py snap-restart-ot triggerelne.
+  // Ha közben új forrás indul (source:start), törlődik – csak forrás-csere
+  // történt, nem teljes stop, a HUD-ot a NOW_PLAYING_INFO frissíti.
+  private stopBroadcastTimer: NodeJS.Timeout | null = null;
+  private static readonly STOP_BROADCAST_DELAY_MS = 1500;
+
   constructor(tenantId: string, snapPort: number) {
     this.tenantId = tenantId;
     this.snapPort = snapPort;
@@ -360,6 +368,30 @@ class TenantSnapEngine {
   private onSourceStart(e: { jobId: string; jobType: MixerJobType }): void {
     const targets = this.jobTargets.get(e.jobId);
 
+    // Forrás-csere: ha volt pending STOP_PLAYBACK broadcast a snap drainből,
+    // töröljük – nem áll meg a stream, csak váltunk forrást, a kliens
+    // HUD-ot a NOW_PLAYING_INFO frissíti.
+    if (this.stopBroadcastTimer) {
+      clearTimeout(this.stopBroadcastTimer);
+      this.stopBroadcastTimer = null;
+    }
+
+    // HUD frissítés: az aktuális játszás info-ját a kliensekhez (Android,
+    // Linux, Windows). Az ESP DeviceAgent WS-en nincs, neki a dispatchSync
+    // route-okon át már megérkezett a HUD-state.
+    const job = this.jobs.get(e.jobId);
+    if (job) {
+      import("../../sync/SyncEngine").then(({ SyncEngine }) => {
+        SyncEngine.broadcastImmediate(this.tenantId, {
+          action:     "NOW_PLAYING_INFO",
+          commandId:  `${e.jobId}:start`,
+          title:      job.title ?? "",
+          jobType:    e.jobType,
+          sourceType: job.source.type,
+        });
+      }).catch(() => {});
+    }
+
     // Nem unmute-olunk vakon mindenkit.
     // Ugyanazt a célzást alkalmazzuk újra néhány késleltetett pillanatban,
     // hogy a késve megjelenő kliensek se maradjanak rossz állapotban.
@@ -381,27 +413,26 @@ class TenantSnapEngine {
     this.jobs.delete(e.jobId);
     this.jobTargets.delete(e.jobId);
 
-    // KRITIKUS: a klienseket explicit értesítjük, hogy a job véget ért.
-    // A natív kliensek (ESP DeviceAgent, Linux/Windows DeviceAgent, Android
-    // player) erre kilépnek a "playback quiet" módból, és a HUD/overlay
-    // azonnal eltűnik. E nélkül stream esetén (durationMs ismeretlen) a
-    // klienst-side timeout sosem érné el, és a HUD végtelen ideig fent
-    // maradna – ezért találkozott a felhasználó "HUD fent marad" tünettel,
-    // ami csak a snap server reset után tűnt el.
-    //
-    // Dinamikus import a circular dep elkerülésére (SyncEngine →
-    // snapcast.service → SyncEngine bizonyos kódutakon).
-    import("../../sync/SyncEngine")
-      .then(({ SyncEngine }) => {
+    // Késleltetett STOP_PLAYBACK broadcast: 1.5 sec késéssel megy ki, hogy a
+    // kliens snap puffere lejátsza a hang utolsó pillanatait MIELŐTT a
+    // Linux/Windows app.py snap-restart-ot indít. Ha közben új forrás indul
+    // (source:start), a timer törlődik – nem áll le a stream, csak váltás.
+    if (this.stopBroadcastTimer) clearTimeout(this.stopBroadcastTimer);
+    this.stopBroadcastTimer = setTimeout(() => {
+      this.stopBroadcastTimer = null;
+      // Védő ellenőrzés: ha közben elindult egy új forrás, ne küldjünk stopot.
+      const m = this.mixer?.getStatus();
+      if (m && (m.current || m.pending)) return;
+
+      import("../../sync/SyncEngine").then(({ SyncEngine }) => {
         SyncEngine.broadcastImmediate(this.tenantId, {
           action:    "STOP_PLAYBACK",
-          commandId: `${e.jobId}:end`,
-          // diagnosztika a kliens-naplóhoz – mit fejeztünk be
+          commandId: `${e.jobId}:drained`,
           jobType:   e.jobType,
           reason:    e.reason,
         });
-      })
-      .catch(err => console.error(`[Snap:${this.tenantId}] SyncEngine STOP broadcast hiba:`, err));
+      }).catch(err => console.error(`[Snap:${this.tenantId}] STOP broadcast hiba:`, err));
+    }, TenantSnapEngine.STOP_BROADCAST_DELAY_MS);
   }
 
   getStatus() {
