@@ -3,6 +3,8 @@
 import { Router } from "express";
 import { prisma } from "../../prisma/client";
 import { authJwt } from "../../middleware/authJwt";
+import { allocateNextSnapPort, SNAP_PORT_RANGE } from "../snapcast/snap-port-allocator";
+import { SnapcastService } from "../snapcast/snapcast.service";
 
 const router = Router();
 
@@ -31,6 +33,7 @@ const SELECT = {
   directorPhone: true,
   directorEmail: true,
   eduId: true,
+  snapPort: true,
 } as const;
 
 /**
@@ -68,25 +71,61 @@ router.post("/", authJwt, async (req, res) => {
       return res.status(400).json({ error: "name is required" });
     }
 
-    const created = await prisma.tenant.create({
-      data: {
-        name: name.trim(),
-        domain: typeof domain === "string" && domain.trim() ? domain.trim() : null,
-        isActive: typeof isActive === "boolean" ? isActive : true,
-        address: typeof address === "string" && address.trim() ? address.trim() : null,
-        directorName: typeof directorName === "string" && directorName.trim() ? directorName.trim() : null,
-        directorPhone: typeof directorPhone === "string" && directorPhone.trim() ? directorPhone.trim() : null,
-        directorEmail: typeof directorEmail === "string" && directorEmail.trim() ? directorEmail.trim() : null,
-        eduId: typeof eduId === "string" && eduId.trim() ? eduId.trim() : null,
-      },
-      select: SELECT,
-    });
+    // Snap port automatikus kiosztása az [1800..1880] tartományból.
+    // P2002 (unique constraint) race esetén max 5x újrapróbálkozunk
+    // egy másik port-kiosztással. Ha a tartomány teli, 507 Insufficient
+    // Storage hiba megy vissza – az admin-nak ekkor érdemes felszabadítani
+    // egy nem-használt tenant-et, vagy bővíteni a SNAP_PORT_MAX env-et.
+    let created;
+    let lastErr: any = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const snapPort = await allocateNextSnapPort();
+      if (snapPort === null) {
+        return res.status(507).json({
+          error: `Nincs szabad snapPort a ${SNAP_PORT_RANGE.base}–${SNAP_PORT_RANGE.max} tartományban`,
+        });
+      }
+
+      try {
+        created = await prisma.tenant.create({
+          data: {
+            name: name.trim(),
+            domain: typeof domain === "string" && domain.trim() ? domain.trim() : null,
+            isActive: typeof isActive === "boolean" ? isActive : true,
+            address: typeof address === "string" && address.trim() ? address.trim() : null,
+            directorName: typeof directorName === "string" && directorName.trim() ? directorName.trim() : null,
+            directorPhone: typeof directorPhone === "string" && directorPhone.trim() ? directorPhone.trim() : null,
+            directorEmail: typeof directorEmail === "string" && directorEmail.trim() ? directorEmail.trim() : null,
+            eduId: typeof eduId === "string" && eduId.trim() ? eduId.trim() : null,
+            snapPort,
+          },
+          select: SELECT,
+        });
+        break;
+      } catch (err: any) {
+        // P2002 = unique constraint violation. Ha a `snapPort` target
+        // ütközik (race két admin POST között), újraallokálunk; ha a
+        // `domain` ütközik, 409-cel azonnal visszadobjuk.
+        if (err?.code === "P2002") {
+          const target = Array.isArray(err.meta?.target) ? err.meta.target : [];
+          if (target.includes("snapPort")) {
+            console.warn(`[POST /admin/tenants] snapPort race (attempt ${attempt + 1}), újra...`);
+            lastErr = err;
+            continue;
+          }
+          return res.status(409).json({ error: "Domain already exists" });
+        }
+        throw err;
+      }
+    }
+
+    if (!created) {
+      console.error("[POST /admin/tenants] 5 retry után sem sikerült snapPort-ot kiosztani:", lastErr);
+      return res.status(500).json({ error: "Failed to allocate snapPort after retries" });
+    }
 
     return res.status(201).json({ ok: true, tenant: created });
   } catch (err: any) {
-    if (err?.code === "P2002") {
-      return res.status(409).json({ error: "Domain already exists" });
-    }
     console.error(err);
     return res.status(500).json({ error: "Failed to create tenant" });
   }
@@ -194,6 +233,16 @@ router.delete("/:id", authJwt, async (req, res) => {
 
     // ── Hard delete – teljes cascade tranzakcióban ──────────────────────────
     console.log(`[DELETE TENANT] Starting cascade delete for tenant ${id} (${existing.name})`);
+
+    // Snapserver teardown ELŐSZÖR (a DB-cascade előtt), mert a snapPort-ot
+    // a tenant rekordból olvassuk ki. Soft-delete-nél (isActive=false)
+    // NEM csináljuk: oda még visszavonhatóan újra is aktiválható a tenant.
+    // Hibatűrő: ha a pm2/file cleanup hibázik, a DB-cascade akkor is fut.
+    try {
+      await SnapcastService.dispose(id);
+    } catch (e) {
+      console.error(`[DELETE TENANT] Snap dispose hiba (folytatjuk):`, e);
+    }
 
     // ── Helper: biztonságos törlés – szinkron TypeError-t is elnyeli ──────────
     async function safeDelete(fn: () => Promise<any>) {

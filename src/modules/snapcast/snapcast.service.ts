@@ -14,7 +14,7 @@
 // Csak ezután indul a tényleges audio mixer job.
 
 import { execSync } from "child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "fs";
 import {
   TenantAudioMixer,
   MixerJob,
@@ -473,6 +473,53 @@ class TenantSnapEngine {
       activeJobId,
     };
   }
+
+  /**
+   * Tenant teljes shutdown: mixer leállítása, pm2 snapserver stop+delete,
+   * config + FIFO unlink. Tenant hard-delete-ekor hívandó.
+   *
+   * Hibatűrő: minden részlépést try/catch-be tesszük, a logot megőrizzük, de
+   * a teljes folyamatot nem dobjuk meg, mert a Tenant DB-cascade-nek le KELL
+   * futnia, akkor is, ha a snapserver külső erőforrásait nem sikerült törölni
+   * (pl. PM2 nem fut, vagy a config file már nem létezik).
+   */
+  async shutdown(): Promise<void> {
+    console.log(`[Snap:${this.snapPort}] shutdown indul (tenant=${this.tenantId})`);
+
+    // 1. Mixer: stopAll → ffmpeg kill, queue/pausedStack clear.
+    try {
+      this.mixer?.stopAll();
+    } catch (e) {
+      console.error(`[Snap:${this.snapPort}] mixer stopAll hiba:`, e);
+    }
+
+    // 2. PM2 process: stop + delete. A "delete" után a process már nem
+    //    indul újra automatikusan a pm2 resurrect-en.
+    try {
+      execSync(`sudo -u deploy pm2 delete snapserver-${this.snapPort}`, {
+        stdio: "pipe",
+      });
+      console.log(`[Snap:${this.snapPort}] PM2 process törölve`);
+    } catch (e) {
+      // Nem létező process: pm2 hibakódot ad, ezt elnyeljük.
+      console.warn(`[Snap:${this.snapPort}] PM2 delete (vagy nem futott): ${(e as Error).message?.split("\n")[0] ?? e}`);
+    }
+
+    // 3. Config fájl és FIFO unlink.
+    for (const f of [this.cfgPath, this.fifoPath]) {
+      try {
+        if (existsSync(f)) {
+          unlinkSync(f);
+          console.log(`[Snap:${this.snapPort}] törölve: ${f}`);
+        }
+      } catch (e) {
+        console.error(`[Snap:${this.snapPort}] unlink hiba (${f}):`, e);
+      }
+    }
+
+    this.snapOnline = false;
+    this.inited = false;
+  }
 }
 
 function sourceToMixer(s: SnapAudioSource): MixerSource {
@@ -571,6 +618,37 @@ class SnapcastServiceClass {
 
   getAllStatus() {
     return [...this.engines.values()].map((e) => e.getStatus());
+  }
+
+  /**
+   * Tenant teljes snapserver-cleanup. Hard-delete-kor hívandó MIELŐTT a DB
+   * cascade lefutna (mert a snapPort-ot a tenant rekordból olvassuk ki).
+   *
+   * Két útvonalat kezelünk:
+   *  1. Ha a tenant-engine már be van töltve (`engines` Map), arra hívunk
+   *     shutdown-ot – ez a leggyakoribb (folyamatos snapserver-rel).
+   *  2. Ha nincs engine (sosem volt play() hívás), de a snapPort már ki van
+   *     osztva, akkor egy ad-hoc engine-példányt csinálunk csak a cleanup-hoz
+   *     (PM2 stop + config/FIFO unlink). A `init()` NEM fut, csak `shutdown()`.
+   */
+  async dispose(tenantId: string): Promise<void> {
+    const loaded = this.engines.get(tenantId);
+    if (loaded) {
+      await loaded.shutdown();
+      this.engines.delete(tenantId);
+      return;
+    }
+
+    const port = await this.getSnapPort(tenantId);
+    if (!port) {
+      // Nincs port → soha nem futott snapserver, nincs mit takarítani.
+      return;
+    }
+
+    // Ad-hoc engine: csak shutdown-ra, init() nélkül. Megpróbáljuk leállítani
+    // a (lehetséges) árva PM2 processt és törölni a config + FIFO fájlokat.
+    const ad = new TenantSnapEngine(tenantId, port);
+    await ad.shutdown();
   }
 }
 
