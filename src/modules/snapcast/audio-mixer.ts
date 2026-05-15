@@ -783,25 +783,27 @@ export class TenantAudioMixer extends EventEmitter {
       // ignore
     }
 
-    const resumeBytes =
-      (src.job.resumeBytes ?? 0) +
-      (src.fadeOutStart !== null ? src.fadeOutStart : src.bytesWritten);
+    // Resume-bytes: file/url forrás esetén a megszakítás pontján folytatjuk
+    // (ffmpeg -ss). Stream forrás esetén resumeBytes=0 – élő stream-et
+    // újra-csatlakozással folytatunk a live pozíción (az aktuális élő adás).
+    const isStream   = src.job.source.type === "stream";
+    const resumeBytes = isStream
+      ? 0
+      : (src.job.resumeBytes ?? 0)
+        + (src.fadeOutStart !== null ? src.fadeOutStart : src.bytesWritten);
 
-    if (src.job.source.type !== "stream") {
-      this.pausedStack.push({
-        job: src.job,
-        resumeBytes,
-        pausedAt: Date.now(),
-      });
+    this.pausedStack.push({
+      job: src.job,
+      resumeBytes,
+      pausedAt: Date.now(),
+    });
 
-      console.log(
-        `[Mixer:${this.tenantId}] ⏸ pause: ${src.job.jobType} @ ${(resumeBytes / BYTES_PER_SEC).toFixed(2)}s`
-      );
-    } else {
-      console.log(
-        `[Mixer:${this.tenantId}] ⏸→drop stream (nem seekelhető): ${src.job.jobType}`
-      );
-    }
+    console.log(
+      `[Mixer:${this.tenantId}] ⏸ pause: ${src.job.jobType}` +
+      (isStream
+        ? ` (stream → live resume)`
+        : ` @ ${(resumeBytes / BYTES_PER_SEC).toFixed(2)}s`)
+    );
 
     this.active = null;
 
