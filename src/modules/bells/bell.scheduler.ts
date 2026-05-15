@@ -18,6 +18,22 @@ const LOOKAHEAD_MS     = 90_000;
 const PREPARE_LEAD_MS  = 4_000;
 const MIN_FUTURE_MS    = 1_000;
 
+// A snapserver-be írt PCM byte fizikai megszólalási késleltetése +
+// az aktív alacsonyabb prio audio fade-out + post-fade gap helye:
+//   1000 ms fade-out (FADE_OUT_BYTES) +
+//    200 ms POST_FADE_GAP_MS +
+//   1000 ms PRE_SILENCE +
+//   ~200 ms ffmpeg warmup +
+//   1000 ms snapserver "[server] buffer" =
+//   ~3400 ms (felfelé kerekítve 3200, hogy ne legyen TOO LATE bell).
+//
+// Ezzel a bell ffmpeg-start a bellMs - 1000ms-en történik, és a snapserver-
+// puffer után pontosan a bellMs-en hallhatóvá válik a chime. Az `applyTarget-
+// ingToClients` unmute is a source:start (= ffmpeg-start) eseményen fut, így
+// a kliens unmute akkor megy, amikor a snap-pipe-on már a bell PCM van –
+// a fade-out garantáltan lecsengett a snap-puffer 1 sec-es csúszása mellett.
+const SNAP_PIPE_LEAD_MS = 3_200;
+
 let _running = false;
 const _dispatched      = new Set<string>();
 const _pendingTimeouts = new Map<string, ReturnType<typeof setTimeout>[]>();
@@ -137,7 +153,10 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
     _dispatched.add(dispatchKey);
 
     const prepareDelay = Math.max(0, waitMs - PREPARE_LEAD_MS);
-    const snapDelay    = Math.max(0, waitMs);
+    // SNAP_PIPE_LEAD_MS-szel előbb indítunk a mixer-be, hogy a PRE_SILENCE +
+    // ffmpeg warmup + snapserver buffer késleltetés után pontosan a bellMs-en
+    // szólaljon meg a chime – szinkron a kliens HUD/unmute idővel.
+    const snapDelay    = Math.max(0, waitMs - SNAP_PIPE_LEAD_MS);
     const commandId    = randomUUID();
     const audioUrl     = `https://api.schoollive.hu/audio/bells/${bell.soundFile}`;
     const soundPath    = path.join(process.cwd(), "audio", "bells", bell.soundFile);

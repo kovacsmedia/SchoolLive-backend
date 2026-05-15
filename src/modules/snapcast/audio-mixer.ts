@@ -340,16 +340,17 @@ export class TenantAudioMixer extends EventEmitter {
   //
   // A pending fázis alatt nincs aktív forrás, így a háttér silence ffmpeg
   // subprocess automatikusan írja a csendet a FIFO-ra (real-time, a Node
-  // main loop-tól függetlenül). A source:start event ITT tüzel, hogy a
-  // snapcast.service.ts célzási retry-jei (0/500/1500 ms) mind a csend
-  // alatt fussanak le, mielőtt a tényleges PCM elkezdődik.
+  // main loop-tól függetlenül).
+  //
+  // NOTE: a `source:start` event a `startSource`-on tüzel, NEM itt – így a
+  // `applyTargetingToClients` (snap-szerver-side mute/unmute) a tényleges
+  // PCM-start időpontján fut. Korábban a PRE_SILENCE elején tüzelt, ami a
+  // fade-out közben (1 sec snap-buffer-csúszás miatt) hallhatóvá tette az
+  // előző (alacsonyabb prio) forrás végét a célzott klienseken az unmute
+  // pillanatán. Mostantól az unmute akkor megy ki, amikor a snap-pipe-on
+  // már a bell/üzenet PCM kezdődik – a fade-out garantáltan lecsengett a
+  // kliens-snap-pufferben.
   private beginPendingStart(job: MixerJob): void {
-    this.emit("source:start", {
-      jobId: job.id,
-      jobType: job.jobType,
-      title: job.title,
-    });
-
     console.log(
       `[Mixer:${this.tenantId}] ⏳ pre-silence ${PRE_SILENCE_MS}ms: ${job.jobType} | ${this.desc(job)}`
     );
@@ -569,6 +570,18 @@ export class TenantAudioMixer extends EventEmitter {
     //
     // A first chunk event utáni SIGSTOP atomic, és csak akkor fut, amikor
     // a job-ffmpeg már garantáltan ír.
+
+    // source:start event – a snapcast.service.ts ezzel triggereli a célzott
+    // mute/unmute RPC-ket. SZÁNDÉKOSAN a PRE_SILENCE UTÁN, a tényleges
+    // PCM-start időpontján: így a kliens-snap-cliens unmute-ja akkor megy
+    // ki, amikor a pipe-on már a job (nem az előző fade-out) PCM-je van –
+    // a snap-buffer 1 sec-es csúszása mellett is csendet hall a kliens
+    // az unmute előtt, nem az előző alacsonyabb prio fade-out végét.
+    this.emit("source:start", {
+      jobId:   job.id,
+      jobType: job.jobType,
+      title:   job.title,
+    });
 
     const args = this.buildFfmpegArgs(job);
 
