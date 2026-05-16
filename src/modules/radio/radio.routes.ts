@@ -602,11 +602,14 @@ router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Re
       return res.status(400).json({ error: "url-nek http(s) URL-nek kell lennie" });
     }
 
-    // streamVolume: 0..10 frontendről → 0..1 lineáris az ffmpeg-nek.
-    // Ha hiányzik vagy érvénytelen → undefined (no pre-gain → eredeti hangerő).
-    const sv = (typeof streamVolume === "number" && streamVolume >= 0 && streamVolume <= 10)
-      ? streamVolume / 10
-      : undefined;
+    // streamVolume: 0..10 frontendről → dB-mapped live radio gain.
+    // A live gain a TenantAudioMixer-en (`setRadioGain`) él, és a stream
+    // közben is állítható (`PUT /radio/stream-volume`). Ezért NEM ffmpeg
+    // pre-gain-en megy ki – itt csak az induló értéket állítjuk be.
+    const sliderInit: number | null = (typeof streamVolume === "number"
+      && streamVolume >= 0 && streamVolume <= 10)
+      ? streamVolume
+      : null;
 
     const { SnapcastService } = await import("../snapcast/snapcast.service");
     const { SyncEngine }      = await import("../../sync/SyncEngine");
@@ -634,10 +637,15 @@ router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Re
       // vagy egy "play-now" fájl), azt SIGKILL-lel azonnal megszakítjuk,
       // és nem queue-ba tesszük az újat. A user-élmény: ▶ kattintásra
       // a régi rögtön némul, az új azonnal indul.
+      // Live radio gain az induló slider-értékre (ha érkezett).
+      if (sliderInit !== null) {
+        await SnapcastService.setRadioVolume(tid(req), sliderInit);
+      }
+
       await SnapcastService.stopRadio(tid(req));
       await SnapcastService.play({
         type:              "RADIO",
-        source:            { type: "stream", url: url.trim(), volume: sv },
+        source:            { type: "stream", url: url.trim() },
         tenantId:          tid(req),
         title:             title?.trim() || "Internetrádió",
         deviceIdsToUnmute: candidateIds,
@@ -667,6 +675,29 @@ router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Re
   }
 });
 
+// PUT /radio/stream-volume – live radio hangerő-állítás stream közben.
+// A frontend slider onChange-elése (debouncolt) hívja, és a változás
+// azonnal érvényesül a következő PCM chunk-tól. A snapserver ~1 sec
+// puffere miatt a klienseken kb. 1 másodperc késéssel hallható.
+//
+// Body: { value: 0..10 } (0 = mute, 10 = 0 dB max, 1 = -24 dB, lépésenként
+//         ~-2.67 dB decibel-egyenletesen).
+router.put("/stream-volume", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const { value } = req.body ?? {};
+    if (typeof value !== "number" || !isFinite(value) || value < 0 || value > 10) {
+      return res.status(400).json({ error: "value 0..10 szám kell legyen" });
+    }
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    await SnapcastService.setRadioVolume(tid(req), value);
+    return res.json({ ok: true, value });
+  } catch (err: any) {
+    console.error("[RADIO/stream-volume] error:", err);
+    return res.status(500).json({ error: err?.message || "Failed to set stream volume" });
+  }
+});
+
 // POST /radio/files/:id/play-now – azonnali lejátszás egy meglévő RadioFile-ból
 // (a frontend "Azonnali lejátszás" gombja ezt hívja, scheduling helyett).
 router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, res: Response) => {
@@ -674,10 +705,12 @@ router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, 
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
     const fileId = paramId(req);
     const { targetType = "ALL", targetId, streamVolume } = req.body ?? {};
-    // streamVolume: 0..10 → 0..1 (lásd /play-stream kommentet).
-    const sv = (typeof streamVolume === "number" && streamVolume >= 0 && streamVolume <= 10)
-      ? streamVolume / 10
-      : undefined;
+    // streamVolume: 0..10 frontendről → induló live radio gain.
+    // A futás közbeni állítás a `PUT /radio/stream-volume` endpoint-on át megy.
+    const sliderInit: number | null = (typeof streamVolume === "number"
+      && streamVolume >= 0 && streamVolume <= 10)
+      ? streamVolume
+      : null;
 
     const file = await prisma.radioFile.findFirst({
       where:  { id: fileId, tenantId: tid(req) },
@@ -705,12 +738,17 @@ router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, 
 
     const snapOnline = await SnapcastService.isSnapserverOnline(tid(req));
     if (snapOnline) {
+      // Live radio gain az induló slider-értékre (ha érkezett).
+      if (sliderInit !== null) {
+        await SnapcastService.setRadioVolume(tid(req), sliderInit);
+      }
+
       // Auto-stop: ha bármi RADIO forrás (netrádió vagy másik play-now)
       // szól, azt azonnal megszakítjuk, és nem queue-ba tesszük az újat.
       await SnapcastService.stopRadio(tid(req));
       await SnapcastService.play({
         type:              "RADIO",
-        source:            { type: "url", url: file.fileUrl, volume: sv },
+        source:            { type: "url", url: file.fileUrl },
         tenantId:          tid(req),
         title:             file.originalName,
         deviceIdsToUnmute: candidateIds,

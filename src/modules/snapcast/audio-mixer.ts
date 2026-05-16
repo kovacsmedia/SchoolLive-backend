@@ -202,10 +202,27 @@ export class TenantAudioMixer extends EventEmitter {
   private running = false;
   private inGap = false;
 
+  // Live radio gain (0..1 lineáris). A frontend slider az `setRadioGain`-en
+  // át bármikor módosítja, és a köv. PCM chunk-tól érvényesül RADIO típusú
+  // forrásokra. Default 1.0 (= 0 dB, max). A snapserver puffer (~1 sec)
+  // miatt a változás kb. 1 másodperc késéssel hallható a klienseken.
+  private radioGain: number = 1.0;
+
   constructor(tenantId: string, fifoPath: string) {
     super();
     this.tenantId = tenantId;
     this.fifoPath = fifoPath;
+  }
+
+  /** Live radio gain beállítása (0..1 lineáris). Csak RADIO típusú forrásra
+   *  hat – BELL/TTS bemondások mindig saját skálán mennek (max-loud chain). */
+  setRadioGain(gain: number): void {
+    this.radioGain = Math.max(0, Math.min(1, gain));
+  }
+
+  /** Aktuális radio gain lekérdezése (debug / status). */
+  getRadioGain(): number {
+    return this.radioGain;
   }
 
   // ── Életciklus ──────────────────────────────────────────────────────────
@@ -637,9 +654,15 @@ export class TenantAudioMixer extends EventEmitter {
         this.pauseSilence();
       }
 
-      const gain = this.computeGain(src, chunk.length);
+      // Effektív gain = fade-gain × (RADIO esetén) live radioGain.
+      // A `radioGain` futás közben módosítható (lásd `setRadioGain`), így a
+      // frontend slider azonnal hat a már szóló streamre is. A snap-szerver
+      // ~1 sec buffer-je miatt a változás ~1s késéssel hallható a klienseken.
+      const fadeGain = this.computeGain(src, chunk.length);
+      const liveGain = src.job.jobType === "RADIO" ? this.radioGain : 1.0;
+      const gain     = fadeGain * liveGain;
 
-      if (gain < 1) {
+      if (gain !== 1) {
         this.applyGain(chunk, gain);
       }
 
@@ -959,46 +982,52 @@ export class TenantAudioMixer extends EventEmitter {
     const seek = resumeSec > 0.5 ? ["-ss", resumeSec.toFixed(3)] : [];
 
     /*
-     * Broadcast-style audio processing chain (opt-in).
+     * Per-jobType audio processing:
      *
-     * A jelen állapotban DEFAULT KIKAPCSOLVA, mert a `loudnorm` filter
-     * single-pass módban dinamikus belső buffer adagolást végez (FFT-alapú
-     * loudness analízis 3 másodperces ablakkal), ami időnként nem pontosan
-     * 20 ms-os chunk-okat ad ki - ez minden ~2 másodpercben 100-120 ms-os
-     * jittert okozott a klienseken (RESYNCING HARD 2: age -99..-119ms).
+     *   BELL / TTS  (bemondás / csengő – "announcement"):
+     *     Cél: a snap pipe-on MAXIMUM amplitúdón szóljanak, hogy a háttér-
+     *     zenénél észrevehetően dominánsabbak legyenek. A `loudnorm` filtert
+     *     SZÁNDÉKOSAN nem használjuk (single-pass módban timing-jittert
+     *     okozott), helyette egyszerű compressor + makeup gain + brick-wall
+     *     limiter. Sub-ms processing latency, nem zavarja a snap-szerver
+     *     ütemezését.
      *
-     * Bekapcsolás: BACKEND_ENABLE_NORMALIZE=1 env változó. Ekkor egy
-     * egyszerűbb chain fut, ami nem tartalmazza a problémás loudnorm-ot:
+     *       acompressor: threshold=-22dB, ratio=4, attack=10ms, release=180ms,
+     *                    makeup=+6dB (a teljes signal-szint emelése)
+     *       alimiter:    limit=0.97 (-0.26 dBFS), megakadályozza a klippeing-et
      *
-     *   acompressor = threshold:-18dB ratio:4 attack:20ms release:250ms
-     *     Dinamikus tartomány tömörítés. A halk passzázsokat kiemeli,
-     *     a hangosakat tompítja.
+     *   RADIO  (netrádió / háttérzene):
+     *     A hangerő-szabályzás NEM ffmpeg pre-gain-en megy (mert az nem
+     *     módosítható futás közben az ffmpeg újraindítása nélkül), hanem
+     *     a `this.radioGain` mező alapján a chunk-write step-ben (`computeGain`
+     *     × `radioGain`). Így a frontend slider azonnal hat a már szóló
+     *     streamre. Lásd: `setRadioGain`.
      *
-     *   alimiter = level_in:1 level_out:1 limit:0.95
-     *     Brick-wall peak limiter -0.45 dBFS ceiling-gel. Az Opus encoder
-     *     előtt megakadályozza a clipping-et.
-     *
-     * Ez a két filter csekély (sub-ms) processing latency-vel jár, így
-     * nem zavarja a snap szerver oldali ütemezést.
-     *
-     * A loudness normalizációt (EBU R128 / -16 LUFS) később adjuk vissza,
-     * amikor megoldjuk a timing jitter problémát (pl. két-passos offline
-     * normalizációval a hangfájlok feltöltésekor, vagy más megközelítéssel).
+     *     A `source.volume` mező is működik per-call pre-gain-ként, de ez
+     *     legacy (a slider már a setRadioGain-en megy). Ha explicit
+     *     source.volume = X érkezik a play() hívásban, azt is alkalmazzuk
+     *     (kompatibilitás miatt), de a live slider-állítás felülírja.
      */
-    const AUDIO_NORMALIZE_FILTER =
-      "acompressor=threshold=-18dB:ratio=4:attack=20:release=250," +
-      "alimiter=level_in=1:level_out=1:limit=0.95";
+    const ANNOUNCEMENT_FILTER =
+      "acompressor=threshold=-22dB:ratio=4:attack=10:release=180:makeup=6," +
+      "alimiter=level_in=1:level_out=1:limit=0.97";
 
-    // Forrás-szintű pre-gain (csak ha explicit meg van adva). A `volume=`
-    // filter értéke 0..1 lineáris, és a snapserver felé NEM küldi tovább,
-    // csak a saját ffmpeg stream-jét gyengíti/erősíti. Default érték: 1
-    // (= nincs change). Ha 0, néma stream (de a job lefut).
-    const v = typeof src.volume === "number" ? Math.max(0, Math.min(1, src.volume)) : null;
-    const preGain = v !== null && v !== 1 ? `volume=${v.toFixed(2)}` : null;
+    // Forrás-szintű pre-gain (volume= ffmpeg filter, csak ha explicit
+    // source.volume van megadva). RADIO esetén a live `radioGain` mező
+    // a futtatható szabályzó (nem itt, hanem a chunk-write step-ben).
+    const explicitVolume = typeof src.volume === "number"
+      ? Math.max(0, Math.min(2, src.volume))
+      : null;
+    const preGain = explicitVolume !== null && explicitVolume !== 1
+      ? `volume=${explicitVolume.toFixed(2)}`
+      : null;
 
     const chain: string[] = [];
     if (preGain) chain.push(preGain);
-    if (process.env.BACKEND_ENABLE_NORMALIZE === "1") chain.push(AUDIO_NORMALIZE_FILTER);
+    if (job.jobType === "BELL" || job.jobType === "TTS") {
+      // Bemondás/csengő: max-loud chain a snap pipe-on.
+      chain.push(ANNOUNCEMENT_FILTER);
+    }
 
     const audioFilter = chain.length > 0 ? ["-af", chain.join(",")] : [];
 

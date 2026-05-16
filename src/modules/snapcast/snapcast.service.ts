@@ -47,6 +47,35 @@ const CHANNELS = 2;
 
 const httpPort = (snapPort: number) => snapPort + 1000;
 
+/**
+ * Frontend slider (0..10) → lineáris audio gain.
+ *
+ * Decibel-egyenletes mapping:
+ *   slider=10 → 0 dB    (gain = 1.000, max amplitúdó)
+ *   slider=9  → -4 dB   (gain ≈ 0.631)
+ *   slider=8  → -8 dB   (gain ≈ 0.398)
+ *   slider=7  → -12 dB  (gain ≈ 0.251)
+ *   slider=6  → -16 dB  (gain ≈ 0.158)
+ *   slider=5  → -20 dB  (gain = 0.100)
+ *   slider=4  → -24 dB  (gain ≈ 0.063)
+ *   slider=3  → -28 dB  (gain ≈ 0.040)
+ *   slider=2  → -32 dB  (gain ≈ 0.025)
+ *   slider=1  → -36 dB  (gain ≈ 0.016)
+ *   slider=0  → mute    (gain = 0)
+ *
+ * A -36 dB-es alsó limit szándékos: ez a klasszikus PA-rendszer alsó
+ * határa, amin alul a háttérzene gyakorlatilag csendnek érződik (~1/64
+ * amplitúdó), de a bemondás max-loud láncon át tisztán hallható.
+ * 4 dB/lépés egyenletes osztás → auditívan szabályos lépcsőzet.
+ */
+function sliderToLinearGain(slider: number): number {
+  if (!Number.isFinite(slider) || slider <= 0) return 0;
+  if (slider >= 10) return 1;
+  // dB = (slider - 10) × (36/9) = (slider - 10) × 4, gain = 10^(dB/20)
+  const db = (slider - 10) * 4;
+  return Math.pow(10, db / 20);
+}
+
 // ── Per-tenant engine ───────────────────────────────────────────────────────
 
 class TenantSnapEngine {
@@ -368,6 +397,15 @@ class TenantSnapEngine {
 
   stopByType(type: SnapJobType): void {
     this.mixer?.stopByType(type as MixerJobType);
+  }
+
+  /** Live radio gain forwarding a TenantAudioMixer-be. */
+  setRadioGain(gain: number): void {
+    this.mixer?.setRadioGain(gain);
+  }
+
+  getRadioGain(): number {
+    return this.mixer?.getRadioGain() ?? 1.0;
   }
 
   // ── Eseményekre reagálás ────────────────────────────────────────────────
@@ -701,6 +739,28 @@ class SnapcastServiceClass {
 
   getAllStatus() {
     return [...this.engines.values()].map((e) => e.getStatus());
+  }
+
+  /**
+   * Live rádió hangerő beállítása sliderről (0..10 skála). A mapping
+   * logaritmikus, decibel-egyenletes:
+   *   • slider = 10 → 0 dB    (gain = 1.0,   max)
+   *   • slider = 1  → -36 dB  (gain ≈ 0.016)
+   *   • slider = 0  → mute    (gain = 0)
+   * 9 lépés között egyenletes -4 dB osztás.
+   *
+   * A változás közvetlenül a következő PCM chunk-ra hat, így stream közben
+   * is állítható. A snapserver puffer (~1 sec) miatt a klienseken kb.
+   * 1 másodperc késéssel hallható.
+   *
+   * Csak RADIO típusú forrásokra hat – a BELL/TTS bemondások saját
+   * max-loud láncon mennek.
+   */
+  async setRadioVolume(tenantId: string, slider: number): Promise<void> {
+    const eng = await this.getEngine(tenantId);
+    if (!eng) return;
+    const gain = sliderToLinearGain(slider);
+    eng.setRadioGain(gain);
   }
 
   /**
