@@ -161,6 +161,20 @@ export async function createDeviceCommand(req: Request, res: Response) {
     },
   });
 
+  // WebSocket-en is azonnal kiküldjük a parancsot a célzott eszköznek.
+  // A Linux/Windows/ESP kliensek a `/devices/poll`-on úgyis észlelik (DB),
+  // így ez számukra ártalmatlan duplikáció (a WS-action-üket egyébként
+  // sem dolgozzák fel: SET_VOLUME/MUTE-ra nincs WS handler).
+  // Az Android kliens viszont NEM poll-oz, csak WS-en kommunikál → eddig
+  // nem kapta meg a SET_VOLUME/MUTE parancsokat → a slider és a némítás
+  // gomb nem hatott. A targeted broadcast ezt javítja.
+  try {
+    const { SyncEngine } = await import("../../sync/SyncEngine");
+    SyncEngine.broadcastImmediate(user.tenantId!, payload, [deviceId]);
+  } catch (e) {
+    console.error(`[device-command] WS broadcast hiba (${deviceId}):`, e);
+  }
+
   res.status(201).json(command);
 }
 
