@@ -113,6 +113,14 @@ export interface MixerJob {
   // Opcionális per-job fade-in. Ha nincs megadva: stream forrásra 1 sec,
   // egyébként 0 (azonnal teljes amplitúdóval szól – chime, üzenet).
   fadeInMs?: number;
+  // Forrás-csere után újraindul-e ez a job (paused stack-ből). Ezt a flag-et
+  // a `source:start` event-en továbbítjuk a service-nek, ami eldönti, hogy
+  // NOW_PLAYING_INFO-t küldjön (új lejátszás) vagy STOP+PREPARE+PLAY-t
+  // (resume → fresh playback a klienseken). A user-request:
+  //   "Az üzenet után stop-ot küldhetünk a klienseknek, és a play resume-t
+  //    új lejátszásként elindítani"
+  // Ez tisztább state-management a klienseken (nincs ragadt _snap_muted).
+  isResume?: boolean;
 }
 
 export type SourceEndReason = "done" | "interrupted" | "error" | "stopped";
@@ -578,9 +586,10 @@ export class TenantAudioMixer extends EventEmitter {
     // a snap-buffer 1 sec-es csúszása mellett is csendet hall a kliens
     // az unmute előtt, nem az előző alacsonyabb prio fade-out végét.
     this.emit("source:start", {
-      jobId:   job.id,
-      jobType: job.jobType,
-      title:   job.title,
+      jobId:    job.id,
+      jobType:  job.jobType,
+      title:    job.title,
+      isResume: job.isResume === true,
     });
 
     const args = this.buildFfmpegArgs(job);
@@ -912,9 +921,18 @@ export class TenantAudioMixer extends EventEmitter {
     if (top) {
       this.pausedStack.pop();
 
+      // Resume: 500ms-os lágy fade-in (a stream-resume már 1s-os default-tal
+      // megy, a file-resume eddig 0-val indult – ez okozta a "hirtelen
+      // megszólalás" érzést a user-request szerint). Explicit fadeInMs
+      // override marad, ha valaki kézzel állította.
+      // isResume=true → source:start eseményen jelezzük a service-nek, hogy
+      // STOP+PREPARE+PLAY-vel dispatchelje a klienseket fresh playback-ként.
+      const RESUME_FADE_IN_MS = 500;
       this.beginPendingStart({
         ...top.job,
         resumeBytes: top.resumeBytes,
+        fadeInMs:    top.job.fadeInMs ?? RESUME_FADE_IN_MS,
+        isResume:    true,
       });
 
       return;

@@ -64,12 +64,19 @@ class TenantSnapEngine {
   private jobTargets = new Map<string, string[] | undefined>();
 
   // STOP_PLAYBACK broadcast késleltetése a snap drain idejére: a `source:end`
-  // event után 1.5 sec-cel megy ki, hogy a kliens snap puffere lejátssza a
-  // hang végét MIELŐTT a Linux/Windows app.py snap-restart-ot triggerelne.
+  // event után ennyivel megy ki, hogy a kliens snap puffere lejátssza a hang
+  // végét MIELŐTT a Linux/Windows app.py snap-restart-ot triggerelne.
   // Ha közben új forrás indul (source:start), törlődik – csak forrás-csere
   // történt, nem teljes stop, a HUD-ot a NOW_PLAYING_INFO frissíti.
+  //
+  // A 3000ms safety margin van a queue-/pausedStack-resume-okra: a mixer
+  // `POST_SILENCE_MS=500 + PRE_SILENCE_MS=1000 = 1500ms` időt vesz fel egy
+  // resume elindításához. Ha a STOP timer is 1500ms volt, race volt a kettő
+  // között → STOP broadcast ment ki radio-resume közben, a kliens snapclient
+  // restart-tal válaszolt → ~0.5s audio gap. 3000ms-szel mindig az `advance`
+  // és `startSource` után fut (akkor m.current már beállt → guard catches).
   private stopBroadcastTimer: NodeJS.Timeout | null = null;
-  private static readonly STOP_BROADCAST_DELAY_MS = 1500;
+  private static readonly STOP_BROADCAST_DELAY_MS = 3000;
 
   constructor(tenantId: string, snapPort: number) {
     this.tenantId = tenantId;
@@ -365,31 +372,103 @@ class TenantSnapEngine {
 
   // ── Eseményekre reagálás ────────────────────────────────────────────────
 
-  private onSourceStart(e: { jobId: string; jobType: MixerJobType }): void {
+  private onSourceStart(e: {
+    jobId: string;
+    jobType: MixerJobType;
+    isResume?: boolean;
+  }): void {
     const targets = this.jobTargets.get(e.jobId);
 
     // Forrás-csere: ha volt pending STOP_PLAYBACK broadcast a snap drainből,
-    // töröljük – nem áll meg a stream, csak váltunk forrást, a kliens
-    // HUD-ot a NOW_PLAYING_INFO frissíti.
+    // töröljük – nem áll meg a stream, csak váltunk forrást.
     if (this.stopBroadcastTimer) {
       clearTimeout(this.stopBroadcastTimer);
       this.stopBroadcastTimer = null;
     }
 
-    // HUD frissítés: az aktuális játszás info-ját a kliensekhez (Android,
-    // Linux, Windows). Az ESP DeviceAgent WS-en nincs, neki a dispatchSync
-    // route-okon át már megérkezett a HUD-state.
     const job = this.jobs.get(e.jobId);
     if (job) {
-      import("../../sync/SyncEngine").then(({ SyncEngine }) => {
-        SyncEngine.broadcastImmediate(this.tenantId, {
-          action:     "NOW_PLAYING_INFO",
-          commandId:  `${e.jobId}:start`,
-          title:      job.title ?? "",
-          jobType:    e.jobType,
-          sourceType: job.source.type,
-        });
-      }).catch(() => {});
+      const targetDeviceIds = this.jobTargets.get(e.jobId) ?? null;
+
+      // ── RESUME: fresh STOP + PREPARE+PLAY a klienseknek ──────────────────
+      //
+      // User-requested architektúra: az "üzenet után stop-ot küldünk a
+      // klienseknek, és a play resume-t új lejátszásként indítjuk". Ez
+      // tisztább, mert minden resume ugyanolyan PREPARE+PLAY flow-n megy
+      // át, mint a friss play, így a kliens-side `_snap_muted` és
+      // overlay-state nem ragad meg az előző forráson.
+      //
+      // Stream esetén ez úgyis stream-újranyitás (ffmpeg reconnect), file
+      // esetén a `resumeBytes` mellett az ffmpeg `-ss` szegmentálja a
+      // folytatást. Soft fade-in (500ms file, 1000ms stream) lágyan indul.
+      if (e.isResume) {
+        const url = (job.source as any).url as string | undefined;
+        const action: "TTS" | "PLAY_URL" | "BELL" =
+          e.jobType === "RADIO" ? "PLAY_URL" : (e.jobType as "TTS" | "BELL");
+
+        import("../../sync/SyncEngine").then(({ SyncEngine }) => {
+          // 1. Előző (interrupted) forrásból maradt HUD/lokális mute törlése.
+          SyncEngine.broadcastImmediate(this.tenantId, {
+            action:    "STOP_PLAYBACK",
+            commandId: `${e.jobId}:resume-stop`,
+            reason:    "resume",
+          });
+
+          // 2. Új lejátszás-ként dispatcheljük (PREPARE + PLAY). 200ms várás
+          //    hogy a STOP_PLAYBACK feldolgozása megtörténjen a kliensen
+          //    (overlay-clear, mute-reset), mielőtt a friss PREPARE módosít.
+          //    Ha a forrás URL hiányzik (pl. BELL file-source), fallback
+          //    NOW_PLAYING_INFO-ra.
+          setTimeout(() => {
+            if (!url) {
+              SyncEngine.broadcastImmediate(this.tenantId, {
+                action:           "NOW_PLAYING_INFO",
+                commandId:        `${e.jobId}:resume-info`,
+                title:            job.title ?? "",
+                text:             job.text,
+                jobType:          e.jobType,
+                sourceType:       job.source.type,
+                targetDeviceIds,
+              });
+              return;
+            }
+            SyncEngine.dispatchSync({
+              tenantId:        this.tenantId,
+              commandId:       `${e.jobId}:resume`,
+              action,
+              url,
+              text:            job.text,
+              title:           job.title,
+              targetDeviceIds: targetDeviceIds ?? undefined,
+              snapcastActive:  this.snapOnline,
+            }).catch(err =>
+              console.error(`[Snap:${this.snapPort}] resume dispatchSync hiba:`, err)
+            );
+          }, 200);
+        }).catch(() => {});
+      } else {
+        // ── NEM resume: NOW_PLAYING_INFO HUD-frissítés ─────────────────────
+        //
+        // Friss forrás-start: a route-szintű dispatchSync már elindított egy
+        // PREPARE+PLAY-t, ez csak HUD-meta (forrás-csere a snap-pipe-on).
+        //
+        // Több mező megy ki:
+        //   • title           – rövid kontextus (radio név, "Csengetés HH:MM",
+        //                       TTS első ~200 karaktere ékezetesen)
+        //   • text            – TTS-nél a TELJES felolvasandó szöveg
+        //   • targetDeviceIds – az aktuális forrás-célzás (null → ALL)
+        import("../../sync/SyncEngine").then(({ SyncEngine }) => {
+          SyncEngine.broadcastImmediate(this.tenantId, {
+            action:           "NOW_PLAYING_INFO",
+            commandId:        `${e.jobId}:start`,
+            title:            job.title ?? "",
+            text:             job.text,
+            jobType:          e.jobType,
+            sourceType:       job.source.type,
+            targetDeviceIds,
+          });
+        }).catch(() => {});
+      }
     }
 
     // Nem unmute-olunk vakon mindenkit.
@@ -425,7 +504,7 @@ class TenantSnapEngine {
       this.jobTargets.delete(e.jobId);
     }
 
-    // Késleltetett STOP_PLAYBACK broadcast: 1.5 sec késéssel megy ki, hogy a
+    // Késleltetett STOP_PLAYBACK broadcast: 3 sec késéssel megy ki, hogy a
     // kliens snap puffere lejátsza a hang utolsó pillanatait MIELŐTT a
     // Linux/Windows app.py snap-restart-ot indít. Ha közben új forrás indul
     // (source:start), a timer törlődik – nem áll le a stream, csak váltás.
@@ -434,9 +513,13 @@ class TenantSnapEngine {
     if (this.stopBroadcastTimer) clearTimeout(this.stopBroadcastTimer);
     this.stopBroadcastTimer = setTimeout(() => {
       this.stopBroadcastTimer = null;
-      // Védő ellenőrzés: ha közben elindult egy új forrás, ne küldjünk stopot.
+      // Védő ellenőrzés: ha közben elindult egy új forrás VAGY paused-stackből
+      // resume vár, ne küldjünk stopot. A `paused.length > 0` az pausedStack-
+      // beli radio resume-okat fedi – korábban csak current/pending volt
+      // figyelve, ami timing-race-be került a 1500ms STOP timer és a
+      // 500+1000=1500ms resume között.
       const m = this.mixer?.getStatus();
-      if (m && (m.current || m.pending)) return;
+      if (m && (m.current || m.pending || (m.paused && m.paused.length > 0))) return;
 
       import("../../sync/SyncEngine").then(({ SyncEngine }) => {
         SyncEngine.broadcastImmediate(this.tenantId, {

@@ -239,11 +239,14 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
     const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${filename}`;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
     const isImmediate   = !scheduledTime || scheduledTime <= new Date();
-    // Title: a TTS forrásszöveg első 64 karaktere ékezet nélkül.
-    // FIGYELEM: a Message.text mező (felolvasandó szöveg) MEGMARAD ékezetesen –
-    // azt a Piper TTS pontosan az ékezetek alapján mondja ki. Csak a `title`,
-    // ami a Now-Playing kijelzőre és a fájlnév-szerű kontextusra kerül, tisztul.
-    const title         = stripAccents(text.trim().substring(0, 64));
+    // Title: a TTS forrásszöveg első 200 karaktere, ÉKEZETESEN.
+    // Korábban `stripAccents(... 64)` volt, mert egy régi fájlnév-jellegű
+    // konvencióhoz volt kalibrálva. Mivel a `title` a HUD-overlay-en jelenik
+    // meg (NOW_PLAYING_INFO broadcast), a stripped 64-karakteres változat
+    // egyszerű forrás-csere után felülírta a kliens-oldali PLAY-helyzetben
+    // mutatott teljes ékezetes szöveget. A Message DB-mező továbbra is külön
+    // tárolódik (text), a title csak rövid kontextus a HUD-on.
+    const title         = text.trim().substring(0, 200);
 
     const message = await prisma.message.create({
       data: {
