@@ -993,10 +993,14 @@ export class TenantAudioMixer extends EventEmitter {
      *     timing-jittert okozott), helyette egyszerű compressor + makeup
      *     gain + brick-wall limiter. Sub-ms processing latency.
      *
-     *     Egy fokozattal gyengébb a korábbi (-22/4/+6/limit=0.97) chain-nél:
-     *       acompressor: threshold=-20dB (kevésbé érzékeny), ratio=3
-     *                    (lágyabb tömörítés), makeup=+4dB (kisebb boost)
-     *       alimiter:    limit=0.95 (-0.45 dBFS), preventív clipping-stop
+     *     "Transparent leveling" – csak a legnagyobb csúcsokat fogja, soft
+     *     knee, minimális makeup → nincs hallható kompresszor-artefakt /
+     *     pumping. A TTS rendered fájl már -12 LUFS-en van, itt csak
+     *     egyenletesítjük a dinamikát + brick-wall limiter biztonsági okból.
+     *       acompressor: threshold=-12dB (csak a hangos csúcsok), ratio=2
+     *                    (alig kompresszál), knee=4dB (soft transition),
+     *                    makeup=+2dB (alig boost), slow attack=20ms
+     *       alimiter:    limit=0.97 (-0.26 dBFS), klipping-stop
      *
      *   RADIO  (netrádió / háttérzene):
      *     A hangerő-szabályzás NEM ffmpeg pre-gain-en megy (mert az nem
@@ -1012,8 +1016,8 @@ export class TenantAudioMixer extends EventEmitter {
      *     (kompatibilitás miatt), de a live slider-állítás felülírja.
      */
     const ANNOUNCEMENT_FILTER =
-      "acompressor=threshold=-20dB:ratio=3:attack=10:release=180:makeup=4," +
-      "alimiter=level_in=1:level_out=1:limit=0.95";
+      "acompressor=threshold=-12dB:ratio=2:attack=20:release=200:knee=4:makeup=2," +
+      "alimiter=level_in=1:level_out=1:limit=0.97";
 
     // Forrás-szintű pre-gain (volume= ffmpeg filter, csak ha explicit
     // source.volume van megadva). RADIO esetén a live `radioGain` mező
