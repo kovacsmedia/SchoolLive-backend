@@ -415,6 +415,24 @@ router.post("/stop-all", authJwt, requireTenant, async (req: Request, res: Respo
   }
 });
 
+// GET /radio/snap-playing
+// A snap-mixer ÉLŐ állapotából adja vissza, hogy épp megy-e RADIO a tenant
+// snap-pipe-ján. Akkor is "playing"-et jelez, ha pillanatnyilag egy bell/TTS
+// megszakította a rádiót (pausedStack-en van) – tehát a "rádiózunk éppen?"
+// kérdésre helyes választ ad oldal-újratöltés / másik user login után is.
+//
+// Válasz: { ok, playing: { name, source: "stream"|"file" } | null }
+router.get("/snap-playing", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    const playing = SnapcastService.getRadioPlaying(tid(req));
+    return res.json({ ok: true, playing });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to fetch snap-playing state" });
+  }
+});
+
 // GET /radio/now-playing
 router.get("/now-playing", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {

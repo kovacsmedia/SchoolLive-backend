@@ -621,6 +621,39 @@ class TenantSnapEngine {
   }
 
   /**
+   * Aktív vagy paused RADIO forrás info – a frontend SchoolRadio
+   * "now-playing" panelhez. Három állapotból bármelyik visszaad RADIO-t:
+   *   1. mixer.current.jobType === "RADIO" (épp szól)
+   *   2. mixer.pending.jobType === "RADIO" (pre-silence-ben, mindjárt szól)
+   *   3. mixer.pausedStack tartalmaz RADIO-t (épp megszakította egy bell/TTS,
+   *      utána folytatódik)
+   * Így page-reload / másik kliens login után is látszik, hogy mit játszik
+   * a rádió – nem kell user-session-ben tartani.
+   */
+  getActiveOrPausedRadio(): { name: string; source: "stream" | "file" } | null {
+    const m = this.mixer?.getStatus();
+    if (!m) return null;
+
+    const isRadio = (jt?: string) => jt === "RADIO";
+    const radioActive =
+      isRadio(m.current?.jobType) ||
+      isRadio(m.pending?.jobType) ||
+      m.paused.some(p => isRadio(p.jobType));
+    if (!radioActive) return null;
+
+    // jobs map-ben keressünk RADIO-t (rendszerint csak egy van egyszerre)
+    for (const [, job] of this.jobs.entries()) {
+      if (job.jobType !== "RADIO") continue;
+      const sourceType = job.source.type === "stream" ? "stream" : "file";
+      return {
+        name:   job.title ?? "Iskolarádió",
+        source: sourceType,
+      };
+    }
+    return null;
+  }
+
+  /**
    * Tenant teljes shutdown: mixer leállítása, pm2 snapserver stop+delete,
    * config + FIFO unlink. Tenant hard-delete-ekor hívandó.
    *
@@ -764,6 +797,15 @@ class SnapcastServiceClass {
 
   getAllStatus() {
     return [...this.engines.values()].map((e) => e.getStatus());
+  }
+
+  /**
+   * Aktív (vagy paused) RADIO forrás a tenant snap-pipe-ján.
+   * Lásd a TenantSnapEngine megfelelő metódusát a részletekért.
+   * Null ha nincs RADIO szólalóban / queue-ban.
+   */
+  getRadioPlaying(tenantId: string): { name: string; source: "stream" | "file" } | null {
+    return this.engines.get(tenantId)?.getActiveOrPausedRadio() ?? null;
   }
 
   /**
