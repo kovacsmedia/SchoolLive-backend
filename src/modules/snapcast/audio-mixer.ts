@@ -985,23 +985,26 @@ export class TenantAudioMixer extends EventEmitter {
      * Per-jobType audio processing:
      *
      *   BELL / TTS  (bemondás / csengő – "announcement"):
-     *     Cél: a snap pipe-on MAXIMUM amplitúdón szóljanak, hogy a háttér-
-     *     zenénél észrevehetően dominánsabbak legyenek. A `loudnorm` filtert
-     *     SZÁNDÉKOSAN nem használjuk (single-pass módban timing-jittert
-     *     okozott), helyette egyszerű compressor + makeup gain + brick-wall
-     *     limiter. Sub-ms processing latency, nem zavarja a snap-szerver
-     *     ütemezését.
+     *     Cél: a snap pipe-on dominánsabb amplitudón szóljanak, hogy a
+     *     háttérzenénél (rádió, amit a radioGain slider eltunkol) észre-
+     *     vehetőek legyenek. NEM kényszerítjük max-amplitudóra (= a
+     *     korábbi +6 dB makeup túl agresszív volt), csak közelítjük.
+     *     A `loudnorm` filter SZÁNDÉKOSAN nincs (single-pass módban
+     *     timing-jittert okozott), helyette egyszerű compressor + makeup
+     *     gain + brick-wall limiter. Sub-ms processing latency.
      *
-     *       acompressor: threshold=-22dB, ratio=4, attack=10ms, release=180ms,
-     *                    makeup=+6dB (a teljes signal-szint emelése)
-     *       alimiter:    limit=0.97 (-0.26 dBFS), megakadályozza a klippeing-et
+     *     Egy fokozattal gyengébb a korábbi (-22/4/+6/limit=0.97) chain-nél:
+     *       acompressor: threshold=-20dB (kevésbé érzékeny), ratio=3
+     *                    (lágyabb tömörítés), makeup=+4dB (kisebb boost)
+     *       alimiter:    limit=0.95 (-0.45 dBFS), preventív clipping-stop
      *
      *   RADIO  (netrádió / háttérzene):
      *     A hangerő-szabályzás NEM ffmpeg pre-gain-en megy (mert az nem
      *     módosítható futás közben az ffmpeg újraindítása nélkül), hanem
      *     a `this.radioGain` mező alapján a chunk-write step-ben (`computeGain`
      *     × `radioGain`). Így a frontend slider azonnal hat a már szóló
-     *     streamre. Lásd: `setRadioGain`.
+     *     streamre. Tipikus használat: slider=7 (~-12 dB, "negyed hangerő")
+     *     a háttérzenéhez, slider=10 (0 dB, max) a hangos lejátszáshoz.
      *
      *     A `source.volume` mező is működik per-call pre-gain-ként, de ez
      *     legacy (a slider már a setRadioGain-en megy). Ha explicit
@@ -1009,8 +1012,8 @@ export class TenantAudioMixer extends EventEmitter {
      *     (kompatibilitás miatt), de a live slider-állítás felülírja.
      */
     const ANNOUNCEMENT_FILTER =
-      "acompressor=threshold=-22dB:ratio=4:attack=10:release=180:makeup=6," +
-      "alimiter=level_in=1:level_out=1:limit=0.97";
+      "acompressor=threshold=-20dB:ratio=3:attack=10:release=180:makeup=4," +
+      "alimiter=level_in=1:level_out=1:limit=0.95";
 
     // Forrás-szintű pre-gain (volume= ffmpeg filter, csak ha explicit
     // source.volume van megadva). RADIO esetén a live `radioGain` mező
@@ -1025,7 +1028,7 @@ export class TenantAudioMixer extends EventEmitter {
     const chain: string[] = [];
     if (preGain) chain.push(preGain);
     if (job.jobType === "BELL" || job.jobType === "TTS") {
-      // Bemondás/csengő: max-loud chain a snap pipe-on.
+      // Bemondás/csengő: max-loud (de nem agresszív) chain a snap pipe-on.
       chain.push(ANNOUNCEMENT_FILTER);
     }
 

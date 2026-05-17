@@ -363,14 +363,39 @@ class TenantSnapEngine {
 
     if (clients.length === 0) return;
 
+    // A `rpcSetClientVolume` mindkét paramétert (percent + muted) ki KELL
+    // küldje a snap-RPC szabványa miatt – ezért nem írhatjuk csak a muted
+    // bitet. A trükk: az adott eszköz user-által-beállított volume-ját
+    // (Device.volume, 0..10 skála) használjuk percent-ként (×10 → 0..100).
+    // Így a unmute NEM hangosít maxra; csak elveszi a mute flag-et a
+    // user-beállította szinten. Ez egyezik a "kliens-volume = állandó"
+    // elvével: a snap-server-side RPC volume soha nem írja felül a
+    // user-szintet.
+    const { prisma } = await import("../../prisma/client");
+    const deviceIds  = clients.map((c: any) => String(c.id));
+    const devices    = await prisma.device.findMany({
+      where:  { tenantId: this.tenantId, id: { in: deviceIds } },
+      select: { id: true, volume: true },
+    });
+    const userPercentByDevice = new Map<string, number>();
+    for (const d of devices) {
+      const v = typeof d.volume === "number" ? d.volume : 5;
+      userPercentByDevice.set(d.id, Math.max(0, Math.min(100, v * 10)));
+    }
+    const userPercent = (deviceId: string): number =>
+      userPercentByDevice.get(deviceId) ?? 50; // unknown device → 50% default
+
     const wanted = new Set(deviceIdsToUnmute ?? []);
 
     if (wanted.size === 0) {
+      // Nincs explicit szűkítés → minden kliens unmute, saját user-volume-on
       await Promise.allSettled(
-        clients.map((c: any) => rpcSetClientVolume(port, c.id, 100, false))
+        clients.map((c: any) =>
+          rpcSetClientVolume(port, c.id, userPercent(c.id), false)
+        )
       );
 
-      console.log(`[Snap:${this.snapPort}] minden kliens unmute: ${clients.length}`);
+      console.log(`[Snap:${this.snapPort}] minden kliens unmute (user-volume): ${clients.length}`);
       return;
     }
 
@@ -380,14 +405,14 @@ class TenantSnapEngine {
         return rpcSetClientVolume(
           port,
           c.id,
-          shouldPlay ? 100 : 0,
+          shouldPlay ? userPercent(c.id) : 0,
           !shouldPlay
         );
       })
     );
 
     console.log(
-      `[Snap:${this.snapPort}] célzás beállítva: ${[...wanted].join(", ")}`
+      `[Snap:${this.snapPort}] célzás beállítva: ${[...wanted].join(", ")} (user-volume preserved)`
     );
   }
 
