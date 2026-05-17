@@ -27,6 +27,7 @@ const DEVICE_SELECT = {
   lastSeenAt: true,
   volume: true,
   muted: true,
+  syncOffsetMs: true,
   createdAt: true,
   orgUnitId: true,
   serialNumber: true,
@@ -62,6 +63,7 @@ router.get("/health", authJwt, requireTenant, async (req, res) => {
         : null,
       volume:      d.volume,
       muted:       d.muted,
+      syncOffsetMs: d.syncOffsetMs,
       createdAt:   d.createdAt,
       orgUnitId:   d.orgUnitId,
       serialNumber: d.serialNumber,
@@ -345,7 +347,7 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
     }
 
     const id = String(req.params.id).trim();
-    const { name, orgUnitId, volume, muted, hwModel } = req.body ?? {};
+    const { name, orgUnitId, volume, muted, hwModel, syncOffsetMs } = req.body ?? {};
 
     const existing = await prisma.device.findFirst({
       where: { id, tenantId: user.tenantId! },
@@ -358,8 +360,31 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
     if (typeof volume !== "undefined")    data.volume    = Math.min(10, Math.max(0, Number(volume)));
     if (typeof muted !== "undefined")     data.muted     = Boolean(muted);
     if (hwModel?.trim())                  data.hwModel   = hwModel.trim();
+    // syncOffsetMs: 10ms-os lépések, korlátozzuk -2000..+2000 ms között,
+    // hogy ne lehessen őrülten nagy érték (1 sec-es snap-buffer határa).
+    if (typeof syncOffsetMs !== "undefined") {
+      const n = Math.round(Number(syncOffsetMs) / 10) * 10;
+      data.syncOffsetMs = Math.max(-2000, Math.min(2000, n));
+    }
 
     const updated = await prisma.device.update({ where: { id }, data, select: DEVICE_SELECT });
+
+    // Ha a syncOffsetMs változott, azonnal pusholjuk a kliensnek WS-en,
+    // hogy a snap-sync-jét frissíthesse játszás közben is (újrakapcsolás
+    // nélkül). A SET_SYNC_OFFSET action a kliens-specifikus protokoll-bővítés.
+    if (typeof syncOffsetMs !== "undefined" && data.syncOffsetMs !== existing.syncOffsetMs) {
+      try {
+        const { SyncEngine } = await import("../../sync/SyncEngine");
+        SyncEngine.broadcastImmediate(
+          user.tenantId!,
+          { action: "SET_SYNC_OFFSET", offsetMs: data.syncOffsetMs },
+          [id],
+        );
+      } catch (e) {
+        console.error(`[device-patch] SET_SYNC_OFFSET WS hiba (${id}):`, e);
+      }
+    }
+
     return res.json({ ok: true, device: updated });
   } catch (err) {
     console.error(err);

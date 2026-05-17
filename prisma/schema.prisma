@@ -179,6 +179,13 @@ model Device {
   volume Int     @default(5)
   muted  Boolean @default(false)
 
+  // Manuális szinkron-eltolás ms-ben. A frontend Devices→Részletek overlay-en
+  // állítható, a kliens snapclient sync-jét tolja előre (+) vagy hátra (-)
+  // ms-ben. 10 ms-os lépések, tipikus tartomány: -500…+500. 0 = nincs offset.
+  // Cél: hallás-alapú finomhangolás az egyes eszközökön firmware-piszkálás
+  // nélkül.
+  syncOffsetMs Int @default(0)
+
   statusPayload Json?
 
   createdAt DateTime @default(now())

@@ -174,7 +174,32 @@ class SyncEngineClass {
     ws.on("error", (err: Error) => console.error(`[SyncEngine] WS hiba: ${deviceId}`, err.message));
 
     const nowMs = Date.now();
-    this.send(ws, { type: "HELLO", serverNow: new Date(nowMs).toISOString(), serverNowMs: nowMs, deviceId });
+
+    // HELLO payload bővítve: a kliens által megkövetelt syncOffsetMs is megy
+    // ki, hogy a snapclient sync-jét csatlakozáskor azonnal alkalmazni tudja
+    // (újraindítás nélkül). A futás közbeni változást a SET_SYNC_OFFSET
+    // action push-olja.
+    let syncOffsetMs = 0;
+    if (clientType === "esp32" && tenantId) {
+      try {
+        const { prisma } = await import("../prisma/client");
+        const dev = await prisma.device.findUnique({
+          where: { id: deviceId },
+          select: { syncOffsetMs: true },
+        });
+        if (dev) syncOffsetMs = dev.syncOffsetMs ?? 0;
+      } catch (e) {
+        console.warn(`[SyncEngine] syncOffsetMs lookup hiba (${deviceId}):`, e);
+      }
+    }
+
+    this.send(ws, {
+      type:         "HELLO",
+      serverNow:    new Date(nowMs).toISOString(),
+      serverNowMs:  nowMs,
+      deviceId,
+      syncOffsetMs,
+    });
   }
 
   private handleMessage(deviceId: string, tenantId: string, msg: any): void {
