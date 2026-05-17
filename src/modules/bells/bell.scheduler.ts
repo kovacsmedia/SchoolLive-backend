@@ -209,18 +209,33 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
       try {
         const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
         if (snapOnline) {
-          // Csengetést minden tenant-eszköz hallja → unmute mindenkinek
-          const allDeviceIds = (await prisma.device.findMany({
+          // CSAK az online (WS-csatlakozott) eszközöket targeteljük –
+          // ugyanúgy mint a `messages.routes.ts` TTS-streamindítási logika.
+          //
+          // Korábban itt `allDeviceIds` ment (minden tenant-eszköz, offline
+          // is). A `SnapcastService.play` belső `prepareClientsForPlayback`
+          // viszont az offline eszközökre 3 sec-ig várakozott (timeout),
+          // így a bell-audio 2 sec-cel KÉSŐN érkezett a klienseken a
+          // HUD-pillanathoz képest → "2 másodperces csuklás".
+          //
+          // Az offline eszközöknek úgyis a `prepareTimeout` (PREPARE-fázis)
+          // queue-z parancsot, ami a /devices/poll-on át megy ki nekik
+          // amint újra online-ak.
+          const allDevices = await prisma.device.findMany({
             where: { tenantId }, select: { id: true },
-          })).map(d => d.id);
+          });
+          const onlineIds = allDevices
+            .map(d => d.id)
+            .filter(id => SyncEngine.isDeviceOnline(id));
+
           await SnapcastService.play({
             type:               "BELL",
             source:             { type: "file", path: soundPath },
             tenantId,
             title:              `Csengetés ${bellTimeStr}`,
-            deviceIdsToUnmute:  allDeviceIds,
+            deviceIdsToUnmute:  onlineIds,
           });
-          console.log(`[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr}`);
+          console.log(`[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr} | ${onlineIds.length} online eszköz`);
         }
       } catch (e) {
         console.error(`[BELLS-SCHEDULER] Snap hiba (${bellTimeStr}):`, e);
