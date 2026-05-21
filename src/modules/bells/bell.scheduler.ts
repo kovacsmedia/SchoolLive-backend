@@ -246,17 +246,22 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
           );
         }
 
-        // CSAK az online (WS-csatlakozott) eszközöket targeteljük –
-        // ugyanúgy mint a `messages.routes.ts` TTS-streamindítási logika.
-        // Az offline eszközöknek a `prepareTimeout` (PREPARE-fázis) queue-z
-        // parancsot, ami a /devices/poll-on át megy ki nekik amint újra
-        // online-ak.
-        const allDevices = await prisma.device.findMany({
-          where: { tenantId }, select: { id: true },
+        // Snap-pipe targeting: a beacon-szinten online eszközök (Device.online=true).
+        // Ide TARTOZNAK az ESP-k is, akik snap-protokollon csatlakoznak NEM
+        // WebSocket-en – a `SyncEngine.isDeviceOnline` ezeket false-nak látja,
+        // pedig a snap-szerveren tisztán bekapcsolva vannak. Korábban itt
+        // `SyncEngine.isDeviceOnline` szűrt → ha bármely Android online volt,
+        // a `deviceIdsToUnmute` csak az androidot tartalmazta, és a snap-RPC
+        // a többi klienst (= ESP-ket) muted=true / volume=0-ra állította!
+        //
+        // A helyes szűrő a DB `Device.online` flag, amit a beacon-loop frissít
+        // (mind az Android, mind az ESP, mind a Linux/Windows pingeli).
+        // Ugyanaz a logika, mint a `/radio/play-stream` és `/messages` route-ban.
+        const onlineDevices = await prisma.device.findMany({
+          where:  { tenantId, online: true },
+          select: { id: true },
         });
-        const onlineIds = allDevices
-          .map(d => d.id)
-          .filter(id => SyncEngine.isDeviceOnline(id));
+        const onlineIds = onlineDevices.map(d => d.id);
 
         await SnapcastService.play({
           type:               "BELL",
