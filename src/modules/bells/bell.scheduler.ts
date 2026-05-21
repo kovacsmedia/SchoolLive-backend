@@ -246,32 +246,31 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
           );
         }
 
-        // Snap-pipe targeting: a beacon-szinten online eszközök (Device.online=true).
-        // Ide TARTOZNAK az ESP-k is, akik snap-protokollon csatlakoznak NEM
-        // WebSocket-en – a `SyncEngine.isDeviceOnline` ezeket false-nak látja,
-        // pedig a snap-szerveren tisztán bekapcsolva vannak. Korábban itt
-        // `SyncEngine.isDeviceOnline` szűrt → ha bármely Android online volt,
-        // a `deviceIdsToUnmute` csak az androidot tartalmazta, és a snap-RPC
-        // a többi klienst (= ESP-ket) muted=true / volume=0-ra állította!
+        // Csengetés MINDIG minden snap-csatlakozott klienshez megy → NEM adunk
+        // explicit `deviceIdsToUnmute`-ot. Az `applyTargetingToClients` ekkor
+        // az `if (wanted.size === 0)` ágon az ÖSSZES snap-szerverhez csatlakozott
+        // klienst (rpcListClients) a saját user-volume-jukon unmute-olja –
+        // függetlenül attól, hogy a kliens snap-client-id-je egyezik-e a
+        // DB.Device.id-vel.
         //
-        // A helyes szűrő a DB `Device.online` flag, amit a beacon-loop frissít
-        // (mind az Android, mind az ESP, mind a Linux/Windows pingeli).
-        // Ugyanaz a logika, mint a `/radio/play-stream` és `/messages` route-ban.
-        const onlineDevices = await prisma.device.findMany({
-          where:  { tenantId, online: true },
-          select: { id: true },
-        });
-        const onlineIds = onlineDevices.map(d => d.id);
-
+        // Korábbi szűrők hibája (mindkettő):
+        //   • `SyncEngine.isDeviceOnline`: ESP-k WS-en nem csatlakoznak → false →
+        //     célzás csak Android-ot tartalmazta → snap-RPC az ESP-ket
+        //     muted=true / volume=0-ra állította (= "Android online → ESP néma")
+        //   • `Device.online: true`: ha az ESP beacon-ja késett (lifecycle
+        //     >10 perc) vagy a snap-client-id ≠ Device.id (ESP-firmware MAC-et
+        //     használ), a snap-RPC akkor is letiltja az ESP-t.
+        //
+        // Bell egy "mindenkit megszólító" esemény → undefined a tiszta szándék.
         await SnapcastService.play({
-          type:               "BELL",
-          source:             { type: "file", path: soundPath },
+          type:    "BELL",
+          source:  { type: "file", path: soundPath },
           tenantId,
-          title:              `Csengetés ${bellTimeStr}`,
-          deviceIdsToUnmute:  onlineIds,
+          title:   `Csengetés ${bellTimeStr}`,
+          // deviceIdsToUnmute: undefined → minden snap-csatlakozott kliens
         });
         console.log(
-          `[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr} | ${onlineIds.length} online eszköz | ` +
+          `[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr} (minden csatlakozott kliens) | ` +
           `fadeOut=${willFadeOut}${willFadeOut ? "" : ` (+${FADE_OUT_EXTRA_LEAD_MS}ms extra wait)`}`
         );
       } catch (e) {
