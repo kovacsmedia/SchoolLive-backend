@@ -15,41 +15,21 @@ import { randomUUID }      from "crypto";
 
 const TICK_INTERVAL_MS = 30_000;
 const LOOKAHEAD_MS     = 90_000;
-// PREPARE-broadcast lead. Korábban 4 sec volt – mostantól 5.5 sec, hogy a
-// (legkésőbb 4.4 sec-cel a bellMs előtt induló) snap-pipe-play előtt a PREPARE
-// biztosan megelőzze + a kliensek ACK-ja összegyűljön a SyncEngine ACK_WAIT
-// (3.8 sec) ablakában.
-const PREPARE_LEAD_MS  = 5_500;
+const PREPARE_LEAD_MS  = 4_000;
 const MIN_FUTURE_MS    = 1_000;
 
-// Snap-pipe play időzítés a bell-hez.
+// A snapserver-be írt PCM byte fizikai megszólalási késleltetése +
+// az aktív alacsonyabb prio audio fade-out + post-fade gap helye:
+//   1000 ms fade-out (FADE_OUT_BYTES) +
+//    200 ms POST_FADE_GAP_MS +
+//   1000 ms PRE_SILENCE +
+//   ~200 ms ffmpeg warmup +
+//   1000 ms snapserver "[server] buffer" =
+//   ~3400 ms (felfelé kerekítve 3200, hogy ne legyen TOO LATE bell).
 //
-// Két forgatókönyv:
-//
-//   A) RADIO vagy TTS aktív (fade-out szükséges):
-//      1000 ms fade-out (FADE_OUT_BYTES) +
-//       200 ms POST_FADE_GAP_MS +
-//      1000 ms PRE_SILENCE +
-//      ~200 ms ffmpeg warmup +
-//      1000 ms snapserver "[server] buffer" =
-//      ~3400 ms, plusz a bell-fájl ~1 sec induló csendje (egyes csengő-
-//      hangokon) → **4400 ms** teljes lead, hogy a chime bellMs-en szólaljon.
-//
-//   B) Idle (nincs aktív forrás, vagy BELL → BELL):
-//      Pipeline csak 2200 ms (nincs fade-out, nincs gap) + 1 sec fájl-csend
-//      = **3200 ms** lead.
-//
-// A snapTimeout-ot mindig az "A" időpontra (= bellMs - 4400ms) ütemezzük – a
-// legkorábbi lehetséges. Amikor a callback fires, a snap-engine mixer-state
-// vizsgálatával eldöntjük, hogy szükség van-e EXTRA 1200 ms várásra (B-eset),
-// hogy a kliens-audio MINDKÉT forgatókönyvben pontosan bellMs-en szólaljon.
-//
-// Ez ugyanaz az elv mint a "rádió → TTS → rádió" sima átmenet: a HUD-pillanat
-// és az audio-érkezés szinkronban van.
-const SNAP_PIPE_LEAD_WITH_FADE_MS = 4_400;
-const SNAP_PIPE_LEAD_IDLE_MS      = 3_200;
-const FADE_OUT_EXTRA_LEAD_MS      = SNAP_PIPE_LEAD_WITH_FADE_MS - SNAP_PIPE_LEAD_IDLE_MS;
-// = 1200 ms – extra várakozás idle-esetben, hogy egyezzen a fade-out-os pipeline-nal.
+// Ezzel a bell ffmpeg-start a bellMs - 1000ms-en történik, és a snapserver-
+// puffer után pontosan a bellMs-en hallhatóvá válik a chime.
+const SNAP_PIPE_LEAD_MS = 3_200;
 
 let _running = false;
 const _dispatched      = new Set<string>();
@@ -170,11 +150,10 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
     _dispatched.add(dispatchKey);
 
     const prepareDelay = Math.max(0, waitMs - PREPARE_LEAD_MS);
-    // A snapTimeout a LEGKORÁBBI lehetséges időpontra ütemezzük (fade-out
-    // esete). Idle-esetben a callback EXTRA 1200 ms várakozással
-    // kompenzálja a hiányzó fade-out + gap idejét, hogy a chime mindkét
-    // forgatókönyvben pontosan bellMs-en szólaljon meg a klienseken.
-    const snapDelay    = Math.max(0, waitMs - SNAP_PIPE_LEAD_WITH_FADE_MS);
+    // SNAP_PIPE_LEAD_MS-szel előbb indítunk a mixer-be, hogy a PRE_SILENCE +
+    // ffmpeg warmup + snapserver buffer késleltetés után pontosan a bellMs-en
+    // szólaljon meg a chime – szinkron a kliens HUD/unmute idővel.
+    const snapDelay    = Math.max(0, waitMs - SNAP_PIPE_LEAD_MS);
     const commandId    = randomUUID();
     const audioUrl     = `https://api.schoollive.hu/audio/bells/${bell.soundFile}`;
     const soundPath    = path.join(process.cwd(), "audio", "bells", bell.soundFile);
@@ -228,40 +207,12 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
         const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
         if (!snapOnline) return;
 
-        // ── Dinamikus időzítés: fade-out szükséges? ────────────────────────
-        // A snapTimeout a fade-out esetre kalibrált (4400 ms lead). Ha a
-        // mixer-en JELENLEG nincs RADIO/TTS aktív, NEM lesz fade-out, így
-        // a pipeline 1200 ms-cel rövidebb → várjunk EXTRA 1200 ms-et, hogy
-        // a kliens-audio mindkét esetben pontosan bellMs-en szólaljon meg.
-        //
-        // Ez ugyanaz az elv, mint a "rádió → TTS → rádió" sima átmenet:
-        // a HUD-pillanat és az audio-érkezés ne csússzanak.
-        const status = SnapcastService.getStatus(tenantId);
-        const activeJobType = status?.mixer?.current?.jobType;
-        const willFadeOut = activeJobType === "RADIO" || activeJobType === "TTS";
-
-        if (!willFadeOut) {
-          await new Promise<void>(resolve =>
-            setTimeout(resolve, FADE_OUT_EXTRA_LEAD_MS)
-          );
-        }
-
         // Csengetés MINDIG minden snap-csatlakozott klienshez megy → NEM adunk
         // explicit `deviceIdsToUnmute`-ot. Az `applyTargetingToClients` ekkor
         // az `if (wanted.size === 0)` ágon az ÖSSZES snap-szerverhez csatlakozott
         // klienst (rpcListClients) a saját user-volume-jukon unmute-olja –
         // függetlenül attól, hogy a kliens snap-client-id-je egyezik-e a
         // DB.Device.id-vel.
-        //
-        // Korábbi szűrők hibája (mindkettő):
-        //   • `SyncEngine.isDeviceOnline`: ESP-k WS-en nem csatlakoznak → false →
-        //     célzás csak Android-ot tartalmazta → snap-RPC az ESP-ket
-        //     muted=true / volume=0-ra állította (= "Android online → ESP néma")
-        //   • `Device.online: true`: ha az ESP beacon-ja késett (lifecycle
-        //     >10 perc) vagy a snap-client-id ≠ Device.id (ESP-firmware MAC-et
-        //     használ), a snap-RPC akkor is letiltja az ESP-t.
-        //
-        // Bell egy "mindenkit megszólító" esemény → undefined a tiszta szándék.
         await SnapcastService.play({
           type:    "BELL",
           source:  { type: "file", path: soundPath },
@@ -269,10 +220,7 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
           title:   `Csengetés ${bellTimeStr}`,
           // deviceIdsToUnmute: undefined → minden snap-csatlakozott kliens
         });
-        console.log(
-          `[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr} (minden csatlakozott kliens) | ` +
-          `fadeOut=${willFadeOut}${willFadeOut ? "" : ` (+${FADE_OUT_EXTRA_LEAD_MS}ms extra wait)`}`
-        );
+        console.log(`[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr} (minden csatlakozott kliens)`);
       } catch (e) {
         console.error(`[BELLS-SCHEDULER] Snap hiba (${bellTimeStr}):`, e);
       } finally {
