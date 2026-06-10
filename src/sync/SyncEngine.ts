@@ -179,25 +179,55 @@ class SyncEngineClass {
     // ki, hogy a snapclient sync-jét csatlakozáskor azonnal alkalmazni tudja
     // (újraindítás nélkül). A futás közbeni változást a SET_SYNC_OFFSET
     // action push-olja.
+    //
+    // ESP32: deviceId = Device.id (deviceKey-ből feloldva)
+    // Browser (PLAYER user): deviceId = clientId (localStorage UUID), de a
+    //   tényleges Device.id-t userId+tenantId-ből kell feloldani; a webplayer
+    //   ezt használja a snap-HELLO ID mezőjéhez.
     let syncOffsetMs = 0;
-    if (clientType === "esp32" && tenantId) {
+    let resolvedSnapDeviceId: string | null = null;
+    if (tenantId) {
       try {
         const { prisma } = await import("../prisma/client");
-        const dev = await prisma.device.findUnique({
-          where: { id: deviceId },
-          select: { syncOffsetMs: true },
-        });
-        if (dev) syncOffsetMs = dev.syncOffsetMs ?? 0;
+        if (clientType === "esp32") {
+          const dev = await prisma.device.findUnique({
+            where: { id: deviceId },
+            select: { syncOffsetMs: true },
+          });
+          if (dev) syncOffsetMs = dev.syncOffsetMs ?? 0;
+          resolvedSnapDeviceId = deviceId;
+        } else if (token) {
+          // Browser: a JWT-ben benne van a userId (payload.sub).
+          // A Device-t userId+tenantId párral oldjuk fel (egy player-user-hez
+          // egy browser-device, lásd player.device.controller register).
+          const decoded = jwt.decode(token) as any;
+          const userIdFromToken: string | undefined = decoded?.sub;
+          if (userIdFromToken) {
+            const dev = await prisma.device.findFirst({
+              where: { userId: userIdFromToken, tenantId },
+              select: { id: true, syncOffsetMs: true },
+            });
+            if (dev) {
+              resolvedSnapDeviceId = dev.id;
+              syncOffsetMs = dev.syncOffsetMs ?? 0;
+            }
+          }
+        }
       } catch (e) {
-        console.warn(`[SyncEngine] syncOffsetMs lookup hiba (${deviceId}):`, e);
+        console.warn(`[SyncEngine] HELLO lookup hiba (${deviceId}):`, e);
       }
     }
 
     this.send(ws, {
-      type:         "HELLO",
-      serverNow:    new Date(nowMs).toISOString(),
-      serverNowMs:  nowMs,
+      type:           "HELLO",
+      serverNow:      new Date(nowMs).toISOString(),
+      serverNowMs:    nowMs,
       deviceId,
+      // snapDeviceId: a Device.id, amit a webplayer a snap-HELLO ID mezőjéhez
+      // használ. ESP32-nél azonos a deviceId-vel; browser-nél a clientId
+      // (localStorage UUID) helyett a tényleges Device.id, amit a snapserver
+      // a targeting (rpcSetClientVolume) során lát.
+      snapDeviceId:   resolvedSnapDeviceId ?? deviceId,
       syncOffsetMs,
     });
   }
