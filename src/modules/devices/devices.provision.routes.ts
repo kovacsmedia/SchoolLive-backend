@@ -192,36 +192,54 @@ router.post("/activate", authJwt, async (req, res) => {
       return res.status(404).json({ error: "Pending device not found or already activated" });
     }
 
-    const validClasses = ["SPEAKER", "DISPLAY", "MULTI"];
+    const validClasses = ["SPEAKER", "DISPLAY", "MULTI", "MULTIZONE"];
     if (!validClasses.includes(deviceClass)) {
       return res.status(400).json({ error: "Invalid deviceClass" });
     }
 
-    // Új deviceKey generálás
+    // Új deviceKey generálás – MULTIZONE esetén mind a 8 zóna ezt osztja meg
     const deviceKey = crypto.randomBytes(24).toString("hex");
     const deviceKeyHash = await bcrypt.hash(deviceKey, 10);
 
-    // Device létrehozása
+    // Mastereszköz létrehozása (Z1, vagy egyetlen eszköz nem-MULTIZONE esetén)
     const device = await prisma.device.create({
       data: {
         tenantId,
-        name,
+        name: deviceClass === "MULTIZONE" ? `${name} Z1` : name,
         deviceClass: deviceClass as any,
         authType: "KEY",
         deviceKeyHash,
         firmwareVersion: pending.firmwareVersion,
         ipAddress: pending.ipAddress,
-        clientId: pendingId, // átmenetileg eltároljuk a pendingId-t
+        clientId: pendingId,
+        zoneIndex: deviceClass === "MULTIZONE" ? 1 : undefined,
         ...(orgUnitId ? { orgUnitId } : {}),
       },
       select: { id: true, name: true, tenantId: true },
     });
 
+    // MULTIZONE: Z2–Z8 zóna eszközök létrehozása ugyanazzal a deviceKey-jel
+    if (deviceClass === "MULTIZONE") {
+      await prisma.device.createMany({
+        data: Array.from({ length: 7 }, (_, i) => ({
+          tenantId,
+          name: `${name} Z${i + 2}`,
+          deviceClass: "MULTIZONE" as const,
+          authType: "KEY" as const,
+          deviceKeyHash,
+          parentDeviceId: device.id,
+          zoneIndex: i + 2,
+          firmwareVersion: pending.firmwareVersion,
+          ipAddress: pending.ipAddress,
+          ...(orgUnitId ? { orgUnitId } : {}),
+        })),
+      });
+    }
+
     // ProvisionSession létrehozása (ESP32 innen kapja a wifi adatokat)
     const provisioningToken = crypto.randomBytes(32).toString("hex");
     const tokenHash = await bcrypt.hash(provisioningToken, 10);
 
-    // A deviceProvisionSession.create()-ban add hozzá:
     await prisma.deviceProvisionSession.create({
       data: {
         tokenHash,

@@ -91,6 +91,10 @@ class SyncEngineClass {
   private pending:  Map<string, PendingSync>     = new Map();
   private profiles: Map<string, DeviceProfile>   = new Map();
 
+  // Multizone: zóna device ID → master device ID leképezés.
+  // Ha egy zóna ID bármely dispatch-ben célzott, a master kapja az üzenetet.
+  private zoneToMaster: Map<string, string> = new Map();
+
   private readonly PREPARE_WINDOW_MS = 1500;
   private readonly SAFETY_MARGIN_MS  = 300;
   private readonly MIN_LEAD_MS       = 1200;
@@ -404,11 +408,20 @@ class SyncEngineClass {
 
   private getOnlineClients(tenantId: string, deviceIds?: string[]): ConnectedClient[] {
     const result: ConnectedClient[] = [];
+    const seen = new Set<string>();
     for (const client of this.clients.values()) {
       if (client.tenantId !== tenantId) continue;
       if (client.ws.readyState !== 1) continue;
-      if (deviceIds && !deviceIds.includes(client.deviceId)) continue;
-      result.push(client);
+      if (deviceIds) {
+        // Közvetlen egyezés VAGY zóna ID-ként a master ez az eszköz
+        const directMatch = deviceIds.includes(client.deviceId);
+        const zoneMatch   = deviceIds.some(id => this.zoneToMaster.get(id) === client.deviceId);
+        if (!directMatch && !zoneMatch) continue;
+      }
+      if (!seen.has(client.deviceId)) {
+        seen.add(client.deviceId);
+        result.push(client);
+      }
     }
     return result;
   }
@@ -439,14 +452,35 @@ class SyncEngineClass {
     ipAddress: string | null,
   ): Promise<void> {
     let channelMode = "MIXED";
+    let zones: Array<{ zoneIndex: number; deviceId: string }> = [];
     try {
       const { prisma } = await import("../prisma/client");
       const dev = await prisma.device.update({
         where: { id: deviceId },
         data: { online: true, lastSeenAt: new Date(), ipAddress: ipAddress ?? undefined },
-        select: { channelMode: true },
+        select: { channelMode: true, deviceClass: true },
       });
       channelMode = dev?.channelMode ?? "MIXED";
+
+      // Multizone: betöltjük a zóna device ID-ket és feltöltjük a zónatérképet
+      if (dev?.deviceClass === "MULTIZONE") {
+        const zoneDevices = await prisma.device.findMany({
+          where: { parentDeviceId: deviceId },
+          select: { id: true, zoneIndex: true },
+          orderBy: { zoneIndex: "asc" },
+        });
+        // Z1 (master) is a zone
+        zones = [{ zoneIndex: 1, deviceId }, ...zoneDevices.map(z => ({ zoneIndex: z.zoneIndex ?? 0, deviceId: z.id }))];
+        for (const z of zoneDevices) {
+          this.zoneToMaster.set(z.id, deviceId);
+        }
+        console.log(`[SyncEngine] MULTIZONE zónatérkép: ${deviceId} → ${zoneDevices.length + 1} zóna`);
+        // Zóna eszközök online-nak jelölése
+        await prisma.device.updateMany({
+          where: { parentDeviceId: deviceId },
+          data: { online: true, lastSeenAt: new Date() },
+        });
+      }
     } catch (e) {
       console.warn(`[SyncEngine] onDeviceConnected DB hiba (${deviceId}):`, e);
     }
@@ -464,28 +498,36 @@ class SyncEngineClass {
       console.warn(`[SyncEngine] SCHEDULE_SYNC hiba (${deviceId}):`, e);
     }
 
-    // channelMode szinkronizálás (ha nem MIXED, push-oljuk az eszköznek)
-    if (channelMode !== "MIXED") {
-      const client = this.clients.get(deviceId);
-      if (client?.ws.readyState === 1) {
-        this.send(client.ws, {
-          type: "COMMAND",
-          commandId: `ch-init-${deviceId}`,
-          payload: { action: "SET_CHANNEL_MODE", mode: channelMode },
-        });
-      }
+    const client = this.clients.get(deviceId);
+
+    // channelMode szinkronizálás
+    if (channelMode !== "MIXED" && client?.ws.readyState === 1) {
+      this.send(client.ws, {
+        type: "COMMAND",
+        commandId: `ch-init-${deviceId}`,
+        payload: { action: "SET_CHANNEL_MODE", mode: channelMode },
+      });
+    }
+
+    // Multizone: zóna device ID-k küldése az ESP32-nek
+    if (zones.length > 0 && client?.ws.readyState === 1) {
+      this.send(client.ws, { type: "ZONE_CONFIG", zones });
+      console.log(`[SyncEngine] 🔌 ZONE_CONFIG → ${deviceId}: ${zones.length} zóna`);
     }
 
     await this.pushPendingCommands(deviceId, tenantId);
   }
 
   private async onDeviceDisconnected(deviceId: string): Promise<void> {
+    // Zónatérkép tisztítása
+    for (const [zoneId, masterId] of this.zoneToMaster.entries()) {
+      if (masterId === deviceId) this.zoneToMaster.delete(zoneId);
+    }
     try {
       const { prisma } = await import("../prisma/client");
-      await prisma.device.update({
-        where: { id: deviceId },
-        data: { online: false },
-      });
+      await prisma.device.update({ where: { id: deviceId }, data: { online: false } });
+      // Multizone: zóna eszközök offline-nak jelölése
+      await prisma.device.updateMany({ where: { parentDeviceId: deviceId }, data: { online: false } });
     } catch (e) {
       console.warn(`[SyncEngine] onDeviceDisconnected DB hiba (${deviceId}):`, e);
     }
@@ -590,7 +632,14 @@ class SyncEngineClass {
 
   isDeviceOnline(deviceId: string): boolean {
     const client = this.clients.get(deviceId);
-    return !!client && client.ws.readyState === 1;
+    if (client && client.ws.readyState === 1) return true;
+    // Zóna device: a master online státusza alapján
+    const masterId = this.zoneToMaster.get(deviceId);
+    if (masterId) {
+      const master = this.clients.get(masterId);
+      return !!master && master.ws.readyState === 1;
+    }
+    return false;
   }
 }
 

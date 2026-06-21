@@ -22,6 +22,7 @@ enum DeviceClass {
   SPEAKER
   DISPLAY
   MULTI
+  MULTIZONE
 }
 
 enum DeviceAuthType {
@@ -201,9 +202,17 @@ model Device {
   otaVersion   String?
   otaUpdatedAt DateTime?
 
-  // ESP32 mono DAC csatorna-mód: "MIXED" | "LEFT" | "RIGHT"
-  // Csak SPEAKER osztályú (MAX98357A mono DAC-os) eszközöknél releváns.
+  // ESP32 mono DAC csatorna-mód: "MIXED" | "LEFT" | "RIGHT" | "STEREO"
   channelMode  String    @default("MIXED")
+
+  // Multizone: zónák szülő eszközének ID-je (Z2-Z8 → Z1/master).
+  // A master eszközön null; a zóna eszközökön a master Device.id-je.
+  parentDeviceId String?
+  // Zóna sorszáma (1-8). Master eszközön 1, Z2-Z8 eszközökön 2-8.
+  zoneIndex      Int?
+
+  parent Device?  @relation("DeviceZones", fields: [parentDeviceId], references: [id], onDelete: Cascade)
+  zones  Device[] @relation("DeviceZones")
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   orgUnit OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
