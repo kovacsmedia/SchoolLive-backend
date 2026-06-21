@@ -1,0 +1,3 @@
+-- ESP32 mono DAC csatorna-mód: "MIXED" | "LEFT" | "RIGHT"
+ALTER TABLE "Device"
+  ADD COLUMN IF NOT EXISTS "channelMode" TEXT NOT NULL DEFAULT 'MIXED';

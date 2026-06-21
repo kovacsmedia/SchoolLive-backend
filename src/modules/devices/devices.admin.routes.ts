@@ -65,6 +65,7 @@ router.get("/health", authJwt, requireTenant, async (req, res) => {
       volume:      d.volume,
       muted:       d.muted,
       syncOffsetMs: d.syncOffsetMs,
+      channelMode:  d.channelMode,
       createdAt:   d.createdAt,
       orgUnitId:   d.orgUnitId,
       serialNumber: d.serialNumber,

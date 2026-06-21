@@ -3,6 +3,3 @@ ALTER TABLE "PendingDevice"
   ADD COLUMN IF NOT EXISTS "userId"    TEXT,
   ADD COLUMN IF NOT EXISTS "userAgent" TEXT;
 
--- ESP32 mono DAC csatorna-mód
-ALTER TABLE "Device"
-  ADD COLUMN IF NOT EXISTS "channelMode" TEXT NOT NULL DEFAULT 'MIXED';
