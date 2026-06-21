@@ -370,7 +370,7 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
     }
     if (typeof channelMode !== "undefined") {
       const cm = String(channelMode).toUpperCase();
-      if (["MIXED", "LEFT", "RIGHT"].includes(cm)) data.channelMode = cm;
+      if (["MIXED", "LEFT", "RIGHT", "STEREO"].includes(cm)) data.channelMode = cm;
     }
 
     const updated = await prisma.device.update({ where: { id }, data, select: DEVICE_SELECT });
