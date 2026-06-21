@@ -113,6 +113,7 @@ async function scheduleDispatch(schedule: {
         tenantId:        schedule.tenantId,
         commandId,
         action:          "PLAY_URL",
+        kind:            "RADIO",
         url:             schedule.radioFile.fileUrl,
         title:           schedule.radioFile.originalName,
         targetDeviceIds: onlineIds,

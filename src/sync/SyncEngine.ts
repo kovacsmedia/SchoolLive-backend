@@ -20,6 +20,9 @@ export interface PreparePayload {
   url?:              string;
   text?:             string;
   title?:            string;
+  // Megjelenítési kategória az eszközök UI-ján: "MESSAGE" | "RADIO" | "SIGNAL" | "EMERGENCY"
+  // Ha hiányzik, az eszköz az action-ből következtet.
+  kind?:             string;
   prepareDeadline:   string;
   snapcastActive?:   boolean;
   // Fordított targeting: a snap stream alapból néma; csak az itt felsorolt
@@ -88,10 +91,10 @@ class SyncEngineClass {
   private pending:  Map<string, PendingSync>     = new Map();
   private profiles: Map<string, DeviceProfile>   = new Map();
 
-  private readonly PREPARE_WINDOW_MS = 4000;
-  private readonly SAFETY_MARGIN_MS  = 500;
-  private readonly MIN_LEAD_MS       = 2000;
-  private readonly ACK_WAIT_MS       = 3800;
+  private readonly PREPARE_WINDOW_MS = 1500;
+  private readonly SAFETY_MARGIN_MS  = 300;
+  private readonly MIN_LEAD_MS       = 1200;
+  private readonly ACK_WAIT_MS       = 600;
 
   init(wss: InstanceType<typeof WebSocketServer>): void {
     this.wss = wss;
@@ -267,6 +270,9 @@ class SyncEngineClass {
     url?:             string;
     text?:            string;
     title?:           string;
+    /** Megjelenítési kategória az eszközök UI-ján: "MESSAGE" | "RADIO" | "SIGNAL" | "EMERGENCY"
+     *  Ha nincs megadva, az eszköz az action-ből következtet (pl. "BELL" → "SIGNAL"). */
+    kind?:            string;
     /** Fordított targeting: ezek az eszközök kapnak hangot. A snap stream
      *  alapból néma; ők lesznek unmutálva. Üres → senki sem szól.
      *  Minden online tenant-kliensnek megy a PREPARE (broadcast), de ACK-ot
@@ -276,7 +282,7 @@ class SyncEngineClass {
     playAtMs?:        number;
     durationMs?:      number;
   }): Promise<void> {
-    const { tenantId, commandId, action, url, text, title,
+    const { tenantId, commandId, action, url, text, title, kind,
             targetDeviceIds, snapcastActive, playAtMs, durationMs } = params;
 
     // Broadcast: minden online kliens értesül – ha nem szerepel az
@@ -319,6 +325,7 @@ class SyncEngineClass {
       commandId,
       action,
       url, text, title,
+      ...(kind ? { kind } : {}),
       prepareDeadline:   deadline.toISOString(),
       snapcastActive,
       unmutedDeviceIds,

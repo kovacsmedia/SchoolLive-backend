@@ -15,7 +15,7 @@ import { randomUUID }      from "crypto";
 
 const TICK_INTERVAL_MS = 30_000;
 const LOOKAHEAD_MS     = 90_000;
-const PREPARE_LEAD_MS  = 4_000;
+const PREPARE_LEAD_MS  = 1_500;
 const MIN_FUTURE_MS    = 1_000;
 
 // A snapserver-be írt PCM byte fizikai megszólalási késleltetése +

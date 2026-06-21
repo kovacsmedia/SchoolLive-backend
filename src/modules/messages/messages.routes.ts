@@ -417,7 +417,7 @@ router.post("/play-url", authJwt, requireTenant, async (req: Request, res: Respo
     const onlineIds = candidateIds.filter(id => SyncEngine.isDeviceOnline(id));
     if (onlineIds.length > 0) {
       await SyncEngine.dispatchSync({
-        tenantId: tid, commandId: randomUUID(), action: "PLAY_URL", url, title,
+        tenantId: tid, commandId: randomUUID(), action: "PLAY_URL", kind: "MESSAGE", url, title,
         durationMs: undefined, snapcastActive: snapOnline,
         targetDeviceIds: candidateIds,
       });
