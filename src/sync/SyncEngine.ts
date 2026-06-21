@@ -438,12 +438,15 @@ class SyncEngineClass {
     clientType: "browser" | "esp32",
     ipAddress: string | null,
   ): Promise<void> {
+    let channelMode = "MIXED";
     try {
       const { prisma } = await import("../prisma/client");
-      await prisma.device.update({
+      const dev = await prisma.device.update({
         where: { id: deviceId },
         data: { online: true, lastSeenAt: new Date(), ipAddress: ipAddress ?? undefined },
+        select: { channelMode: true },
       });
+      channelMode = dev?.channelMode ?? "MIXED";
     } catch (e) {
       console.warn(`[SyncEngine] onDeviceConnected DB hiba (${deviceId}):`, e);
     }
@@ -459,6 +462,18 @@ class SyncEngineClass {
       console.log(`[SyncEngine] 📅 SCHEDULE_SYNC → ${deviceId}`);
     } catch (e) {
       console.warn(`[SyncEngine] SCHEDULE_SYNC hiba (${deviceId}):`, e);
+    }
+
+    // channelMode szinkronizálás (ha nem MIXED, push-oljuk az eszköznek)
+    if (channelMode !== "MIXED") {
+      const client = this.clients.get(deviceId);
+      if (client?.ws.readyState === 1) {
+        this.send(client.ws, {
+          type: "COMMAND",
+          commandId: `ch-init-${deviceId}`,
+          payload: { action: "SET_CHANNEL_MODE", mode: channelMode },
+        });
+      }
     }
 
     await this.pushPendingCommands(deviceId, tenantId);

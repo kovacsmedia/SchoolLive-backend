@@ -201,6 +201,10 @@ model Device {
   otaVersion   String?
   otaUpdatedAt DateTime?
 
+  // ESP32 mono DAC csatorna-mód: "MIXED" | "LEFT" | "RIGHT"
+  // Csak SPEAKER osztályú (MAX98357A mono DAC-os) eszközöknél releváns.
+  channelMode  String    @default("MIXED")
+
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   orgUnit OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
   user User? @relation(fields: [userId], references: [id], onDelete: SetNull)

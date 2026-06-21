@@ -28,6 +28,7 @@ const DEVICE_SELECT = {
   volume: true,
   muted: true,
   syncOffsetMs: true,
+  channelMode: true,
   createdAt: true,
   orgUnitId: true,
   serialNumber: true,
@@ -347,7 +348,7 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
     }
 
     const id = String(req.params.id).trim();
-    const { name, orgUnitId, volume, muted, hwModel, syncOffsetMs } = req.body ?? {};
+    const { name, orgUnitId, volume, muted, hwModel, syncOffsetMs, channelMode } = req.body ?? {};
 
     const existing = await prisma.device.findFirst({
       where: { id, tenantId: user.tenantId! },
@@ -366,12 +367,14 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
       const n = Math.round(Number(syncOffsetMs) / 10) * 10;
       data.syncOffsetMs = Math.max(-2000, Math.min(2000, n));
     }
+    if (typeof channelMode !== "undefined") {
+      const cm = String(channelMode).toUpperCase();
+      if (["MIXED", "LEFT", "RIGHT"].includes(cm)) data.channelMode = cm;
+    }
 
     const updated = await prisma.device.update({ where: { id }, data, select: DEVICE_SELECT });
 
-    // Ha a syncOffsetMs változott, azonnal pusholjuk a kliensnek WS-en,
-    // hogy a snap-sync-jét frissíthesse játszás közben is (újrakapcsolás
-    // nélkül). A SET_SYNC_OFFSET action a kliens-specifikus protokoll-bővítés.
+    // Ha a syncOffsetMs változott, azonnal pusholjuk a kliensnek WS-en.
     if (typeof syncOffsetMs !== "undefined" && data.syncOffsetMs !== existing.syncOffsetMs) {
       try {
         const { SyncEngine } = await import("../../sync/SyncEngine");
@@ -382,6 +385,20 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
         );
       } catch (e) {
         console.error(`[device-patch] SET_SYNC_OFFSET WS hiba (${id}):`, e);
+      }
+    }
+
+    // Ha a channelMode változott, azonnal pusholjuk SET_CHANNEL_MODE parancsként.
+    if (typeof channelMode !== "undefined" && data.channelMode && data.channelMode !== existing.channelMode) {
+      try {
+        const { SyncEngine } = await import("../../sync/SyncEngine");
+        SyncEngine.broadcastImmediate(
+          user.tenantId!,
+          { type: "COMMAND", commandId: `ch-${id}-${Date.now()}`, payload: { action: "SET_CHANNEL_MODE", mode: data.channelMode } },
+          [id],
+        );
+      } catch (e) {
+        console.error(`[device-patch] SET_CHANNEL_MODE WS hiba (${id}):`, e);
       }
     }
 
