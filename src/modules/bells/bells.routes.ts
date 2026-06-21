@@ -611,7 +611,7 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
     await resolveTodayBells(device.tenantId, today);
 
   const sounds = await prisma.bellSoundFile.findMany({
-    where: { tenantId: device.tenantId },
+    where: { tenantId: device.tenantId, kind: "SCHEDULE" },
   });
 
   res.json({
@@ -639,3 +639,26 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
     updatedAt: new Date().toISOString(),
   });
 });
+
+// ── Shared helper – SyncEngine is hívja WS SCHEDULE_SYNC push-hoz ─────────────
+
+export async function buildScheduleSyncPayload(tenantId: string): Promise<object> {
+  const today = todayInBudapest();
+  const { bells, defaultBells, isHoliday, todayVersion, defaultVersion } =
+    await resolveTodayBells(tenantId, today);
+
+  const sounds = await prisma.bellSoundFile.findMany({
+    where: { tenantId, kind: "SCHEDULE" },
+  });
+
+  return {
+    type:           "SCHEDULE_SYNC",
+    isHoliday,
+    todayVersion,
+    defaultVersion,
+    bells:          bells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
+    defaultBells:   defaultBells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
+    sounds:         sounds.map((s: any) => ({ filename: s.filename, url: `/audio/bells/${s.filename}`, sizeBytes: s.sizeBytes })),
+    updatedAt:      new Date().toISOString(),
+  };
+}

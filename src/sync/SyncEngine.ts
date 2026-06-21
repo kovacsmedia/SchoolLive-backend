@@ -55,6 +55,7 @@ interface ConnectedClient {
   tenantId:    string;
   type:        "browser" | "esp32";
   connectedAt: Date;
+  ipAddress:   string | null;
 }
 
 interface PendingSync {
@@ -150,7 +151,12 @@ class SyncEngineClass {
     const existing = this.clients.get(deviceId);
     if (existing && existing.ws.readyState === 1) existing.ws.close(4010, "Replaced");
 
-    const client: ConnectedClient = { ws, deviceId, tenantId, type: clientType, connectedAt: new Date() };
+    const ipAddress =
+      (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
+      (req.socket as any)?.remoteAddress ||
+      null;
+
+    const client: ConnectedClient = { ws, deviceId, tenantId, type: clientType, connectedAt: new Date(), ipAddress };
     this.clients.set(deviceId, client);
     console.log(`[SyncEngine] 🔌 Csatlakozott: ${deviceId} (${client.type}) tenant=${tenantId}`);
 
@@ -168,6 +174,7 @@ class SyncEngineClass {
       if (this.clients.get(deviceId)?.ws === ws) {
         this.clients.delete(deviceId);
         console.log(`[SyncEngine] 🔌 Lecsatlakozott: ${deviceId}`);
+        void this.onDeviceDisconnected(deviceId);
       }
     });
 
@@ -186,16 +193,20 @@ class SyncEngineClass {
     //   ezt használja a snap-HELLO ID mezőjéhez.
     let syncOffsetMs = 0;
     let resolvedSnapDeviceId: string | null = null;
+    let snapHost: string | null = null;
+    let snapPort: number | null = null;
     if (tenantId) {
       try {
         const { prisma } = await import("../prisma/client");
         if (clientType === "esp32") {
-          const dev = await prisma.device.findUnique({
-            where: { id: deviceId },
-            select: { syncOffsetMs: true },
-          });
+          const [dev, tenant] = await Promise.all([
+            prisma.device.findUnique({ where: { id: deviceId }, select: { syncOffsetMs: true } }),
+            prisma.tenant.findUnique({ where: { id: tenantId }, select: { snapPort: true } }),
+          ]);
           if (dev) syncOffsetMs = dev.syncOffsetMs ?? 0;
           resolvedSnapDeviceId = deviceId;
+          snapHost = process.env.SNAP_HOST ?? "api.schoollive.hu";
+          snapPort = tenant?.snapPort ?? null;
         } else if (token) {
           // Browser: a JWT-ben benne van a userId (payload.sub).
           // A Device-t userId+tenantId párral oldjuk fel (egy player-user-hez
@@ -229,7 +240,11 @@ class SyncEngineClass {
       // a targeting (rpcSetClientVolume) során lát.
       snapDeviceId:   resolvedSnapDeviceId ?? deviceId,
       syncOffsetMs,
+      // ESP32-nek azonnal elérhető a Snapcast konfig – nincs szükség külön beacon HTTP hívásra
+      ...(clientType === "esp32" && snapHost && snapPort ? { snapHost, snapPort } : {}),
     });
+
+    void this.onDeviceConnected(deviceId, tenantId, clientType, ipAddress);
   }
 
   private handleMessage(deviceId: string, tenantId: string, msg: any): void {
@@ -238,6 +253,10 @@ class SyncEngineClass {
     } else if (msg.type === "TIME_SYNC") {
       const client = this.clients.get(deviceId);
       if (client) this.send(client.ws, { type: "TIME_SYNC_RESPONSE", clientSeq: msg.seq, serverNow: new Date().toISOString() });
+    } else if (msg.type === "BEACON") {
+      void this.handleBeacon(deviceId, tenantId, msg);
+    } else if (msg.type === "CMD_ACK") {
+      void this.handleCmdAck(deviceId, tenantId, msg);
     }
   }
 
@@ -404,6 +423,137 @@ class SyncEngineClass {
     const sorted = [...profile.samples].sort((a, b) => a - b);
     profile.avg = sorted.reduce((s, v) => s + v, 0) / sorted.length;
     profile.p95 = sorted[Math.floor(sorted.length * 0.95)] ?? sorted[sorted.length - 1];
+  }
+
+  private async onDeviceConnected(
+    deviceId: string,
+    tenantId: string,
+    clientType: "browser" | "esp32",
+    ipAddress: string | null,
+  ): Promise<void> {
+    try {
+      const { prisma } = await import("../prisma/client");
+      await prisma.device.update({
+        where: { id: deviceId },
+        data: { online: true, lastSeenAt: new Date(), ipAddress: ipAddress ?? undefined },
+      });
+    } catch (e) {
+      console.warn(`[SyncEngine] onDeviceConnected DB hiba (${deviceId}):`, e);
+    }
+    if (clientType !== "esp32") return;
+
+    const client = this.clients.get(deviceId);
+    if (!client || client.ws.readyState !== 1) return;
+
+    try {
+      const { buildScheduleSyncPayload } = await import("../modules/bells/bells.routes");
+      const payload = await buildScheduleSyncPayload(tenantId);
+      this.send(client.ws, payload);
+      console.log(`[SyncEngine] 📅 SCHEDULE_SYNC → ${deviceId}`);
+    } catch (e) {
+      console.warn(`[SyncEngine] SCHEDULE_SYNC hiba (${deviceId}):`, e);
+    }
+
+    await this.pushPendingCommands(deviceId, tenantId);
+  }
+
+  private async onDeviceDisconnected(deviceId: string): Promise<void> {
+    try {
+      const { prisma } = await import("../prisma/client");
+      await prisma.device.update({
+        where: { id: deviceId },
+        data: { online: false },
+      });
+    } catch (e) {
+      console.warn(`[SyncEngine] onDeviceDisconnected DB hiba (${deviceId}):`, e);
+    }
+  }
+
+  private async handleBeacon(deviceId: string, tenantId: string, msg: any): Promise<void> {
+    const { volume, muted, firmwareVersion, statusPayload } = msg;
+    try {
+      const { prisma } = await import("../prisma/client");
+      await prisma.device.update({
+        where: { id: deviceId },
+        data: {
+          lastSeenAt:      new Date(),
+          firmwareVersion: typeof firmwareVersion === "string" ? firmwareVersion : undefined,
+          volume:          typeof volume === "number" ? volume : undefined,
+          muted:           typeof muted === "boolean" ? muted : undefined,
+          statusPayload:   statusPayload ?? undefined,
+        },
+      });
+
+      const tenant = await prisma.tenant.findUnique({
+        where:  { id: tenantId },
+        select: { snapPort: true },
+      });
+      const snapHost = process.env.SNAP_HOST ?? "api.schoollive.hu";
+
+      const client = this.clients.get(deviceId);
+      if (client?.ws.readyState === 1) {
+        this.send(client.ws, {
+          type:     "BEACON_ACK",
+          snapHost,
+          snapPort: tenant?.snapPort ?? null,
+        });
+      }
+    } catch (e) {
+      console.error(`[SyncEngine] handleBeacon hiba (${deviceId}):`, e);
+    }
+  }
+
+  private async handleCmdAck(deviceId: string, tenantId: string, msg: any): Promise<void> {
+    const { commandId, ok, error } = msg;
+    if (!commandId || typeof commandId !== "string") return;
+    try {
+      const { prisma } = await import("../prisma/client");
+      const cmd = await prisma.deviceCommand.findFirst({
+        where: { id: commandId, tenantId, deviceId },
+      });
+      if (!cmd || cmd.status === "ACKED" || cmd.status === "FAILED") return;
+      await prisma.deviceCommand.update({
+        where: { id: cmd.id },
+        data: {
+          status:  ok ? "ACKED" : "FAILED",
+          ackedAt: new Date(),
+          error:   typeof error === "string" ? error : null,
+        },
+      });
+      console.log(`[SyncEngine] ✅ CMD_ACK: ${commandId} ok=${ok} device=${deviceId}`);
+      await this.pushPendingCommands(deviceId, tenantId);
+    } catch (e) {
+      console.error(`[SyncEngine] handleCmdAck hiba (${deviceId}):`, e);
+    }
+  }
+
+  async pushPendingCommands(deviceId: string, tenantId: string): Promise<void> {
+    const client = this.clients.get(deviceId);
+    if (!client || client.ws.readyState !== 1) return;
+    try {
+      const { prisma } = await import("../prisma/client");
+
+      const queued = await prisma.deviceCommand.findFirst({
+        where:   { deviceId, tenantId, status: "QUEUED" },
+        orderBy: { queuedAt: "asc" },
+      });
+      if (!queued) return;
+
+      const updated = await prisma.deviceCommand.updateMany({
+        where: { id: queued.id, status: "QUEUED" },
+        data:  { status: "SENT", sentAt: new Date() },
+      });
+      if (updated.count === 0) return;
+
+      this.send(client.ws, {
+        type:      "COMMAND",
+        commandId: queued.id,
+        payload:   queued.payload,
+      });
+      console.log(`[SyncEngine] 📤 COMMAND push → ${deviceId}: ${(queued.payload as any)?.action}`);
+    } catch (e) {
+      console.error(`[SyncEngine] pushPendingCommands hiba (${deviceId}):`, e);
+    }
   }
 
   getStatus(): object {
