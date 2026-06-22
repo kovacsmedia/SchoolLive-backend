@@ -197,7 +197,7 @@ router.post("/activate", authJwt, async (req, res) => {
       return res.status(400).json({ error: "Invalid deviceClass" });
     }
 
-    // Új deviceKey generálás – MULTIZONE esetén mind a 8 zóna ezt osztja meg
+    // Új deviceKey generálás – MULTIZONE esetén mind a 4 zóna ezt osztja meg
     const deviceKey = crypto.randomBytes(24).toString("hex");
     const deviceKeyHash = await bcrypt.hash(deviceKey, 10);
 
@@ -218,10 +218,10 @@ router.post("/activate", authJwt, async (req, res) => {
       select: { id: true, name: true, tenantId: true },
     });
 
-    // MULTIZONE: Z2–Z8 zóna eszközök létrehozása ugyanazzal a deviceKey-jel
+    // MULTIZONE: Z2–Z4 zóna eszközök létrehozása ugyanazzal a deviceKey-jel
     if (deviceClass === "MULTIZONE") {
       await prisma.device.createMany({
-        data: Array.from({ length: 7 }, (_, i) => ({
+        data: Array.from({ length: 3 }, (_, i) => ({
           tenantId,
           name: `${name} Z${i + 2}`,
           deviceClass: "MULTIZONE" as const,
