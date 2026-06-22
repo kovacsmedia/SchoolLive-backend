@@ -6,6 +6,13 @@ ALTER TABLE "Device"
   ADD COLUMN IF NOT EXISTS "parentDeviceId" TEXT,
   ADD COLUMN IF NOT EXISTS "zoneIndex"      INT;
 
-ALTER TABLE "Device"
-  ADD CONSTRAINT IF NOT EXISTS "Device_parentDeviceId_fkey"
-  FOREIGN KEY ("parentDeviceId") REFERENCES "Device"("id") ON DELETE CASCADE;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint WHERE conname = 'Device_parentDeviceId_fkey'
+  ) THEN
+    ALTER TABLE "Device"
+      ADD CONSTRAINT "Device_parentDeviceId_fkey"
+      FOREIGN KEY ("parentDeviceId") REFERENCES "Device"("id") ON DELETE CASCADE;
+  END IF;
+END $$;
