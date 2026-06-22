@@ -498,8 +498,6 @@ class SyncEngineClass {
       console.warn(`[SyncEngine] SCHEDULE_SYNC hiba (${deviceId}):`, e);
     }
 
-    const client = this.clients.get(deviceId);
-
     // channelMode szinkronizálás
     if (channelMode !== "MIXED" && client?.ws.readyState === 1) {
       this.send(client.ws, {
