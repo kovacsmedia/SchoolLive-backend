@@ -27,7 +27,14 @@ export async function postLogout(req: Request, res: Response) {
       try {
         const jwt = await import("jsonwebtoken");
         const { env } = await import("../../config/env");
-        const decoded = jwt.default.verify(bodyToken, env.JWT_ACCESS_SECRET) as any;
+        // ignoreExpiration: a logout akkor is sikerüljön (törölje az
+        // activeSessionId-t), ha a token időközben lejárt – pl. a user
+        // inaktívan hagyta a fület, a token 15 perc után lejárt, és csak
+        // EZUTÁN kattint kijelentkezésre / zárja be a fület (sendBeacon).
+        // Enélkül a session szerver-oldalon "élve" maradt volna, és a user
+        // az újra-bejelentkezéskor a 60mp-es inaktivitási grace lejártáig
+        // "already_logged_in" 409-et kapott volna.
+        const decoded = jwt.default.verify(bodyToken, env.JWT_ACCESS_SECRET, { ignoreExpiration: true }) as any;
         userId = decoded.sub;
       } catch {}
     }
@@ -36,6 +43,12 @@ export async function postLogout(req: Request, res: Response) {
   if (!userId) return res.status(204).send(); // silent – ne blokkoljuk
   await authService.logout(userId);
   res.status(204).send();
+}
+
+export async function postRefresh(req: Request, res: Response) {
+  if (!req.user) return res.status(401).json({ error: "Unauthenticated" });
+  const result = await authService.refresh(req.user);
+  res.json(result);
 }
 
 export async function getMeHandler(req: Request, res: Response) {

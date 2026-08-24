@@ -72,6 +72,19 @@ export async function login(email: string, password: string) {
   };
 }
 
+// Aktív (még nem lejárt) token cseréje egy friss TTL-űre, újra bejelentkezés
+// (jelszó megadása) nélkül. A frontend ezt hívja periodikusan, amíg az
+// admin fül aktív/fókuszban van, hogy egy éppen dolgozó felhasználó
+// munkamenete ne járjon le a 15 perces access-token TTL miatt.
+export async function refresh(payload: JwtPayload) {
+  const token = jwt.sign(
+    payload,
+    env.JWT_ACCESS_SECRET as jwt.Secret,
+    { expiresIn: env.JWT_ACCESS_TTL as any }
+  );
+  return { accessToken: token };
+}
+
 export async function logout(userId: string) {
   await prisma.$executeRaw`
     UPDATE "User" SET "activeSessionId" = NULL WHERE id = ${userId}
