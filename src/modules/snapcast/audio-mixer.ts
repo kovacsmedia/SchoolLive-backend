@@ -167,6 +167,11 @@ interface ActiveSource {
   // job.fadeInMs vagy default (stream→1s, egyéb→0) alapján.
   fadeInBytes: number;
   fadeOutStart: number | null;
+  // Miért indult a fade-out: "interrupted" = magasabb prio job szakítja meg
+  // (a job pausedStack-re kerül, resume-olható), "stopped" = user-initiated
+  // STOP_PLAYBACK (nincs resume, a queue-t a hívó már kiürítette). null,
+  // amíg nincs fade-out folyamatban.
+  fadeOutReason: SourceEndReason | null;
   killed: boolean;
 }
 
@@ -412,7 +417,12 @@ export class TenantAudioMixer extends EventEmitter {
     this.pausedStack = [];
 
     this.cancelPending("stopped");
-    this.killActive("stopped");
+    // 1s fade-out az azonnali SIGKILL helyett – felhasználói STOP-nál a
+    // korábbi azonnali vágás a snap-buffer miatt "elnyúlt", hibásnak ható
+    // hangként hallatszott a lejátszókon. A fade-out ugyanazt a mechanizmust
+    // használja, mint a magasabb prioritású job megszakításkor (beginFadeOut/
+    // onFadeOutComplete), csak "stopped" reason-nel (nincs resume).
+    this.beginFadeOut("stopped");
   }
 
   stopByType(jobType: MixerJobType): void {
@@ -429,7 +439,8 @@ export class TenantAudioMixer extends EventEmitter {
     }
 
     if (this.active?.job.jobType === jobType) {
-      this.killActive("stopped");
+      // Ld. stopAll() kommentje – fade-out azonnali SIGKILL helyett.
+      this.beginFadeOut("stopped");
     }
   }
 
@@ -627,6 +638,7 @@ export class TenantAudioMixer extends EventEmitter {
       fadeInActive: fadeInBytes > 0,
       fadeInBytes,
       fadeOutStart: null,
+      fadeOutReason: null,
       killed: false,
     };
 
@@ -829,12 +841,23 @@ export class TenantAudioMixer extends EventEmitter {
     }
   }
 
-  private beginFadeOut(): void {
-    if (!this.active || this.active.fadeOutStart !== null) return;
+  private beginFadeOut(reason: SourceEndReason = "interrupted"): void {
+    if (!this.active) return;
 
-    this.active.fadeOutStart = this.active.bytesWritten;
+    if (this.active.fadeOutStart !== null) {
+      // Már fut egy fade-out (pl. magasabb prio job szakította meg épp).
+      // Ha most egy explicit STOP jön, a reasont "stopped"-ra frissítjük,
+      // hogy onFadeOutComplete ne pause-olja resume-olhatóként, hanem
+      // véglegesen lezárja (a queue-t a stopAll()/stopByType() már
+      // kiürítette, szóval amúgy sem lenne mire resume-olni).
+      if (reason === "stopped") this.active.fadeOutReason = "stopped";
+      return;
+    }
 
-    console.log(`[Mixer:${this.tenantId}] ↘ fade-out: ${this.active.job.jobType}`);
+    this.active.fadeOutStart  = this.active.bytesWritten;
+    this.active.fadeOutReason = reason;
+
+    console.log(`[Mixer:${this.tenantId}] ↘ fade-out (${reason}): ${this.active.job.jobType}`);
   }
 
   private onFadeOutComplete(src: ActiveSource): void {
@@ -846,6 +869,26 @@ export class TenantAudioMixer extends EventEmitter {
       src.proc.kill("SIGTERM");
     } catch {
       // ignore
+    }
+
+    this.active = null;
+
+    if (src.fadeOutReason === "stopped") {
+      // User-initiated STOP_PLAYBACK: nincs resume/pause – a stopAll()/
+      // stopByType() már kiürítette a queue-t és a pausedStack-et, mielőtt
+      // a fade-out elindult. Csak lezárjuk a job-ot és folytatjuk a háttér-
+      // silence-t (mint killActive), NEM advance-elünk a queue-ra.
+      this.resumeSilence();
+
+      this.emit("source:end", {
+        jobId:        src.job.id,
+        jobType:      src.job.jobType,
+        reason:       "stopped" as SourceEndReason,
+        bytesWritten: src.bytesWritten,
+      });
+
+      console.log(`[Mixer:${this.tenantId}] ⏹ fade-out kész (stopped): ${src.job.jobType}`);
+      return;
     }
 
     // Resume-bytes: file/url forrás esetén a megszakítás pontján folytatjuk
@@ -869,8 +912,6 @@ export class TenantAudioMixer extends EventEmitter {
         ? ` (stream → live resume)`
         : ` @ ${(resumeBytes / BYTES_PER_SEC).toFixed(2)}s`)
     );
-
-    this.active = null;
 
     this.emit("source:end", {
       jobId: src.job.id,
