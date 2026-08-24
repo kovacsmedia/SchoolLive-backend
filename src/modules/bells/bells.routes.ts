@@ -99,6 +99,18 @@ async function authenticateDevice(req: Request): Promise<any | null> {
   return null;
 }
 
+// Tanév: szeptember 1 – július 1. Ha a mai budapesti dátum >= augusztus,
+// az idei szeptember a kezdet; egyébként a tavalyi.
+function schoolYearRange(today: Date): { start: Date; end: Date } {
+  const y = today.getUTCFullYear();
+  const m = today.getUTCMonth(); // 0-indexelt: 7 = augusztus
+  const startYear = m >= 7 ? y : y - 1;
+  return {
+    start: new Date(Date.UTC(startYear, 8, 1)),      // szept 1
+    end:   new Date(Date.UTC(startYear + 1, 6, 1)),  // (köv. év) júl 1
+  };
+}
+
 async function resolveTodayBells(tenantId: string, today: Date): Promise<{
   bells: any[];
   defaultBells: any[];
@@ -600,6 +612,63 @@ bellsRouter.get("/today", async (req: Request, res: Response) => {
   });
 });
 
+// ── Teljes tanévnyi naptár (szept 1 – júl 1) – minden sablon + minden
+// naptár-kivétel (ünnepnap / eltérő sablon adott napra) + a hangfájlok.
+// Ezzel egy eszköz teljesen offline is ki tudja számolni BÁRMELYIK jövőbeli
+// nap csengetési rendjét, nem csak a "ma"-t – nem kell online lennie azon a
+// napon, amikor egy naptár-kivétel életbe lép.
+async function buildFullYearCalendar(tenantId: string): Promise<{
+  schoolYear:       { start: string; end: string };
+  defaultTemplateId: string | null;
+  templates:        Array<{ id: string; isDefault: boolean; bells: Array<{ hour: number; minute: number; type: string; soundFile: string }> }>;
+  calendar:         Array<{ date: string; isHoliday: boolean; templateId: string | null }>;
+  sounds:           Array<{ filename: string; url: string; sizeBytes: number }>;
+  fullYearVersion:  string;
+}> {
+  const { start, end } = schoolYearRange(todayInBudapest());
+
+  const [templates, calendarDays, sounds] = await Promise.all([
+    prisma.bellScheduleTemplate.findMany({
+      where:   { tenantId },
+      include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
+    }),
+    prisma.bellCalendarDay.findMany({
+      where:   { tenantId, date: { gte: start, lt: end } },
+      orderBy: { date: "asc" },
+    }),
+    prisma.bellSoundFile.findMany({ where: { tenantId, kind: "SCHEDULE" } }),
+  ]);
+
+  const templatesOut = templates.map((t: any) => ({
+    id:        t.id,
+    isDefault: t.isDefault,
+    bells:     t.bells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
+  }));
+  const calendarOut = calendarDays.map((d: any) => ({
+    date:       d.date.toISOString().slice(0, 10),
+    isHoliday:  d.isHoliday,
+    templateId: d.templateId,
+  }));
+  const soundsOut = sounds.map((s: any) => ({
+    filename:  s.filename,
+    url:       `/audio/bells/${s.filename}`,
+    sizeBytes: s.sizeBytes,
+  }));
+
+  const fullYearVersion = crypto.createHash("md5")
+    .update(JSON.stringify({ templatesOut, calendarOut, soundsOut }))
+    .digest("hex").slice(0, 12);
+
+  return {
+    schoolYear:        { start: start.toISOString().slice(0, 10), end: end.toISOString().slice(0, 10) },
+    defaultTemplateId: templates.find((t: any) => t.isDefault)?.id ?? null,
+    templates:         templatesOut,
+    calendar:          calendarOut,
+    sounds:            soundsOut,
+    fullYearVersion,
+  };
+}
+
 // ── /sync – ESP32 / native player ─────────────────────────────────────────
 
 bellsRouter.get("/sync", async (req: Request, res: Response) => {
@@ -613,6 +682,8 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
   const sounds = await prisma.bellSoundFile.findMany({
     where: { tenantId: device.tenantId, kind: "SCHEDULE" },
   });
+
+  const fullYear = await buildFullYearCalendar(device.tenantId);
 
   res.json({
     ok: true,
@@ -637,6 +708,14 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
       sizeBytes: s.sizeBytes,
     })),
     updatedAt: new Date().toISOString(),
+    // Új, additív mezők: a teljes tanévnyi naptár. A régi kliensek ezeket
+    // egyszerűen figyelmen kívül hagyják (bells/defaultBells/sounds
+    // változatlan formában megmarad "ma" nézetnek).
+    schoolYear:        fullYear.schoolYear,
+    defaultTemplateId: fullYear.defaultTemplateId,
+    templates:         fullYear.templates,
+    calendar:          fullYear.calendar,
+    fullYearVersion:   fullYear.fullYearVersion,
   });
 });
 
@@ -651,6 +730,8 @@ export async function buildScheduleSyncPayload(tenantId: string): Promise<object
     where: { tenantId, kind: "SCHEDULE" },
   });
 
+  const fullYear = await buildFullYearCalendar(tenantId);
+
   return {
     type:           "SCHEDULE_SYNC",
     isHoliday,
@@ -660,5 +741,11 @@ export async function buildScheduleSyncPayload(tenantId: string): Promise<object
     defaultBells:   defaultBells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
     sounds:         sounds.map((s: any) => ({ filename: s.filename, url: `/audio/bells/${s.filename}`, sizeBytes: s.sizeBytes })),
     updatedAt:      new Date().toISOString(),
+    // Additív mezők – teljes tanévnyi naptár (ld. buildFullYearCalendar).
+    schoolYear:        fullYear.schoolYear,
+    defaultTemplateId: fullYear.defaultTemplateId,
+    templates:         fullYear.templates,
+    calendar:          fullYear.calendar,
+    fullYearVersion:   fullYear.fullYearVersion,
   };
 }

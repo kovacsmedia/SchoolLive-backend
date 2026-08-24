@@ -305,7 +305,18 @@ class TenantSnapEngine {
     deviceIdsToUnmute?: string[]
   ): Promise<void> {
     const port = httpPort(this.snapPort);
-    const wanted = new Set(deviceIdsToUnmute ?? []);
+
+    // Csak az ISMERTEN online eszközökre várunk – korábban egy tartósan
+    // offline célzott eszköz (pl. elromlott hangszóró) a teljes 3mp-es
+    // timeoutot kivárta minden egyes lejátszásnál, mert sosem jelent meg a
+    // snapserver kliens-listáján. A WS-kapcsolat állapota (SyncEngine)
+    // valós idejű, így ezzel szűrünk a várakozás ELŐTT – ha egy eszköz
+    // WS-en nincs csatlakozva, nem is fog snap-clientként megjelenni,
+    // szóval fölösleges rá várni.
+    const { SyncEngine } = await import("../../sync/SyncEngine");
+    const wanted = new Set(
+      (deviceIdsToUnmute ?? []).filter((id) => SyncEngine.isDeviceOnline(id))
+    );
 
     const timeoutMs = 3000;
     const pollMs = 150;

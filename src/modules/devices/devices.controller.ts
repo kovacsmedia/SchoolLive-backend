@@ -162,15 +162,23 @@ export async function createDeviceCommand(req: Request, res: Response) {
   });
 
   // WebSocket-en is azonnal kiküldjük a parancsot a célzott eszköznek.
-  // A Linux/Windows/ESP kliensek a `/devices/poll`-on úgyis észlelik (DB),
-  // így ez számukra ártalmatlan duplikáció (a WS-action-üket egyébként
-  // sem dolgozzák fel: SET_VOLUME/MUTE-ra nincs WS handler).
-  // Az Android kliens viszont NEM poll-oz, csak WS-en kommunikál → eddig
-  // nem kapta meg a SET_VOLUME/MUTE parancsokat → a slider és a némítás
-  // gomb nem hatott. A targeted broadcast ezt javítja.
+  // Az üzenet MINDKÉT alakot tartalmazza egyszerre, hogy a különböző
+  // kliens-parserek is felismerjék:
+  //  - ESP32 (DeviceAgent::onWsMessage) kizárólag `type:"COMMAND"` +
+  //    `payload.action`-t ismeri fel (wrappelt alak).
+  //  - Android (SyncClient) a top-level `action` mezőt nézi, `type`-ot
+  //    figyelmen kívül hagyja (bare alak).
+  // A commandId mindkettőnek jelen van, hogy CMD_ACK-ot tudjanak küldeni –
+  // ez zárja ki, hogy a parancs a `/devices/poll`-on keresztül még egyszer,
+  // duplikáltan végrehajtódjon (poll csak QUEUED állapotú parancsot ad ki,
+  // ACK után a command SENT→ACKED lesz).
   try {
     const { SyncEngine } = await import("../../sync/SyncEngine");
-    SyncEngine.broadcastImmediate(user.tenantId!, payload, [deviceId]);
+    SyncEngine.broadcastImmediate(
+      user.tenantId!,
+      { ...(payload as object), type: "COMMAND", commandId: command.id, payload },
+      [deviceId],
+    );
   } catch (e) {
     console.error(`[device-command] WS broadcast hiba (${deviceId}):`, e);
   }
@@ -284,175 +292,6 @@ export async function ackCommand(req: Request, res: Response) {
       data: { playedAt: new Date() },
     }).catch(() => { /* silent */ });
   }
-
-  return res.json({ ok: true, command: updated });
-}
-
-export async function playerPollCommands(req: Request, res: Response) {
-  const user = req.user;
-  if (!user) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
-  if (user.role !== "PLAYER") return res.status(403).json({ ok: false, error: "FORBIDDEN" });
-
-  const { clientId } = req.body ?? {};
-  if (!clientId || typeof clientId !== "string") {
-    return res.status(400).json({ ok: false, error: "clientId is required" });
-  }
-  if (!user.tenantId) {
-    return res.status(400).json({ ok: false, error: "TENANT_CONTEXT_REQUIRED" });
-  }
-
-  const device = await prisma.device.findFirst({
-    where: {
-      tenantId: user.tenantId,
-      authType: "JWT",
-      userId: user.sub,
-      clientId,
-    },
-    select: { id: true, tenantId: true },
-  });
-
-  if (!device) {
-    return res.status(404).json({ ok: false, error: "DEVICE_NOT_REGISTERED" });
-  }
-
-  await prisma.device.update({
-    where: { id: device.id },
-    data: { online: true, lastSeenAt: new Date() },
-  });
-
-  const dev = { id: device.id, tenantId: device.tenantId };
-  const now = new Date();
-
-  const sentList = await prisma.deviceCommand.findMany({
-    where: { tenantId: dev.tenantId, deviceId: dev.id, status: "SENT" },
-    orderBy: { queuedAt: "asc" },
-  });
-
-  if (sentList.length > 1) {
-    const toRequeueIds = sentList.slice(1).map((c) => c.id);
-    await prisma.deviceCommand.updateMany({
-      where: { id: { in: toRequeueIds } },
-      data: { status: "QUEUED", sentAt: null, lastError: "Superseded: another command was already in-flight" },
-    });
-  }
-
-  const inFlight = await prisma.deviceCommand.findFirst({
-    where: { tenantId: dev.tenantId, deviceId: dev.id, status: "SENT" },
-    orderBy: { sentAt: "asc" },
-  });
-
-  if (inFlight) {
-    const sentAt = inFlight.sentAt ?? new Date(0);
-    const timeoutMs = ackTimeoutMs(inFlight.retryCount);
-    const timeoutBefore = new Date(now.getTime() - timeoutMs);
-
-    if (sentAt > timeoutBefore) {
-      return res.json({ ok: true, command: null });
-    }
-
-    if (inFlight.retryCount < inFlight.maxRetries) {
-      const updated = await prisma.deviceCommand.update({
-        where: { id: inFlight.id },
-        data: { retryCount: { increment: 1 }, sentAt: now, lastError: `Timeout: ACK not received (timeoutMs=${timeoutMs})` },
-      });
-      return res.json({ ok: true, command: updated });
-    }
-
-    await prisma.deviceCommand.update({
-      where: { id: inFlight.id },
-      data: { status: "FAILED", ackedAt: now, lastError: "Timeout: max retries reached", error: "Timeout: max retries reached" },
-    });
-  }
-
-  const queued = await prisma.deviceCommand.findFirst({
-    where: { tenantId: dev.tenantId, deviceId: dev.id, status: "QUEUED" },
-    orderBy: { queuedAt: "asc" },
-  });
-
-  if (!queued) {
-    return res.json({ ok: true, command: null });
-  }
-
-  const updatedCount = await prisma.deviceCommand.updateMany({
-    where: { id: queued.id, status: "QUEUED" },
-    data: { status: "SENT", sentAt: now },
-  });
-
-  if (updatedCount.count === 0) {
-    return res.json({ ok: true, command: null });
-  }
-
-  const fresh = await prisma.deviceCommand.findUnique({ where: { id: queued.id } });
-  return res.json({ ok: true, command: fresh });
-}
-
-export async function playerAckCommand(req: Request, res: Response) {
-  const user = req.user;
-  if (!user) return res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
-  if (user.role !== "PLAYER") return res.status(403).json({ ok: false, error: "FORBIDDEN" });
-
-  const { clientId, commandId, ok, error } = req.body ?? {};
-
-  if (!clientId || typeof clientId !== "string") {
-    return res.status(400).json({ ok: false, error: "clientId is required" });
-  }
-  if (!commandId || typeof commandId !== "string") {
-    return res.status(400).json({ ok: false, error: "commandId is required" });
-  }
-  if (typeof ok !== "boolean") {
-    return res.status(400).json({ ok: false, error: "ok is required (boolean)" });
-  }
-  if (!user.tenantId) {
-    return res.status(400).json({ ok: false, error: "TENANT_CONTEXT_REQUIRED" });
-  }
-
-  const device = await prisma.device.findFirst({
-    where: {
-      tenantId: user.tenantId,
-      authType: "JWT",
-      userId: user.sub,
-      clientId,
-    },
-    select: { id: true, tenantId: true },
-  });
-
-  if (!device) {
-    return res.status(404).json({ ok: false, error: "DEVICE_NOT_REGISTERED" });
-  }
-
-  const cmd = await prisma.deviceCommand.findFirst({
-    where: { id: commandId, tenantId: device.tenantId, deviceId: device.id },
-  });
-  if (!cmd) {
-    return res.status(404).json({ ok: false, error: "COMMAND_NOT_FOUND" });
-  }
-
-  if (cmd.status === "ACKED" || cmd.status === "FAILED") {
-    return res.json({ ok: true, command: cmd, note: "Already finalized" });
-  }
-
-  const updated = await prisma.deviceCommand.update({
-    where: { id: cmd.id },
-    data: {
-      status: ok ? "ACKED" : "FAILED",
-      ackedAt: new Date(),
-      lastError: ok ? null : (typeof error === "string" ? error : "Player reported error"),
-      error: ok ? null : (typeof error === "string" ? error : "Player reported error"),
-    },
-  });
-
-  // Ha sikeres ACK és van messageId, frissítjük a Message.playedAt-et
-  if (ok && cmd.messageId) {
-    await prisma.message.update({
-      where: { id: cmd.messageId },
-      data: { playedAt: new Date() },
-    }).catch(() => { /* silent */ });
-  }
-
-  await prisma.device.update({
-    where: { id: device.id },
-    data: { online: true, lastSeenAt: new Date() },
-  });
 
   return res.json({ ok: true, command: updated });
 }

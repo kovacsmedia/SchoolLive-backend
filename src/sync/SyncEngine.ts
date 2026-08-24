@@ -55,6 +55,12 @@ export interface ReadyAck {
 interface ConnectedClient {
   ws:          WebSocket;
   deviceId:    string;
+  // A tényleges Device.id az adatbázisban. ESP32/native (deviceKey-auth)
+  // kliensnél megegyezik a `deviceId`-vel. Böngésző (JWT-auth) kliensnél a
+  // `deviceId` a kliens saját localStorage clientId-ja, ami NEM a Device.id –
+  // ezt itt tároljuk, hogy a DB-írások (beacon, online-státusz, parancs
+  // lookup) mindig a helyes rekordot érjék el.
+  dbDeviceId:  string;
   tenantId:    string;
   type:        "browser" | "esp32";
   connectedAt: Date;
@@ -163,12 +169,29 @@ class SyncEngineClass {
       (req.socket as any)?.remoteAddress ||
       null;
 
-    const client: ConnectedClient = { ws, deviceId, tenantId, type: clientType, connectedAt: new Date(), ipAddress };
+    // dbDeviceId egyelőre = deviceId (esp32-nél ez már helyes); böngészőnél
+    // lentebb, a userId+tenantId lookup után frissül a tényleges Device.id-re.
+    const client: ConnectedClient = { ws, deviceId, dbDeviceId: deviceId, tenantId, type: clientType, connectedAt: new Date(), ipAddress };
     this.clients.set(deviceId, client);
     console.log(`[SyncEngine] 🔌 Csatlakozott: ${deviceId} (${client.type}) tenant=${tenantId}`);
 
+    // Holt kapcsolat felismerése: ha egy klienstől 70mp-ig (kb. 2-3 ping
+    // ciklus) nem jön pong, a socket félig-nyitva ragadhatott (pl. kliens
+    // oldali hálózati hiba, ami nem zárja le tisztán a TCP-t) – ilyenkor
+    // online-nak látszana a poll/HTTP kivezetése után is, hiszen kizárólag
+    // erre a WS-kapcsolatra támaszkodunk. terminate() erőltetett zárás,
+    // ami lefuttatja a meglévő "close" handlert (offline jelölés, cleanup).
+    let lastPongAt = Date.now();
+    ws.on("pong", () => { lastPongAt = Date.now(); });
     const pingInterval = setInterval(() => {
-      if (ws.readyState === 1) ws.ping(); else clearInterval(pingInterval);
+      if (ws.readyState !== 1) { clearInterval(pingInterval); return; }
+      if (Date.now() - lastPongAt > 70_000) {
+        console.warn(`[SyncEngine] ⚠️ Nincs pong 70mp-ig, holt kapcsolat bontása: ${deviceId}`);
+        clearInterval(pingInterval);
+        ws.terminate();
+        return;
+      }
+      ws.ping();
     }, 25_000);
 
     ws.on("message", (data: Buffer | ArrayBuffer | Buffer[]) => {
@@ -178,10 +201,11 @@ class SyncEngineClass {
 
     ws.on("close", () => {
       clearInterval(pingInterval);
-      if (this.clients.get(deviceId)?.ws === ws) {
+      const closing = this.clients.get(deviceId);
+      if (closing?.ws === ws) {
         this.clients.delete(deviceId);
         console.log(`[SyncEngine] 🔌 Lecsatlakozott: ${deviceId}`);
-        void this.onDeviceDisconnected(deviceId);
+        void this.onDeviceDisconnected(deviceId, closing.dbDeviceId);
       }
     });
 
@@ -236,6 +260,10 @@ class SyncEngineClass {
       }
     }
 
+    // A regisztrált klienshez tartozó dbDeviceId frissítése a feloldott
+    // Device.id-re (böngészőnél ez tér el a `deviceId` regisztrációs kulcstól).
+    client.dbDeviceId = resolvedSnapDeviceId ?? deviceId;
+
     this.send(ws, {
       type:           "HELLO",
       serverNow:      new Date(nowMs).toISOString(),
@@ -251,19 +279,20 @@ class SyncEngineClass {
       ...(clientType === "esp32" && snapHost && snapPort ? { snapHost, snapPort } : {}),
     });
 
-    void this.onDeviceConnected(deviceId, tenantId, clientType, ipAddress);
+    void this.onDeviceConnected(deviceId, client.dbDeviceId, tenantId, clientType, ipAddress);
   }
 
   private handleMessage(deviceId: string, tenantId: string, msg: any): void {
+    const client     = this.clients.get(deviceId);
+    const dbDeviceId = client?.dbDeviceId ?? deviceId;
     if (msg.type === "READY_ACK") {
       this.receiveAck(msg as ReadyAck & { type: string });
     } else if (msg.type === "TIME_SYNC") {
-      const client = this.clients.get(deviceId);
       if (client) this.send(client.ws, { type: "TIME_SYNC_RESPONSE", clientSeq: msg.seq, serverNow: new Date().toISOString() });
     } else if (msg.type === "BEACON") {
-      void this.handleBeacon(deviceId, tenantId, msg);
+      void this.handleBeacon(deviceId, dbDeviceId, tenantId, msg);
     } else if (msg.type === "CMD_ACK") {
-      void this.handleCmdAck(deviceId, tenantId, msg);
+      void this.handleCmdAck(deviceId, dbDeviceId, tenantId, msg);
     }
   }
 
@@ -445,8 +474,13 @@ class SyncEngineClass {
     profile.p95 = sorted[Math.floor(sorted.length * 0.95)] ?? sorted[sorted.length - 1];
   }
 
+  // `deviceId` = WS regisztrációs kulcs (this.clients keye, socket-lookuphoz).
+  // `dbDeviceId` = a tényleges Device.id (DB-írásokhoz/-lookupokhoz). ESP32-nél
+  // a kettő egyezik; böngészőnél a `deviceId` a kliens clientId-ja, a
+  // `dbDeviceId` a userId+tenantId alapján feloldott valódi Device.id.
   private async onDeviceConnected(
     deviceId: string,
+    dbDeviceId: string,
     tenantId: string,
     clientType: "browser" | "esp32",
     ipAddress: string | null,
@@ -456,7 +490,7 @@ class SyncEngineClass {
     try {
       const { prisma } = await import("../prisma/client");
       const dev = await prisma.device.update({
-        where: { id: deviceId },
+        where: { id: dbDeviceId },
         data: { online: true, lastSeenAt: new Date(), ipAddress: ipAddress ?? undefined },
         select: { channelMode: true, deviceClass: true },
       });
@@ -465,30 +499,33 @@ class SyncEngineClass {
       // Multizone: betöltjük a zóna device ID-ket és feltöltjük a zónatérképet
       if (dev?.deviceClass === "MULTIZONE") {
         const zoneDevices = await prisma.device.findMany({
-          where: { parentDeviceId: deviceId },
+          where: { parentDeviceId: dbDeviceId },
           select: { id: true, zoneIndex: true },
           orderBy: { zoneIndex: "asc" },
         });
         // Z1 (master) is a zone
-        zones = [{ zoneIndex: 1, deviceId }, ...zoneDevices.map(z => ({ zoneIndex: z.zoneIndex ?? 0, deviceId: z.id }))];
+        zones = [{ zoneIndex: 1, deviceId: dbDeviceId }, ...zoneDevices.map(z => ({ zoneIndex: z.zoneIndex ?? 0, deviceId: z.id }))];
         for (const z of zoneDevices) {
-          this.zoneToMaster.set(z.id, deviceId);
+          this.zoneToMaster.set(z.id, dbDeviceId);
         }
-        console.log(`[SyncEngine] MULTIZONE zónatérkép: ${deviceId} → ${zoneDevices.length + 1} zóna`);
+        console.log(`[SyncEngine] MULTIZONE zónatérkép: ${dbDeviceId} → ${zoneDevices.length + 1} zóna`);
         // Zóna eszközök online-nak jelölése
         await prisma.device.updateMany({
-          where: { parentDeviceId: deviceId },
+          where: { parentDeviceId: dbDeviceId },
           data: { online: true, lastSeenAt: new Date() },
         });
       }
     } catch (e) {
-      console.warn(`[SyncEngine] onDeviceConnected DB hiba (${deviceId}):`, e);
+      console.warn(`[SyncEngine] onDeviceConnected DB hiba (${dbDeviceId}):`, e);
     }
-    if (clientType !== "esp32") return;
 
     const client = this.clients.get(deviceId);
     if (!client || client.ws.readyState !== 1) return;
 
+    // SCHEDULE_SYNC MINDEN kliens-típusnak megy (nem csak ESP32-nek) – a
+    // teljes tanévnyi naptárat (ld. buildFullYearCalendar) is tartalmazza,
+    // hogy bármelyik platform el tudja tárolni/hasznosítani, ne csak a
+    // "ma" nézetet lássa.
     try {
       const { buildScheduleSyncPayload } = await import("../modules/bells/bells.routes");
       const payload = await buildScheduleSyncPayload(tenantId);
@@ -497,6 +534,8 @@ class SyncEngineClass {
     } catch (e) {
       console.warn(`[SyncEngine] SCHEDULE_SYNC hiba (${deviceId}):`, e);
     }
+
+    if (clientType !== "esp32") return;
 
     // channelMode szinkronizálás
     if (channelMode !== "MIXED" && client?.ws.readyState === 1) {
@@ -513,31 +552,32 @@ class SyncEngineClass {
       console.log(`[SyncEngine] 🔌 ZONE_CONFIG → ${deviceId}: ${zones.length} zóna`);
     }
 
-    await this.pushPendingCommands(deviceId, tenantId);
+    await this.pushPendingCommands(deviceId, dbDeviceId, tenantId);
   }
 
-  private async onDeviceDisconnected(deviceId: string): Promise<void> {
+  private async onDeviceDisconnected(deviceId: string, dbDeviceId: string): Promise<void> {
     // Zónatérkép tisztítása
     for (const [zoneId, masterId] of this.zoneToMaster.entries()) {
-      if (masterId === deviceId) this.zoneToMaster.delete(zoneId);
+      if (masterId === dbDeviceId) this.zoneToMaster.delete(zoneId);
     }
     try {
       const { prisma } = await import("../prisma/client");
-      await prisma.device.update({ where: { id: deviceId }, data: { online: false } });
+      await prisma.device.update({ where: { id: dbDeviceId }, data: { online: false } });
       // Multizone: zóna eszközök offline-nak jelölése
-      await prisma.device.updateMany({ where: { parentDeviceId: deviceId }, data: { online: false } });
+      await prisma.device.updateMany({ where: { parentDeviceId: dbDeviceId }, data: { online: false } });
     } catch (e) {
-      console.warn(`[SyncEngine] onDeviceDisconnected DB hiba (${deviceId}):`, e);
+      console.warn(`[SyncEngine] onDeviceDisconnected DB hiba (${dbDeviceId}):`, e);
     }
   }
 
-  private async handleBeacon(deviceId: string, tenantId: string, msg: any): Promise<void> {
+  private async handleBeacon(deviceId: string, dbDeviceId: string, tenantId: string, msg: any): Promise<void> {
     const { volume, muted, firmwareVersion, statusPayload } = msg;
     try {
       const { prisma } = await import("../prisma/client");
       await prisma.device.update({
-        where: { id: deviceId },
+        where: { id: dbDeviceId },
         data: {
+          online:          true,
           lastSeenAt:      new Date(),
           firmwareVersion: typeof firmwareVersion === "string" ? firmwareVersion : undefined,
           volume:          typeof volume === "number" ? volume : undefined,
@@ -561,17 +601,17 @@ class SyncEngineClass {
         });
       }
     } catch (e) {
-      console.error(`[SyncEngine] handleBeacon hiba (${deviceId}):`, e);
+      console.error(`[SyncEngine] handleBeacon hiba (${dbDeviceId}):`, e);
     }
   }
 
-  private async handleCmdAck(deviceId: string, tenantId: string, msg: any): Promise<void> {
+  private async handleCmdAck(deviceId: string, dbDeviceId: string, tenantId: string, msg: any): Promise<void> {
     const { commandId, ok, error } = msg;
     if (!commandId || typeof commandId !== "string") return;
     try {
       const { prisma } = await import("../prisma/client");
       const cmd = await prisma.deviceCommand.findFirst({
-        where: { id: commandId, tenantId, deviceId },
+        where: { id: commandId, tenantId, deviceId: dbDeviceId },
       });
       if (!cmd || cmd.status === "ACKED" || cmd.status === "FAILED") return;
       await prisma.deviceCommand.update({
@@ -582,21 +622,21 @@ class SyncEngineClass {
           error:   typeof error === "string" ? error : null,
         },
       });
-      console.log(`[SyncEngine] ✅ CMD_ACK: ${commandId} ok=${ok} device=${deviceId}`);
-      await this.pushPendingCommands(deviceId, tenantId);
+      console.log(`[SyncEngine] ✅ CMD_ACK: ${commandId} ok=${ok} device=${dbDeviceId}`);
+      await this.pushPendingCommands(deviceId, dbDeviceId, tenantId);
     } catch (e) {
-      console.error(`[SyncEngine] handleCmdAck hiba (${deviceId}):`, e);
+      console.error(`[SyncEngine] handleCmdAck hiba (${dbDeviceId}):`, e);
     }
   }
 
-  async pushPendingCommands(deviceId: string, tenantId: string): Promise<void> {
+  async pushPendingCommands(deviceId: string, dbDeviceId: string, tenantId: string): Promise<void> {
     const client = this.clients.get(deviceId);
     if (!client || client.ws.readyState !== 1) return;
     try {
       const { prisma } = await import("../prisma/client");
 
       const queued = await prisma.deviceCommand.findFirst({
-        where:   { deviceId, tenantId, status: "QUEUED" },
+        where:   { deviceId: dbDeviceId, tenantId, status: "QUEUED" },
         orderBy: { queuedAt: "asc" },
       });
       if (!queued) return;
@@ -629,8 +669,16 @@ class SyncEngineClass {
   }
 
   isDeviceOnline(deviceId: string): boolean {
+    // A hívók (bells/messages/radio ütemezők) mindig a valódi Device.id-t
+    // adják át. ESP32/native kliensnél ez egyezik a WS regisztrációs
+    // kulccsal, így a direkt lookup elég. Böngészőnél (WebPlayer) a
+    // regisztrációs kulcs a kliens saját clientId-ja – ott dbDeviceId
+    // alapján kell megkeresni a klienst.
     const client = this.clients.get(deviceId);
     if (client && client.ws.readyState === 1) return true;
+    for (const c of this.clients.values()) {
+      if (c.dbDeviceId === deviceId && c.ws.readyState === 1) return true;
+    }
     // Zóna device: a master online státusza alapján
     const masterId = this.zoneToMaster.get(deviceId);
     if (masterId) {
