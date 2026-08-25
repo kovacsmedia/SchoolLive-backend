@@ -15,6 +15,7 @@ import crypto from "crypto";
 import { prisma }        from "../../prisma/client";
 import { authJwt }       from "../../middleware/authJwt";
 import { requireTenant } from "../../middleware/tenant";
+import { SyncEngine }    from "../../sync/SyncEngine";
 
 const router = Router();
 
@@ -76,6 +77,18 @@ router.post("/upload", authJwt, requireTenant, upload.single("file"),
       });
 
       console.log(`[OTA] Firmware feltöltve: ${version} (${req.file.size} bytes)`);
+
+      // WS "nézd meg most" ébresztő minden csatlakozott eszköznek – enélkül
+      // a poll-only OTA check (30 percenként, OtaManager.h CHECK_INTERVAL_MS)
+      // miatt egy már online eszköz akár fél órát is várna, mire észreveszi
+      // az új verziót.
+      SyncEngine.broadcastToAllTenants({
+        type:        "OTA_UPDATE",
+        version:     release.version,
+        mandatory:   release.mandatory,
+        targetClass: release.targetClass,
+      });
+
       return res.status(201).json({ ok: true, release });
     } catch (e: any) {
       if (e.code === "P2002") return res.status(409).json({ error: "Ez a verzió már létezik" });

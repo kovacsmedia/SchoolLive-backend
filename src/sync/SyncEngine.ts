@@ -435,6 +435,21 @@ class SyncEngineClass {
     console.log(`[SyncEngine] 📡 Broadcast → ${targets.length} eszköz`);
   }
 
+  // Tenant-független broadcast – kizárólag a FirmwareRelease-hez kell, mivel
+  // az globális (nincs tenantId mezője), minden bejelentkezett eszköznek
+  // szól. A device-osztály/verzió szerinti tényleges szűrést a kliens saját
+  // GET /firmware/check hívása végzi el – ez a broadcast csak egy "nézd meg
+  // most" ébresztő, nem a frissítés maga.
+  broadcastToAllTenants(payload: object): void {
+    let count = 0;
+    for (const client of this.clients.values()) {
+      if (client.ws.readyState !== 1) continue;
+      this.send(client.ws, payload);
+      count++;
+    }
+    console.log(`[SyncEngine] 📡 Globális broadcast → ${count} eszköz`);
+  }
+
   private getOnlineClients(tenantId: string, deviceIds?: string[]): ConnectedClient[] {
     const result: ConnectedClient[] = [];
     const seen = new Set<string>();
