@@ -9,6 +9,10 @@ import { env }                  from "./config/env";
 import { startBellsScheduler }  from "./modules/bells/bell.scheduler";
 import { startRadioScheduler }  from "./modules/radio/radio.scheduler";
 import { startDeviceLifecycleScheduler } from "./modules/devices/device.lifecycle";
+import { startClusterHeartbeat } from "./modules/cluster/cluster.heartbeat";
+import { startLeaderElection, releaseLeadershipIfHeld } from "./modules/cluster/cluster.leader";
+import { startClusterRebalancer } from "./modules/cluster/cluster.rebalancer";
+import { startOwnershipPoller }  from "./modules/cluster/tenant-ownership";
 import { SyncEngine }           from "./sync/SyncEngine";
 import usersAdminRoutes         from "./modules/users/users.admin.routes";
 import { createSnapStreamWss }  from "./modules/snapcast/snap-stream-proxy";
@@ -57,6 +61,14 @@ startBellsScheduler();
 startRadioScheduler();
 startDeviceLifecycleScheduler();
 
+// ── Cluster (multi-node) ─────────────────────────────────────────────────────
+// Sorrend számít: a heartbeat regisztrálja a node-ot (getSelfNodeId), amire a
+// leader-election és a rebalancer/ownership pollerek is támaszkodnak.
+startClusterHeartbeat();
+startLeaderElection();
+startClusterRebalancer();
+startOwnershipPoller();
+
 app.use("/admin/users", usersAdminRoutes);
 
 // ── Indítás ───────────────────────────────────────────────────────────────────
@@ -69,11 +81,16 @@ server.listen(env.PORT, () => {
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 process.on("SIGTERM", () => {
   console.log("[Server] SIGTERM – leállítás...");
-  syncWss.close(() => {
-    snapStreamWss.close(() => {
-      server.close(() => {
-        console.log("[Server] Leállítva.");
-        process.exit(0);
+  // Ha épp mi vagyunk a cluster leader, azonnal elengedjük a lease-t – így
+  // egy rutin `pm2 reload` deploy nem okoz felesleges ~20mp-es failover-
+  // ablakot minden push-nál (a köv. renewal-tick úgyis átveszi más node).
+  void releaseLeadershipIfHeld().finally(() => {
+    syncWss.close(() => {
+      snapStreamWss.close(() => {
+        server.close(() => {
+          console.log("[Server] Leállítva.");
+          process.exit(0);
+        });
       });
     });
   });

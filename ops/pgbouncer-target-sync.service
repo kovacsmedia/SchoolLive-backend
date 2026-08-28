@@ -1,0 +1,9 @@
+[Unit]
+Description=SchoolLive cluster — PgBouncer célpont szinkron a pg_auto_failover primary-jével
+After=network-online.target postgresql.service pgbouncer.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=postgres
+ExecStart=/opt/schoollive/backend/ops/pgbouncer-target-sync.sh

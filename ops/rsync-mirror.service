@@ -1,0 +1,9 @@
+[Unit]
+Description=SchoolLive cluster — hangfájlok (audio/, uploads/) tükrözése a többi node-ra
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=deploy
+ExecStart=/opt/schoollive/backend/ops/rsync-mirror.sh

@@ -161,6 +161,17 @@ class SyncEngineClass {
 
     if (!tenantId) { ws.close(4003, "Missing tenantId"); return; }
 
+    // Multi-node cluster: ez a tenant lehet, hogy NEM ehhez a node-hoz van
+    // rendelve (rebalancing miatt elköltözött, vagy a kliens még a régi
+    // node-ot próbálja). A 4009-es close code szándékosan egyedi – a
+    // majdani kliens-oldali reconnect-logika ebből tudja, hogy más node-ot
+    // kell keresnie (GET /cluster/locate), nem általános auth-hiba.
+    const { isOwnedByThisNode } = await import("../modules/cluster/tenant-ownership");
+    if (!isOwnedByThisNode(tenantId)) {
+      ws.close(4009, "Tenant not hosted on this node");
+      return;
+    }
+
     const existing = this.clients.get(deviceId);
     if (existing && existing.ws.readyState === 1) existing.ws.close(4010, "Replaced");
 
@@ -236,7 +247,7 @@ class SyncEngineClass {
           ]);
           if (dev) syncOffsetMs = dev.syncOffsetMs ?? 0;
           resolvedSnapDeviceId = deviceId;
-          snapHost = process.env.SNAP_HOST ?? "api.schoollive.hu";
+          snapHost = env.NODE_HOSTNAME; // multi-node: mindig EZ a node a snap-cél, sosem egy globális fix host (ld. terv Fázis 7)
           snapPort = tenant?.snapPort ?? null;
         } else if (token) {
           // Browser: a JWT-ben benne van a userId (payload.sub).
@@ -450,6 +461,30 @@ class SyncEngineClass {
     console.log(`[SyncEngine] 📡 Globális broadcast → ${count} eszköz`);
   }
 
+  // Multi-node cluster: amikor ez a node elveszít egy tenantot (rebalancing
+  // miatt), az annak kapcsolódott kliensei ne várjanak a köv. beacon/ping-
+  // timeoutra – azonnal, explicit lezárjuk a WS kapcsolatukat, ugyanazzal
+  // a 4009 close code-dal, mint a handleConnection() ownership-kapuja.
+  // A tenant-ownership.ts poll-diff-je hívja, mielőtt a snap-engine teardown
+  // is lefut.
+  // `newHostname`: ha meg van adva, MINDEN érintett klienshez elküldünk egy
+  // explicit "ide menj" üzenetet a close előtt, hogy azonnal, aktívan tudjon
+  // átkapcsolni – nem kell megvárnia a saját reconnect+discovery fallback-ját.
+  // Csak élő régi tulajdonos node hívja (halott node-on nem fut semmi, ami
+  // hívhatná – ld. tenant-ownership.ts).
+  disconnectTenant(tenantId: string, newHostname?: string | null): void {
+    let count = 0;
+    for (const client of this.clients.values()) {
+      if (client.tenantId !== tenantId) continue;
+      if (client.ws.readyState === 1) {
+        if (newHostname) this.send(client.ws, { type: "NODE_REASSIGNED", hostname: newHostname });
+        client.ws.close(4009, "Tenant not hosted on this node");
+      }
+      count++;
+    }
+    if (count > 0) console.log(`[SyncEngine] 🔌 disconnectTenant(${tenantId}): ${count} kliens lezárva${newHostname ? ` → ${newHostname}` : ""}`);
+  }
+
   private getOnlineClients(tenantId: string, deviceIds?: string[]): ConnectedClient[] {
     const result: ConnectedClient[] = [];
     const seen = new Set<string>();
@@ -605,7 +640,7 @@ class SyncEngineClass {
         where:  { id: tenantId },
         select: { snapPort: true },
       });
-      const snapHost = process.env.SNAP_HOST ?? "api.schoollive.hu";
+      const snapHost = env.NODE_HOSTNAME; // multi-node: mindig EZ a node a snap-cél, sosem egy globális fix host (ld. terv Fázis 7)
 
       const client = this.clients.get(deviceId);
       if (client?.ws.readyState === 1) {

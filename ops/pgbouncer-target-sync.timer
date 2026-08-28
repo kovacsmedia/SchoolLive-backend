@@ -1,0 +1,11 @@
+[Unit]
+Description=SchoolLive cluster — PgBouncer célpont szinkron 10 másodpercenként
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=10s
+Unit=pgbouncer-target-sync.service
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target

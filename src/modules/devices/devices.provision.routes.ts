@@ -69,7 +69,7 @@ router.get("/status/:pendingId", async (req, res) => {
     // Aktivált – keressük a device-t
     const device = await prisma.device.findFirst({
       where: { clientId: pendingId },
-      select: { id: true, name: true },
+      select: { id: true, name: true, tenantId: true },
     });
 
     if (!device) {
@@ -97,6 +97,10 @@ router.get("/status/:pendingId", async (req, res) => {
         wifiSecurity: session.wifiSecurity,   // "WPA2_PERSONAL" | "WPA2_ENTERPRISE"
         wifiUser: session.wifiUser,           // ESP enterprise módban használja
         deviceKey: session.pendingDeviceKey ?? "",
+        // Multi-node cluster: a kliens ezt cache-eli (PersistStore::setTenantId),
+        // hogy node-váltás esetén a GET /cluster/locate?tenantId= hívást
+        // tudja indítani.
+        tenantId: device.tenantId,
       },
     };
 

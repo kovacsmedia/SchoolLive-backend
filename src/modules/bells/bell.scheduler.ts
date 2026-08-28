@@ -12,6 +12,7 @@ import { SnapcastService } from "../snapcast/snapcast.service";
 import { execSync }        from "child_process";
 import path                from "path";
 import { randomUUID }      from "crypto";
+import { todayInBudapest, getBellMs, isBudapestWeekend } from "../../utils/budapest-time";
 
 const TICK_INTERVAL_MS = 30_000;
 const LOOKAHEAD_MS     = 90_000;
@@ -46,30 +47,6 @@ function getAudioDurationMs(filePath: string): number | null {
     if (isFinite(sec) && sec > 0) return Math.round(sec * 1000);
   } catch {}
   return null;
-}
-
-function todayInBudapest(): Date {
-  const now = new Date();
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Budapest",
-    year: "numeric", month: "2-digit", day: "2-digit",
-  });
-  const [year, month, day] = fmt.format(now).split("-").map(Number);
-  return new Date(Date.UTC(year, month - 1, day));
-}
-
-function getBellMs(hour: number, minute: number): number {
-  const now = new Date();
-  const budapestDateStr = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Budapest",
-    year: "numeric", month: "2-digit", day: "2-digit",
-  }).format(now);
-  const [y, m, d] = budapestDateStr.split("-").map(Number);
-  const bellLocalStr = `${y}-${String(m).padStart(2,"0")}-${String(d).padStart(2,"0")}T${String(hour).padStart(2,"0")}:${String(minute).padStart(2,"0")}:00`;
-  const tempDate   = new Date(`${bellLocalStr}Z`);
-  const budapestMs = new Date(tempDate.toLocaleString("en-US", { timeZone: "Europe/Budapest" })).getTime();
-  const offsetMs   = tempDate.getTime() - budapestMs;
-  return new Date(`${bellLocalStr}Z`).getTime() + offsetMs;
 }
 
 // ── SYNC_BELLS push – azonnali értesítés ──────────────────────────────────────
@@ -115,10 +92,7 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
 
   if (calDay?.isHoliday) return;
 
-  const budapestDayOfWeek = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Europe/Budapest", weekday: "short",
-  }).format(now);
-  const isWeekend         = budapestDayOfWeek === "Sat" || budapestDayOfWeek === "Sun";
+  const isWeekend           = isBudapestWeekend(now);
   const hasExplicitTemplate = !!calDay?.template?.bells?.length;
   if (isWeekend && !hasExplicitTemplate) return;
 

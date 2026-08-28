@@ -14,7 +14,7 @@ declare global {
   }
 }
 
-export function requireTenant(req: Request, res: Response, next: NextFunction) {
+export async function requireTenant(req: Request, res: Response, next: NextFunction) {
   if (!req.user) return res.status(401).json({ error: "Unauthenticated" });
 
   // SUPER_ADMIN: tenant context must come from header
@@ -40,15 +40,38 @@ export function requireTenant(req: Request, res: Response, next: NextFunction) {
 
     // Also attach to req.user so existing code that checks user.tenantId keeps working
     (req.user as any).tenantId = tenantId;
+  } else {
+    // Non-superadmin: tenant comes from the token/user
+    if (!req.user.tenantId) {
+      return res.status(403).json({ error: "Tenant context required" });
+    }
 
-    return next();
+    req.tenantId = req.user.tenantId;
   }
 
-  // Non-superadmin: tenant comes from the token/user
-  if (!req.user.tenantId) {
-    return res.status(403).json({ error: "Tenant context required" });
+  // Multi-node cluster: ez a tenant lehet, hogy NEM ehhez a node-hoz van
+  // rendelve. 409-et adunk (nem 403 – ez nem jogosultsági hiba, hanem
+  // "rossz node"), a helyes hostname-mel a válaszban, hogy a kliens azonnal
+  // tudjon próbálkozni máshol. Fail-open DB-hiba esetén – a mélyebb kapuk
+  // (SnapcastService.getEngine, SyncEngine WS accept) úgyis védik a
+  // ténylegesen stateful erőforrásokat, egy tranziens DB-hiba itt ne
+  // blokkolja le az összes tenant-scope-olt route-ot.
+  try {
+    const { prisma } = await import("../prisma/client");
+    const { env } = await import("../config/env");
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: req.tenantId },
+      select: { assignedNode: { select: { hostname: true } } },
+    });
+    if (tenant?.assignedNode && tenant.assignedNode.hostname !== env.NODE_HOSTNAME) {
+      return res.status(409).json({
+        error: "Tenant not hosted on this node",
+        correctNodeHostname: tenant.assignedNode.hostname,
+      });
+    }
+  } catch (e) {
+    console.error("[requireTenant] ownership check hiba:", e);
   }
 
-  req.tenantId = req.user.tenantId;
   next();
 }

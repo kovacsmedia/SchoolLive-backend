@@ -9,6 +9,7 @@ import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
 import { broadcastSyncBells } from "./bell.scheduler";
 import { stripAccents } from "../../utils/text";
+import { todayInBudapest } from "../../utils/budapest-time";
 
 /** ffprobe alapú hossz-mérés ms-ben. Hiba/elérhetetlenség esetén null. */
 function probeDurationMs(filePath: string): number | null {
@@ -24,17 +25,6 @@ function probeDurationMs(filePath: string): number | null {
 }
 
 export const bellsRouter = Router();
-
-/** UTC-éjféli Date objektum az aktuális helyi (Europe/Budapest) naptári napra */
-function todayInBudapest(): Date {
-  const now = new Date();
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Budapest",
-    year: "numeric", month: "2-digit", day: "2-digit"
-  });
-  const [year, month, day] = fmt.format(now).split("-").map(Number);
-  return new Date(Date.UTC(year, month - 1, day));
-}
 
 const AUDIO_DIR = path.join(process.cwd(), "audio", "bells");
 // 4 MB tárhely – az ESP32-S3-N16R8 (16MB flash) particionálásában az

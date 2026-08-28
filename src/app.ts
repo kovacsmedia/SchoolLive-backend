@@ -16,6 +16,7 @@ import { bellsRouter }          from "./modules/bells/bells.routes";
 import radioRoutes              from "./modules/radio/radio.routes";
 import contactRouter            from "./modules/contact/contact.routes";
 import firmwareRouter           from "./modules/firmware/firmware.routes";
+import clusterAdminRoutes       from "./modules/cluster/cluster.admin.routes";
 import { authJwt }              from "./middleware/authJwt";
 import { requireTenant }        from "./middleware/tenant";
 import prisma                   from "./prisma";
@@ -55,6 +56,24 @@ app.get("/sync/status", authJwt, (_req, res) => {
   res.json(SyncEngine.getStatus());
 });
 
+// Multi-node cluster: melyik node birtokolja jelenleg ezt a tenantot.
+// Szándékosan hitelesítés nélküli – bárhonnan ugyanazt a választ adja
+// (a közös DB-t olvassa), és egy eszköznek pontosan azért kell hívnia,
+// hogy MIELŐTT bármilyen munkamenete lenne a helyes node-on, megtudja
+// hova kapcsolódjon. Melyik node "birtokol" egy tenantot nem érzékeny adat.
+app.get("/cluster/locate", async (req, res) => {
+  const tenantId = String(req.query.tenantId ?? "");
+  if (!tenantId) return res.status(400).json({ error: "tenantId required" });
+
+  const tenant = await prisma.tenant.findUnique({
+    where: { id: tenantId },
+    select: { assignedNode: { select: { hostname: true } } },
+  });
+  if (!tenant?.assignedNode) return res.status(404).json({ error: "Not found" });
+
+  return res.json({ hostname: tenant.assignedNode.hostname });
+});
+
 // ── Route-ok ──────────────────────────────────────────────────────────────────
 
 app.use("/admin/tenants",  tenantsAdminRouter);
@@ -70,6 +89,7 @@ app.use("/bells",          bellsRouter);
 app.use("/radio",          radioRoutes);
 app.use("/contact",        contactRouter);
 app.use("/firmware",       firmwareRouter);
+app.use("/admin/cluster",  clusterAdminRoutes);
 
 // Statikus fájlok
 app.use("/audio/bells",  express.static(path.join(process.cwd(), "audio", "bells")));

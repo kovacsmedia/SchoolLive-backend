@@ -66,6 +66,18 @@ enum OtaStatus {
   ROLLBACK
 }
 
+// Multi-node cluster: egy backend-node élet-státusza.
+//   ACTIVE   – heartbeatel, a rebalancer kioszthat rá tenantot
+//   DRAINING – heartbeatel, de a rebalancer SOSEM ad rá tenantot (kézi
+//              staging lépcső, amíg pl. a kliens-oldali node-discovery
+//              nincs kész)
+//   DEAD     – nincs friss heartbeat, a leader a tenantjait szétosztja
+enum NodeStatus {
+  ACTIVE
+  DRAINING
+  DEAD
+}
+
 model Tenant {
   id        String   @id @default(uuid())
   name      String
@@ -98,7 +110,16 @@ model Tenant {
   radioSchedules   RadioSchedule[]
   youtubePlaylists YoutubePlaylist[]
 
+  // Multi-node cluster: melyik backend-node "birtokolja" jelenleg ezt a
+  // tenantot (SyncEngine WS + Snapcast ott fut). Csak a leader írja
+  // (cluster.rebalancer.ts) – a többi node csak olvassa, hogy eldöntse,
+  // reagáljon-e erre a tenantra (ld. tenant-ownership.ts).
+  assignedNodeId String?
+  assignedNode   ClusterNode? @relation(fields: [assignedNodeId], references: [id], onDelete: SetNull)
+  assignedAt     DateTime?
+
   @@index([isActive])
+  @@index([assignedNodeId])
 }
 
 model OrganizationalUnit {
@@ -541,4 +562,42 @@ model FirmwareRelease {
   createdBy User @relation("FirmwareCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
 
   @@index([createdAt])
+}
+
+// ── Multi-node cluster ──────────────────────────────────────────────────────
+//
+// Egy fizikai backend-node (api.schoollive.hu, api2.schoollive.hu, ...)
+// nyilvántartása. Minden node induláskor + periodikusan upsertel egy sort
+// a saját hostname-jére (cluster.heartbeat.ts). A leader (ClusterLeaderLease)
+// ez alapján dönt a tenant-kiosztásról (cluster.rebalancer.ts).
+model ClusterNode {
+  id              String     @id @default(uuid())
+  // A node publikus DNS neve, pl. "api2.schoollive.hu" – meg kell egyeznie
+  // env.NODE_HOSTNAME-mel. Ez az érték kerül ki a kliensekhez is (Snapcast
+  // cél, /cluster/locate válasz), tehát pontosan a DNS névnek kell lennie.
+  hostname        String     @unique
+  status          NodeStatus @default(ACTIVE)
+  lastHeartbeatAt DateTime   @default(now())
+  startedAt       DateTime   @default(now())
+
+  tenants       Tenant[]
+  leaseAsLeader ClusterLeaderLease?
+
+  @@index([status, lastHeartbeatAt])
+}
+
+// Singleton sor (id mindig "singleton") a dinamikus master-választáshoz.
+// A node-ok atomikus compare-and-swap UPDATE-tel versenyeznek a lease
+// megszerzéséért/megújításáért – ld. cluster.leader.ts. Csak egy node
+// tekintheti magát leadernek egyszerre, amíg a lease le nem jár.
+model ClusterLeaderLease {
+  id             String    @id @default("singleton")
+  // @unique: Prisma 1-1 opcionális reláció megköveteli, hogy az FK oldal
+  // unique legyen (a ClusterNode.leaseAsLeader visszairányú mező miatt).
+  // Ez amúgy is helyes: egy node egyszerre csak egyszer lehet leader.
+  leaderNodeId   String?   @unique
+  leaseExpiresAt DateTime?
+  updatedAt      DateTime  @updatedAt
+
+  leaderNode ClusterNode? @relation(fields: [leaderNodeId], references: [id], onDelete: SetNull)
 }

@@ -10,6 +10,7 @@
 import { Router, Request, Response } from "express";
 import { prisma }                    from "../../prisma/client";
 import { randomBytes }               from "crypto";
+import { env }                       from "../../config/env";
 
 const router = Router();
 
@@ -119,11 +120,13 @@ router.get("/info", async (req: Request, res: Response) => {
       select: {
         id:            true,
         deviceKeyHash: true,
+        tenantId:      true,
         tenant: { select: { name: true } },
       },
     });
 
     let matchedId:   string | null = null;
+    let tenantId:    string | null = null;
     let tenantName:  string | null = null;
 
     for (const d of devices) {
@@ -131,6 +134,7 @@ router.get("/info", async (req: Request, res: Response) => {
       const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
       if (ok) {
         matchedId  = d.id;
+        tenantId   = d.tenantId ?? null;
         tenantName = d.tenant?.name ?? null;
         break;
       }
@@ -138,8 +142,10 @@ router.get("/info", async (req: Request, res: Response) => {
 
     if (!matchedId) return res.status(401).json({ error: "Invalid device key" });
 
-    // deviceId most már benne van a válaszban!
-    return res.json({ ok: true, tenantName, deviceId: matchedId });
+    // deviceId + tenantId a válaszban – a kliens (Windows/Linux/Android)
+    // ezt cache-eli, hogy a multi-node cluster discovery-hez
+    // (GET /cluster/locate?tenantId=) tudja, MELYIK tenantot kell keresnie.
+    return res.json({ ok: true, tenantName, tenantId, deviceId: matchedId });
 
   } catch (err) {
     console.error("[NativeInfo] hiba:", err);
@@ -234,15 +240,27 @@ router.get("/snap-port", async (req: Request, res: Response) => {
 
     const tenant = await prisma.tenant.findUnique({
       where:  { id: tenantId },
-      select: { snapPort: true },
+      select: { snapPort: true, assignedNode: { select: { hostname: true } } },
     });
 
     if (!tenant?.snapPort) {
       return res.status(404).json({ error: "Nincs snapPort beállítva" });
     }
 
+    // Multi-node cluster: ha ez a tenant NEM ehhez a node-hoz van rendelve,
+    // 409-et adunk a helyes host-tal – nem szabad ezen a node-on futó
+    // snapPort-ot mondani egy máshol élő tenantra (ld. terv Fázis 7).
+    if (tenant.assignedNode && tenant.assignedNode.hostname !== env.NODE_HOSTNAME) {
+      return res.status(409).json({
+        error: "Tenant not hosted on this node",
+        correctNodeHostname: tenant.assignedNode.hostname,
+      });
+    }
+
     console.log(`[NativeSnapPort] tenantId=${tenantId} snapPort=${tenant.snapPort}`);
-    return res.json({ ok: true, snapPort: tenant.snapPort });
+    // snapHost: ez a node maga – a snap-kapcsolat mindig arról a node-ról
+    // szól, amelyik ezt a választ adta (nem egy globális fix host).
+    return res.json({ ok: true, snapPort: tenant.snapPort, snapHost: env.NODE_HOSTNAME });
 
   } catch (err) {
     console.error("[NativeSnapPort] hiba:", err);

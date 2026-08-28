@@ -1,0 +1,9 @@
+# Cluster-node hostnevek listája, egy sor / node.
+# Ugyanaz a fájl megy ki minden node-ra (git-tel deployolva) — a szkriptek
+# a saját NODE_HOSTNAME-jüket (a .env-ből) automatikusan kihagyják a listából.
+#
+# Új node felvételekor: ide is, és a GitHub Actions "DEPLOY_HOSTS" repo
+# Variable-jébe is fel kell venni (Settings → Secrets and variables →
+# Actions → Variables).
+api.schoollive.hu
+api1.schoollive.hu

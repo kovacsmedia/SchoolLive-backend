@@ -3,3 +3,8 @@ node_modules
 .env
 
 /generated/prisma
+
+# Node-specifikus cluster-HA beállítások (PGDATA-út stb.) és a
+# pgbouncer-target-sync.sh futásidejű állapotfájlja — sose node-független.
+ops/pg-ha.local.env
+ops/.pgbouncer-target-sync.last

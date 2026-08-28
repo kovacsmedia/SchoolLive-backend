@@ -10,6 +10,27 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
 
+    # Multi-node: minden pushnál MINDEN cluster-node-ra deployolunk, azonos
+    # lépéssorral (a kód mindenhol ugyanaz). A host-lista egy repo Variable-
+    # ből jön (Settings → Secrets and variables → Actions → Variables →
+    # DEPLOY_HOSTS), JSON tömbként, pl.:
+    #   ["api.schoollive.hu","api2.schoollive.hu"]
+    # Nem secret, mert a hostname nem érzékeny adat. Az SSH-hitelesítés
+    # (DEPLOY_USER/DEPLOY_KEY) egyelőre közös minden node-on – ha egy
+    # jövőbeli node más hitelesítést igényel, ez itt később node-onként
+    # szétbontható.
+    #
+    # fail-fast:false – egy node deploy-hibája ne szakítsa meg a többiét.
+    # Egyidejű `prisma migrate deploy` N node-ról ugyanarra a DB-re
+    # BIZTONSÁGOS: a Prisma Migrate saját Postgres advisory lockot tart a
+    # migrációk alkalmazása alatt pontosan erre az esetre (több replika
+    # egyszerre deployol) – a második node blokkol, amíg az első végez,
+    # utána 0 migrációt talál alkalmazandónak és sikeresen kilép.
+    strategy:
+      fail-fast: false
+      matrix:
+        host: ${{ fromJson(vars.DEPLOY_HOSTS) }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,7 +40,7 @@ jobs:
           mkdir -p ~/.ssh
           touch ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
-          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${{ matrix.host }}" >> ~/.ssh/known_hosts
 
       - name: Upload backend to server (rsync)
         continue-on-error: true
@@ -28,7 +49,7 @@ jobs:
           switches: -avzr --delete --ignore-errors --exclude='.git' --exclude='node_modules' --exclude='.env' --exclude='dist' --exclude='uploads' --exclude='audio'
           path: ./
           remote_path: /opt/schoollive/backend
-          remote_host: ${{ secrets.DEPLOY_HOST }}
+          remote_host: ${{ matrix.host }}
           remote_user: ${{ secrets.DEPLOY_USER }}
           remote_key: ${{ secrets.DEPLOY_KEY }}
 
@@ -36,7 +57,7 @@ jobs:
         if: always()
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host:     ${{ secrets.DEPLOY_HOST }}
+          host:     ${{ matrix.host }}
           username: ${{ secrets.DEPLOY_USER }}
           key:      ${{ secrets.DEPLOY_KEY }}
           script: |
@@ -53,7 +74,12 @@ jobs:
             echo "== Install deps =="
             npm install
 
-            # .env betöltése
+            # .env betöltése – MINDEN node .env-jében kötelező (multi-node
+            # bevezetése óta): DATABASE_URL (közös, központi Postgres),
+            # NODE_HOSTNAME (ennek a node-nak a publikus DNS neve, pl.
+            # "api2.schoollive.hu"), és JWT_ACCESS_SECRET-nek AZONOSNAK
+            # kell lennie minden node-on (egy node által kiadott tokent
+            # bármelyik másiknak érvényesítenie kell tudnia).
             if [ -f ".env" ]; then
               echo "== Loading .env =="
               set -a

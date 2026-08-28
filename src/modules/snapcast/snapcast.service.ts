@@ -743,6 +743,15 @@ class SnapcastServiceClass {
   private async getEngine(
     tenantId: string
   ): Promise<TenantSnapEngine | null> {
+    // Multi-node cluster: ez a kritikus kapu – enélkül BÁRMELYIK node lustán
+    // felhúzhatná BÁRMELYIK tenant snapserverét első használatkor, függetlenül
+    // attól, kié a tenant valójában (a rebalancer szerint).
+    const { isOwnedByThisNode } = await import("../cluster/tenant-ownership");
+    if (!isOwnedByThisNode(tenantId)) {
+      console.warn(`[Snapcast] getEngine elutasítva – tenant ${tenantId} nem ehhez a node-hoz van rendelve`);
+      return null;
+    }
+
     if (this.engines.has(tenantId)) {
       return this.engines.get(tenantId)!;
     }
@@ -853,6 +862,23 @@ class SnapcastServiceClass {
    *     (PM2 stop + config/FIFO unlink). A `init()` NEM fut, csak `shutdown()`.
    */
   async dispose(tenantId: string): Promise<void> {
+    await this.teardownEngine(tenantId);
+  }
+
+  /**
+   * Multi-node cluster: ez a node ELVESZTETTE a tenantot (rebalancing miatt
+   * másik node vette át) – NEM hard-delete. A takarítás technikailag
+   * ugyanaz, mint dispose()-nál: a TenantSnapEngine.init() idempotensen
+   * mindent újraépít (FIFO, config, PM2), ha a tenant később visszakerül
+   * erre a node-ra, tehát semmi nem vész el egy "soft" teardown-nal.
+   * Külön elnevezett belépési pont csak a hívási hely szemantikájának
+   * tisztázására – a viselkedés azonos a dispose()-éval.
+   */
+  async deactivateTenant(tenantId: string): Promise<void> {
+    await this.teardownEngine(tenantId);
+  }
+
+  private async teardownEngine(tenantId: string): Promise<void> {
     const loaded = this.engines.get(tenantId);
     if (loaded) {
       await loaded.shutdown();

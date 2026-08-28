@@ -5,6 +5,7 @@ import { prisma } from "../../prisma/client";
 import { authJwt } from "../../middleware/authJwt";
 import { allocateNextSnapPort, SNAP_PORT_RANGE } from "../snapcast/snap-port-allocator";
 import { SnapcastService } from "../snapcast/snapcast.service";
+import { pickLeastLoadedNode } from "../cluster/cluster.rebalancer";
 
 const router = Router();
 
@@ -76,6 +77,12 @@ router.post("/", authJwt, async (req, res) => {
     // egy másik port-kiosztással. Ha a tartomány teli, 507 Insufficient
     // Storage hiba megy vissza – az admin-nak ekkor érdemes felszabadítani
     // egy nem-használt tenant-et, vagy bővíteni a SNAP_PORT_MAX env-et.
+    // Multi-node cluster: a legkevésbé terhelt ACTIVE node kiválasztása MÁR
+    // ITT (nem várjuk meg a köv. rebalance-tickt) – különben egy vadonatúj
+    // tenant a CLUSTER_REBALANCE_INTERVAL_MS-ig sehova sem lenne kiosztva,
+    // egyetlen node sem venné fel a WS/Snapcast kéréseit.
+    const assignedNode = await pickLeastLoadedNode();
+
     let created;
     let lastErr: any = null;
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -98,6 +105,8 @@ router.post("/", authJwt, async (req, res) => {
             directorEmail: typeof directorEmail === "string" && directorEmail.trim() ? directorEmail.trim() : null,
             eduId: typeof eduId === "string" && eduId.trim() ? eduId.trim() : null,
             snapPort,
+            assignedNodeId: assignedNode?.id ?? null,
+            assignedAt: assignedNode ? new Date() : null,
           },
           select: SELECT,
         });
