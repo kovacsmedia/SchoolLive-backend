@@ -73,7 +73,7 @@ router.patch("/nodes/:id", authJwt, async (req, res) => {
     }
 
     const node = await prisma.clusterNode.update({
-      where: { id: req.params.id },
+      where: { id: String(req.params.id) },
       data: { status },
     });
 
