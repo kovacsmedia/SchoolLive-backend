@@ -8,11 +8,9 @@ export async function postLogin(req: Request, res: Response) {
   const result = await authService.login(String(email), String(password));
   if (!result) return res.status(401).json({ error: "Invalid credentials" });
 
-  // Single session: a felhasználó már be van jelentkezve másik eszközön
-  if ("error" in result && result.error === "already_logged_in") {
-    return res.status(409).json({ error: "already_logged_in", message: "Ez a felhasználó már be van jelentkezve egy másik eszközön." });
-  }
-
+  // Helyes jelszó = mindig azonnali belépés (ld. auth.service.ts login()) –
+  // a régi session máshol a authJwt middleware-en keresztül szűnik meg a
+  // következő kérésénél, nincs itt elutasítandó eset.
   res.json(result);
 }
 
@@ -31,9 +29,8 @@ export async function postLogout(req: Request, res: Response) {
         // activeSessionId-t), ha a token időközben lejárt – pl. a user
         // inaktívan hagyta a fület, a token 15 perc után lejárt, és csak
         // EZUTÁN kattint kijelentkezésre / zárja be a fület (sendBeacon).
-        // Enélkül a session szerver-oldalon "élve" maradt volna, és a user
-        // az újra-bejelentkezéskor a 60mp-es inaktivitási grace lejártáig
-        // "already_logged_in" 409-et kapott volna.
+        // (Már nem kritikus a re-login szempontjából, mert a login() mindig
+        // azonnal beenged – de a activeSessionId takarítása így is helyes.)
         const decoded = jwt.default.verify(bodyToken, env.JWT_ACCESS_SECRET, { ignoreExpiration: true }) as any;
         userId = decoded.sub;
       } catch {}

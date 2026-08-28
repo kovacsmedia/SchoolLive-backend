@@ -4,18 +4,12 @@ import { prisma } from "../../prisma/client";
 import { env } from "../../config/env";
 import { JwtPayload } from "./auth.types";
 
-// Aláír egy access tokent, és a payload-ba kódolt `exp`-ből visszaadja a
-// pontos lejárati időpontot is – ezt tároljuk a User.sessionExpiresAt
-// mezőben, hogy a single-session ellenőrzés a TÉNYLEGES token-lejárathoz
-// tudjon igazodni (nem egy attól független aktivitás-heurisztikához).
-function signAccessToken(payload: JwtPayload): { token: string; expiresAt: Date } {
-  const token = jwt.sign(
+function signAccessToken(payload: JwtPayload): string {
+  return jwt.sign(
     payload,
     env.JWT_ACCESS_SECRET as jwt.Secret,
     { expiresIn: env.JWT_ACCESS_TTL as any }
   );
-  const decoded = jwt.decode(token) as { exp: number };
-  return { token, expiresAt: new Date(decoded.exp * 1000) };
 }
 
 export async function login(email: string, password: string) {
@@ -32,39 +26,13 @@ export async function login(email: string, password: string) {
     tenantName = tenant?.name ?? null;
   }
 
-  // ── Single session ellenőrzés ────────────────────────────────────────────
-  // Raw SQL: Prisma schema nem tartalmazza az activeSessionId / lastSeenAt /
-  // sessionExpiresAt mezőket
-  const sessionRow = await prisma.$queryRaw<{ activeSessionId: string | null; sessionExpiresAt: Date | null; role: string }[]>`
-    SELECT "activeSessionId", "sessionExpiresAt", role FROM "User" WHERE id = ${user.id}
-  `;
-  const existingSession  = sessionRow[0]?.activeSessionId ?? null;
-  const sessionExpiresAt = sessionRow[0]?.sessionExpiresAt ?? null;
-  const userRole         = sessionRow[0]?.role ?? user.role;
-
-  if (existingSession) {
-    // PLAYER szerepkör: sosem tiltjuk ki – a VP folyamatosan fut
-    if (userRole === "PLAYER") {
-      console.log(`[AUTH] PLAYER re-login allowed (always permitted, no session limit)`);
-      // session frissítése folytatódik lentebb
-    } else {
-      // A régi session TÉNYLEGES token-lejáratához igazodunk (nem egy attól
-      // független aktivitás-heurisztikához) – ha a korábban kiadott token
-      // már garantáltan lejárt, a régi session halott, azonnal engedünk be.
-      // Ha sessionExpiresAt hiányzik (pl. a migráció előtt létrejött session),
-      // biztonságosan lejártnak tekintjük – inkább engedjünk be, mint hogy
-      // örökre kizárjunk valakit egy hiányzó adat miatt.
-      const stillValid = sessionExpiresAt !== null && new Date(sessionExpiresAt).getTime() > Date.now();
-
-      if (stillValid) {
-        // Aktív, még nem lejárt session létezik → nem engedjük be
-        return { error: "already_logged_in" } as const;
-      }
-      console.log(`[AUTH] Old session expired for user ${user.id} → allowing re-login`);
-    }
-  }
-
-  // Új session ID generálása és mentése
+  // ── Single session: helyes jelszó = AZONNALI belépés ─────────────────────
+  // Nincs várakozás, nincs "already_logged_in" elutasítás – ez egy
+  // kommunikációs rendszer felhasználói felülete, mindig rendelkezésre kell
+  // állnia. Az új sessionId felülírja a régit; a authJwt middleware minden
+  // kérésnél összeveti a token sessionId-jét a User.activeSessionId-vel, így
+  // a régi (bárhol máshol futó) session a KÖVETKEZŐ kérésénél azonnal
+  // 401 session_superseded-et kap – nincs szükség előzetes ellenőrzésre itt.
   const sessionId = crypto.randomUUID();
 
   const payload: JwtPayload = {
@@ -75,10 +43,10 @@ export async function login(email: string, password: string) {
     sessionId,
   };
 
-  const { token, expiresAt } = signAccessToken(payload);
+  const token = signAccessToken(payload);
 
   await prisma.$executeRaw`
-    UPDATE "User" SET "activeSessionId" = ${sessionId}, "sessionExpiresAt" = ${expiresAt} WHERE id = ${user.id}
+    UPDATE "User" SET "activeSessionId" = ${sessionId} WHERE id = ${user.id}
   `;
 
   return {
@@ -87,27 +55,20 @@ export async function login(email: string, password: string) {
   };
 }
 
-// Aktív (még nem lejárt) token cseréje egy friss TTL-űre, újra bejelentkezés
-// (jelszó megadása) nélkül. A frontend ezt hívja periodikusan, amíg az
-// admin fül aktív/fókuszban van, hogy egy éppen dolgozó felhasználó
-// munkamenete ne járjon le a 15 perces access-token TTL miatt.
+// Aktív (még nem lejárt, és még nem felülírt) token cseréje egy friss
+// TTL-űre, újra bejelentkezés (jelszó megadása) nélkül. A frontend ezt
+// hívja periodikusan, amíg az admin fül aktív/fókuszban van, hogy egy
+// éppen dolgozó felhasználó munkamenete ne járjon le a 15 perces
+// access-token TTL miatt. A sessionId változatlan marad a payloadban,
+// úgyhogy nem kell semmit frissíteni az adatbázisban.
 export async function refresh(payload: JwtPayload) {
-  const { token, expiresAt } = signAccessToken(payload);
-
-  // A session "élettartamát" is meghosszabbítjuk, különben a single-session
-  // ellenőrzés a régi (első bejelentkezéskori) lejáratot nézné, és egy
-  // aktívan dolgozó user saját magát zárná ki egy másik eszközről való
-  // bejelentkezéskor, holott a munkamenete épp csak meghosszabbodott.
-  await prisma.$executeRaw`
-    UPDATE "User" SET "sessionExpiresAt" = ${expiresAt} WHERE id = ${payload.sub}
-  `;
-
+  const token = signAccessToken(payload);
   return { accessToken: token };
 }
 
 export async function logout(userId: string) {
   await prisma.$executeRaw`
-    UPDATE "User" SET "activeSessionId" = NULL, "sessionExpiresAt" = NULL WHERE id = ${userId}
+    UPDATE "User" SET "activeSessionId" = NULL WHERE id = ${userId}
   `;
 }
 
