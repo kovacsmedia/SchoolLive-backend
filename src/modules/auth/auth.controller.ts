@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import * as authService from "./auth.service";
+import { SUPPORTED_LOCALES } from "../../config/env";
 
 export async function postLogin(req: Request, res: Response) {
   const { email, password } = req.body ?? {};
@@ -55,4 +56,16 @@ export async function getMeHandler(req: Request, res: Response) {
   if (!me) return res.status(404).json({ error: "User not found" });
 
   res.json(me);
+}
+
+export async function patchMeLocale(req: Request, res: Response) {
+  if (!req.user) return res.status(401).json({ error: "Unauthenticated" });
+
+  const locale = req.body?.locale;
+  if (typeof locale !== "string" || !SUPPORTED_LOCALES.includes(locale as any)) {
+    return res.status(400).json({ error: `locale must be one of: ${SUPPORTED_LOCALES.join(", ")}` });
+  }
+
+  const updated = await authService.setLocale(req.user.sub, locale);
+  res.json({ ok: true, locale: updated.locale });
 }

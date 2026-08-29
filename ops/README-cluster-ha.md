@@ -204,6 +204,24 @@ vagy szünetben.
 
 ---
 
+## H. Piper-modellek (lokalizáció — TTS-fordítás)
+
+A Messages oldal "Fordítás" gombja a kiválasztott célnyelvnek megfelelő Piper hangmodellt
+használja (ld. `src/services/tts.service.ts` `VOICES` map). Ehhez 7 új modell (.onnx +
+.onnx.json pár, angol/német/szlovák/lengyel/román/ukrán/szerb) kell minden app-node
+`/opt/schoollive/piper/models/` könyvtárába — horvátra NINCS külön fájl, a szerb modellt
+használjuk (ld. a lokalizációs terv Context szakaszát).
+
+Minden app-node-on (a 3 meglévő magyar modell mellé):
+```bash
+sudo /opt/schoollive/backend/ops/download-piper-voices.sh
+```
+Idempotens — a meglévő fájlokat kihagyja, csak a hiányzókat tölti le. `GOOGLE_TRANSLATE_API_KEY`-t
+is be kell állítani minden app-node `.env`-jében (Google Cloud Console → Translation API
+kulcs), különben a `/messages/translate` végpont 502-t ad.
+
+---
+
 ## Karbantartási megjegyzések
 
 - Új app-node hozzáadásakor: `ops/nodes.txt` bővítése, GH Actions `DEPLOY_HOSTS` bővítése,

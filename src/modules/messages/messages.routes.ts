@@ -5,6 +5,8 @@ import { prisma }          from "../../prisma/client";
 import { authJwt }         from "../../middleware/authJwt";
 import { requireTenant }   from "../../middleware/tenant";
 import { generateTTS, NORMALIZE_COMPRESS_FILTER } from "../../services/tts.service";
+import { translateText }   from "../../services/translate.service";
+import { SUPPORTED_LOCALES } from "../../config/env";
 import { resolveIntroSoundPath } from "../bells/bells.routes";
 import { stripAccents }    from "../../utils/text";
 import { SyncEngine }      from "../../sync/SyncEngine";
@@ -217,6 +219,28 @@ router.delete("/templates/:id", authJwt, requireTenant, async (req: Request, res
     });
     return res.json({ ok: true });
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to delete template" }); }
+});
+
+// POST /messages/translate – üzenetszöveg fordítása a "Fordítás" gombhoz.
+// A TÉNYLEGES TTS-generálás NEM itt történik: a frontend a visszaadott
+// translatedText-tel hívja a MEGLÉVŐ POST /messages route-ot,
+// voice=<targetLang> paraméterrel.
+router.post("/translate", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const { text, targetLang } = req.body as Record<string, unknown>;
+    if (typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({ error: "text is required" });
+    }
+    if (typeof targetLang !== "string" || !SUPPORTED_LOCALES.includes(targetLang as any)) {
+      return res.status(400).json({ error: `targetLang must be one of: ${SUPPORTED_LOCALES.join(", ")}` });
+    }
+
+    const translatedText = await translateText(text.trim(), targetLang);
+    return res.json({ ok: true, translatedText });
+  } catch (err) {
+    console.error("[MESSAGES/translate] hiba:", err);
+    return res.status(502).json({ error: "Failed to translate text" });
+  }
 });
 
 // POST /messages – TTS üzenet küldése

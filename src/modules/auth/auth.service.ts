@@ -51,7 +51,7 @@ export async function login(email: string, password: string) {
 
   return {
     accessToken: token,
-    user: { id: user.id, email: user.email, role: user.role, tenantId: user.tenantId ?? null, tenantName: tenantName ?? null }
+    user: { id: user.id, email: user.email, role: user.role, tenantId: user.tenantId ?? null, tenantName: tenantName ?? null, locale: user.locale }
   };
 }
 
@@ -75,6 +75,14 @@ export async function logout(userId: string) {
 export async function getMe(userId: string) {
   return prisma.user.findUnique({
     where: { id: userId },
-    select: { id: true, email: true, role: true, tenantId: true, isActive: true }
+    select: { id: true, email: true, role: true, tenantId: true, isActive: true, locale: true }
+  });
+}
+
+export async function setLocale(userId: string, locale: string) {
+  return prisma.user.update({
+    where: { id: userId },
+    data:  { locale },
+    select: { id: true, locale: true },
   });
 }

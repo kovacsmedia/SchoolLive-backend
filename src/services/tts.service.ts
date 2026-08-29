@@ -16,9 +16,24 @@ const DINGDONG_WAV = path.join(AUDIO_DIR, "dingdong.wav");
 const DINGDONG_MP3 = path.join(AUDIO_DIR, "dingdong.mp3");
 
 const VOICES: Record<string, string> = {
+  // Magyar (eredeti, hangszín-választás)
   anna:  "hu_HU-anna-medium.onnx",
   berta: "hu_HU-berta-medium.onnx",
   imre:  "hu_HU-imre-medium.onnx",
+  // Idegen nyelvű TTS-fordításhoz (Messages "Fordítás" gomb) — 1 hang / nyelv.
+  // A `voice` mostantól vagy magyar hangnév, vagy ISO 639-1 nyelvkód lehet,
+  // ugyanez a map mindkettőt feloldja.
+  en: "en_US-amy-medium.onnx",
+  de: "de_DE-thorsten-medium.onnx",
+  sk: "sk_SK-lili-medium.onnx",
+  pl: "pl_PL-darkman-medium.onnx",
+  ro: "ro_RO-mihai-medium.onnx",
+  uk: "uk_UA-ukrainian_tts-medium.onnx",
+  sr: "sr_RS-serbski_institut-medium.onnx",
+  // Nincs natív horvát Piper-modell (a rhasspy/piper-voices repóban horvát
+  // egyáltalán nem szerepel) — a szerb hangot használjuk horvát szöveghez is,
+  // ld. a lokalizációs terv Context szakaszát.
+  hr: "sr_RS-serbski_institut-medium.onnx",
 };
 
 function runProcess(bin: string, args: string[], input?: string): Promise<void> {

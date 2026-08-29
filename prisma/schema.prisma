@@ -160,6 +160,10 @@ model User {
   lastLoginAt DateTime?
   createdAt   DateTime @default(now())
 
+  // UI-lokalizáció: a user által választott felület-nyelv (ISO 639-1 kód,
+  // ld. src/config/env.ts SUPPORTED_LOCALES). Default magyar.
+  locale String @default("hu")
+
   tenant   Tenant?             @relation(fields: [tenantId], references: [id], onDelete: SetNull)
   orgUnit  OrganizationalUnit? @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
 

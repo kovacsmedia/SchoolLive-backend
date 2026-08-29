@@ -41,4 +41,18 @@ export const env = {
 
   // Üres = kikapcsolva, nincs kimenő webhook-hívás.
   CLUSTER_ALERT_WEBHOOK_URL: process.env.CLUSTER_ALERT_WEBHOOK_URL ?? "",
+
+  // ── Lokalizáció ────────────────────────────────────────────────────────
+  //
+  // Google Cloud Translation v2 REST API kulcs (üzenet-fordítás, ld.
+  // src/services/translate.service.ts). MINDEN app-node .env-jében kell,
+  // mert bármelyik node kaphat /messages/translate kérést az adott tenant
+  // szerint.
+  GOOGLE_TRANSLATE_API_KEY: process.env.GOOGLE_TRANSLATE_API_KEY ?? "",
 };
+
+// UI-nyelv és TTS-fordítás célnyelvek allowlist-je (ISO 639-1). A magyar a
+// forrás/default nyelv, a többi 8 a UI-választóban ÉS a TTS-fordítás
+// célnyelv-listájában is megjelenik.
+export const SUPPORTED_LOCALES = ["hu", "en", "de", "sk", "pl", "ro", "uk", "sr", "hr"] as const;
+export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number];
