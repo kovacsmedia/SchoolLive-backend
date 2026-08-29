@@ -5,7 +5,7 @@
 
 import { env } from "../config/env";
 
-const TRANSLATE_ENDPOINT = "https://translation.googleapis.com/language/translate2";
+const TRANSLATE_ENDPOINT = "https://translation.googleapis.com/language/translate/v2";
 
 export async function translateText(text: string, targetLang: string): Promise<string> {
   if (!env.GOOGLE_TRANSLATE_API_KEY) {
