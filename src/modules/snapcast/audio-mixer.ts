@@ -109,6 +109,10 @@ export interface MixerJob {
   priority: number; // kisebb = magasabb prio
   title?: string;
   text?: string;
+  // Teljes hossz másodpercben (YouTube-metaadatból vagy RadioFile.durationSec-ből) –
+  // csak a `getRadioLiveState()` élő seek-sáv UI-jának adjuk tovább, a lejátszást
+  // magát nem befolyásolja.
+  durationSec?: number;
   resumeBytes?: number;
   // Opcionális per-job fade-in. Ha nincs megadva: stream forrásra 1 sec,
   // egyébként 0 (azonnal teljes amplitúdóval szól – chime, üzenet).
@@ -198,6 +202,14 @@ export class TenantAudioMixer extends EventEmitter {
   private pending: PendingStart | null = null;
   private pausedStack: PausedSource[] = [];
   private queue: MixerJob[] = [];
+
+  // Felhasználó-kezdeményezett élő szünet (YouTube fül / Hangfájl könyvtár
+  // élő seek-sáv "⏸" gombja) — SZÁNDÉKOSAN NEM a `pausedStack`-en tárolva,
+  // mert az `advance()` a pausedStack tetejét automatikusan visszaveszi,
+  // amint a queue kiürül (ez a helyes viselkedés a prioritás-megszakításnál,
+  // de itt egy user által explicit, határozatlan idejű szünetről van szó –
+  // csak egy explicit `resumeRadio()` hívás oldja fel).
+  private userPausedRadio: { job: MixerJob; resumeBytes: number } | null = null;
 
   private silenceProc: ChildProcess | null = null;
   private silencePaused: boolean = false;
@@ -412,9 +424,11 @@ export class TenantAudioMixer extends EventEmitter {
     // ("interrupted" reason-nal nem törölnek, de "stopped"-on igen.)
     for (const j of this.queue) this.emitStopped(j);
     for (const p of this.pausedStack) this.emitStopped(p.job);
+    if (this.userPausedRadio) this.emitStopped(this.userPausedRadio.job);
 
     this.queue = [];
     this.pausedStack = [];
+    this.userPausedRadio = null;
 
     this.cancelPending("stopped");
     // 1s fade-out az azonnali SIGKILL helyett – felhasználói STOP-nál a
@@ -430,6 +444,10 @@ export class TenantAudioMixer extends EventEmitter {
     // source:end stopped-et, hogy a service.ts ki tudja takarítani őket.
     for (const j of this.queue.filter(q => q.jobType === jobType)) this.emitStopped(j);
     for (const p of this.pausedStack.filter(ps => ps.job.jobType === jobType)) this.emitStopped(p.job);
+    if (this.userPausedRadio && this.userPausedRadio.job.jobType === jobType) {
+      this.emitStopped(this.userPausedRadio.job);
+      this.userPausedRadio = null;
+    }
 
     this.queue       = this.queue.filter((j) => j.jobType !== jobType);
     this.pausedStack = this.pausedStack.filter((p) => p.job.jobType !== jobType);
@@ -506,6 +524,89 @@ export class TenantAudioMixer extends EventEmitter {
       inGap: this.inGap,
       inPreSilence: this.pending !== null,
     };
+  }
+
+  // ── Élő RADIO-vezérlés (YouTube fül / Hangfájl könyvtár seek-sáv) ──────────
+  //
+  // Csak akkor hatnak, ha ÉPP egy RADIO típusú job aktívan szól (vagy user
+  // által szüneteltetve van) — ha egy magasabb prioritású BELL/TTS félbeszakította
+  // (a RADIO ilyenkor a `pausedStack`-en van, NEM a `userPausedRadio`-ban), a
+  // hívó egyértelmű `false`-t kap, nem piszkál bele az interrupt-mechanizmusba.
+  //
+  // A tekerés/resume ugyanazt a kill+újraindítás-adott-pozícióról mintát
+  // használja, mint a meglévő prioritás-megszakítás/resume (ld. advance()) –
+  // a snapcast.service.ts onSourceStart(isResume=true) ága ugyanúgy
+  // STOP+PREPARE+PLAY-t küld a klienseknek, mint eddig is bell/TTS utáni
+  // radio-resume esetén, így nincs szükség új kliens-oldali kódra.
+
+  /** Élő pozíció/állapot RADIO forráshoz (seek-sáv UI-hoz). Null, ha nincs
+   *  RADIO se aktívan szóló, se user-paused állapotban. */
+  getRadioLiveState(): { active: boolean; paused: boolean; positionSec: number; durationSec?: number; title?: string } | null {
+    if (this.active && this.active.job.jobType === "RADIO") {
+      return {
+        active: true,
+        paused: false,
+        positionSec: this.active.bytesWritten / BYTES_PER_SEC,
+        durationSec: this.active.job.durationSec,
+        title: this.active.job.title,
+      };
+    }
+    if (this.userPausedRadio) {
+      return {
+        active: false,
+        paused: true,
+        positionSec: this.userPausedRadio.resumeBytes / BYTES_PER_SEC,
+        durationSec: this.userPausedRadio.job.durationSec,
+        title: this.userPausedRadio.job.title,
+      };
+    }
+    return null;
+  }
+
+  /** Élő tekerés: ha épp szól, azonnal újraindul az új pozícióról; ha épp
+   *  user-paused, csak a mentett pozíciót módosítja (marad paused). */
+  seekRadio(positionSec: number): boolean {
+    const resumeBytes = Math.max(0, Math.round(positionSec * BYTES_PER_SEC));
+
+    if (this.active && this.active.job.jobType === "RADIO") {
+      const job = this.active.job;
+      this.killActive("interrupted");
+      this.beginPendingStart({ ...job, resumeBytes, isResume: true });
+      return true;
+    }
+
+    if (this.userPausedRadio) {
+      this.userPausedRadio = { ...this.userPausedRadio, resumeBytes };
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Élő szünet: leállítja az aktív RADIO-t, a pozíciót elmenti — NEM a
+   *  pausedStack-re (ld. mező-komment), hogy az `advance()` ne vegye
+   *  automatikusan vissza. */
+  pauseRadio(): boolean {
+    if (!this.active || this.active.job.jobType !== "RADIO") return false;
+
+    const src = this.active;
+    const resumeBytes = (src.job.resumeBytes ?? 0) + src.bytesWritten;
+    this.userPausedRadio = { job: src.job, resumeBytes };
+
+    this.killActive("interrupted");
+    return true;
+  }
+
+  /** Élő folytatás a `userPausedRadio`-ban mentett pozícióról. */
+  resumeRadio(): boolean {
+    if (!this.userPausedRadio) return false;
+    if (this.active || this.pending) return false;
+
+    const { job, resumeBytes } = this.userPausedRadio;
+    this.userPausedRadio = null;
+
+    this.beginPendingStart({ ...job, resumeBytes, isResume: true });
+    return true;
   }
 
   // ── Silence subprocess életciklus ───────────────────────────────────────

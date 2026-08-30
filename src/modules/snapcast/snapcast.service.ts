@@ -276,6 +276,7 @@ class TenantSnapEngine {
     source: SnapAudioSource;
     title?: string;
     text?: string;
+    durationSec?: number;
     deviceIdsToUnmute?: string[];
   }): Promise<string> {
     if (!this.mixer) {
@@ -290,6 +291,7 @@ class TenantSnapEngine {
       priority: SNAP_PRIORITY[params.type],
       title: params.title,
       text: params.text,
+      durationSec: params.durationSec,
     };
 
     this.jobs.set(job.id, job);
@@ -299,6 +301,25 @@ class TenantSnapEngine {
 
     this.mixer.enqueue(job);
     return job.id;
+  }
+
+  // ── Élő RADIO-vezérlés (YouTube fül / Hangfájl könyvtár seek-sáv) ──────────
+  // Vékony wrapperek a mixer megfelelő metódusaihoz, ld. audio-mixer.ts.
+
+  seekRadio(positionSec: number): boolean {
+    return this.mixer?.seekRadio(positionSec) ?? false;
+  }
+
+  pauseRadio(): boolean {
+    return this.mixer?.pauseRadio() ?? false;
+  }
+
+  resumeRadio(): boolean {
+    return this.mixer?.resumeRadio() ?? false;
+  }
+
+  getRadioLiveState() {
+    return this.mixer?.getRadioLiveState() ?? null;
   }
 
   private async prepareClientsForPlayback(
@@ -638,6 +659,9 @@ class TenantSnapEngine {
    *   2. mixer.pending.jobType === "RADIO" (pre-silence-ben, mindjárt szól)
    *   3. mixer.pausedStack tartalmaz RADIO-t (épp megszakította egy bell/TTS,
    *      utána folytatódik)
+   *   4. mixer.getRadioLiveState() user-paused (ld. audio-mixer.ts
+   *      `userPausedRadio` mező) – az élő seek-sáv "⏸" gombjával
+   *      szüneteltetve, explicit "▶ resume"-ra vár.
    * Így page-reload / másik kliens login után is látszik, hogy mit játszik
    * a rádió – nem kell user-session-ben tartani.
    */
@@ -649,7 +673,8 @@ class TenantSnapEngine {
     const radioActive =
       isRadio(m.current?.jobType) ||
       isRadio(m.pending?.jobType) ||
-      m.paused.some(p => isRadio(p.jobType));
+      m.paused.some(p => isRadio(p.jobType)) ||
+      this.mixer?.getRadioLiveState() !== null;
     if (!radioActive) return null;
 
     // jobs map-ben keressünk RADIO-t (rendszerint csak egy van egyszerre)
@@ -783,6 +808,7 @@ class SnapcastServiceClass {
     tenantId: string;
     title?: string;
     text?: string;
+    durationSec?: number;
     deviceIdsToUnmute?: string[];
     persistent?: boolean;
   }): Promise<string> {
@@ -794,8 +820,33 @@ class SnapcastServiceClass {
       source: params.source,
       title: params.title,
       text: params.text,
+      durationSec: params.durationSec,
       deviceIdsToUnmute: params.deviceIdsToUnmute,
     });
+  }
+
+  // ── Élő RADIO-vezérlés (YouTube fül / Hangfájl könyvtár seek-sáv) ──────────
+  //
+  // SZÁNDÉKOSAN `this.engines.get(tenantId)`-vel, NEM `getEngine()`-nel –
+  // az utóbbi lazy-init-elne egy snapserver-t is, ami pazarlás/hibás lenne
+  // egy pusztán állapot-lekérdező/vezérlő hívásnál (pl. 1mp-enkénti poll),
+  // ha a tenantnak épp nincs is betöltött engine-je (biztos nincs is mit
+  // vezérelni/lekérdezni rajta).
+
+  seekRadio(tenantId: string, positionSec: number): boolean {
+    return this.engines.get(tenantId)?.seekRadio(positionSec) ?? false;
+  }
+
+  pauseRadio(tenantId: string): boolean {
+    return this.engines.get(tenantId)?.pauseRadio() ?? false;
+  }
+
+  resumeRadio(tenantId: string): boolean {
+    return this.engines.get(tenantId)?.resumeRadio() ?? false;
+  }
+
+  getRadioLiveState(tenantId: string) {
+    return this.engines.get(tenantId)?.getRadioLiveState() ?? null;
   }
 
   async stop(tenantId: string): Promise<void> {

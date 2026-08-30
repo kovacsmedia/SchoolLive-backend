@@ -143,6 +143,60 @@ router.get("/schedules", authJwt, requireTenant, async (req: Request, res: Respo
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to fetch schedules" }); }
 });
 
+// Közös ütemezés-létrehozási logika (ütközés-ellenőrzéssel), amit a normál
+// `/schedules` (meglévő RadioFile-ra) ÉS a `/youtube/schedule` (előbb
+// letöltött, majd RadioFile-ként tárolt YouTube-videóra) is használ – ld.
+// utóbbinál a "YouTube – időzített lejátszás" szakaszt lent.
+async function createSchedule(params: {
+  tid: string; uid: string; radioFileId: string;
+  targetType: string; targetId?: string | null; scheduledAt: Date;
+}): Promise<
+  | { ok: true; schedule: any }
+  | { ok: false; status: number; error: string; conflict?: any }
+> {
+  const file = await prisma.radioFile.findFirst({
+    where: { id: params.radioFileId, tenantId: params.tid },
+    select: { id: true, durationSec: true },
+  });
+  if (!file) return { ok: false, status: 404, error: "Radio file not found" };
+
+  if (file.durationSec) {
+    const endTime    = new Date(params.scheduledAt.getTime() + file.durationSec * 1000);
+    const candidates = await prisma.radioSchedule.findMany({
+      where: {
+        tenantId: params.tid, status: { in: ["PENDING", "DISPATCHED"] },
+        targetType: params.targetType as any,
+        ...(params.targetId ? { targetId: String(params.targetId) } : {}),
+        scheduledAt: { lt: endTime },
+      },
+      include: { radioFile: { select: { durationSec: true, originalName: true } } },
+      orderBy: { scheduledAt: "asc" },
+    });
+    for (const conflict of candidates) {
+      const conflictEnd = conflict.radioFile.durationSec
+        ? new Date(conflict.scheduledAt.getTime() + conflict.radioFile.durationSec * 1000)
+        : null;
+      if (conflict.status === "DISPATCHED" && conflictEnd && conflictEnd < new Date()) continue;
+      if (!conflictEnd || conflictEnd > params.scheduledAt) {
+        return {
+          ok: false, status: 409, error: "Időütközés",
+          conflict: { id: conflict.id, scheduledAt: conflict.scheduledAt, originalName: conflict.radioFile.originalName, status: conflict.status },
+        };
+      }
+    }
+  }
+
+  const schedule = await prisma.radioSchedule.create({
+    data: {
+      tenantId: params.tid, createdById: params.uid, radioFileId: file.id,
+      targetType: params.targetType as any, targetId: params.targetId ? String(params.targetId) : null,
+      scheduledAt: params.scheduledAt, status: "PENDING",
+    },
+    include: { radioFile: { select: { id: true, originalName: true, durationSec: true, fileUrl: true } } },
+  });
+  return { ok: true, schedule };
+}
+
 router.post("/schedules", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
@@ -151,28 +205,12 @@ router.post("/schedules", authJwt, requireTenant, async (req: Request, res: Resp
     const scheduledDate = new Date(scheduledAt);
     if (isNaN(scheduledDate.getTime())) return res.status(400).json({ error: "Invalid scheduledAt date" });
     if (scheduledDate < new Date())     return res.status(400).json({ error: "scheduledAt must be in the future" });
-    const file = await prisma.radioFile.findFirst({ where: { id: String(radioFileId), tenantId: tid(req) }, select: { id: true, durationSec: true } });
-    if (!file) return res.status(404).json({ error: "Radio file not found" });
-    if (file.durationSec) {
-      const endTime    = new Date(scheduledDate.getTime() + file.durationSec * 1000);
-      const candidates = await prisma.radioSchedule.findMany({
-        where: { tenantId: tid(req), status: { in: ["PENDING", "DISPATCHED"] }, targetType: targetType as any, ...(targetId ? { targetId: String(targetId) } : {}), scheduledAt: { lt: endTime } },
-        include: { radioFile: { select: { durationSec: true, originalName: true } } },
-        orderBy: { scheduledAt: "asc" },
-      });
-      for (const conflict of candidates) {
-        const conflictEnd = conflict.radioFile.durationSec ? new Date(conflict.scheduledAt.getTime() + conflict.radioFile.durationSec * 1000) : null;
-        if (conflict.status === "DISPATCHED" && conflictEnd && conflictEnd < new Date()) continue;
-        if (!conflictEnd || conflictEnd > scheduledDate) {
-          return res.status(409).json({ error: "Időütközés", conflict: { id: conflict.id, scheduledAt: conflict.scheduledAt, originalName: conflict.radioFile.originalName, status: conflict.status } });
-        }
-      }
-    }
-    const schedule = await prisma.radioSchedule.create({
-      data: { tenantId: tid(req), createdById: uid(req), radioFileId: file.id, targetType: targetType as any, targetId: targetId ? String(targetId) : null, scheduledAt: scheduledDate, status: "PENDING" },
-      include: { radioFile: { select: { id: true, originalName: true, durationSec: true, fileUrl: true } } },
+    const result = await createSchedule({
+      tid: tid(req), uid: uid(req), radioFileId: String(radioFileId),
+      targetType, targetId, scheduledAt: scheduledDate,
     });
-    return res.status(201).json({ ok: true, schedule });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, conflict: (result as any).conflict });
+    return res.status(201).json({ ok: true, schedule: result.schedule });
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to create schedule" }); }
 });
 
@@ -496,6 +534,39 @@ router.get("/yt-search", authJwt, requireTenant, async (req: Request, res: Respo
   } catch (err: any) { console.error("[yt-search]", err?.message); return res.json({ ok: true, results: [] }); }
 });
 
+// GET /radio/yt-live-url – közvetlen, azonnal streamelhető audio-CDN-URL
+// feloldása egy YouTube linkből ("YouTube fül" élő böngésző+lejátszó,
+// "🔴 Élő adásba küldés" gomb). FONTOS: ez egy LEJÁRÓ, aláírt Google-CDN-link
+// (jellemzően pár órán belül lejár) – csak azonnali indításra jó, IDŐZÍTETT
+// lejátszáshoz a `/youtube/schedule` route-ot kell használni, ami előbb
+// letölti a videót (ld. lent).
+router.get("/yt-live-url", authJwt, requireTenant, async (req: Request, res: Response) => {
+  if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+  const url = String(req.query.url ?? "").trim();
+  if (!url || !isYoutubeUrl(url)) return res.status(400).json({ ok: false, error: "Érvényes YouTube URL szükséges" });
+  try {
+    const [meta, directUrlRaw] = await Promise.all([
+      runCmd(YT_DLP_BIN, ["--print", "%(title)s|||%(duration)s", "--no-playlist", "--no-warnings", "--skip-download", url]),
+      runCmd(YT_DLP_BIN, ["-f", "bestaudio", "-g", "--no-playlist", "--no-warnings", url]),
+    ]);
+    const [title, durationRaw] = meta.split("|||");
+    const durationSec = Math.round(parseFloat(durationRaw));
+    // `-g` néha több sort ad vissza (pl. külön video+audio URL) – bestaudio
+    // szűrővel egy audio-only formátumot kérünk, az első sor a helyes.
+    const resolvedUrl = directUrlRaw.split("\n").map(l => l.trim()).find(Boolean);
+    if (!resolvedUrl) return res.status(422).json({ ok: false, error: "Nem sikerült feloldani az audio URL-t" });
+    return res.json({
+      ok: true,
+      url: resolvedUrl,
+      title: title?.trim() || "YouTube videó",
+      durationSec: isNaN(durationSec) ? null : durationSec,
+    });
+  } catch (err: any) {
+    console.error("[yt-live-url]", err?.message);
+    return res.status(422).json({ ok: false, error: "Nem sikerült előkészíteni az élő lejátszást" });
+  }
+});
+
 router.get("/gdrive-files", authJwt, requireTenant, async (req: Request, res: Response) => {
   const url = String(req.query.url ?? "").trim();
   if (!url) return res.status(400).json({ ok: false, error: "url required" });
@@ -612,7 +683,7 @@ router.get("/ytplaylists/build-status/:fileId", authJwt, requireTenant, async (r
 router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
-    const { url, title, targetType = "ALL", targetId, streamVolume } = req.body ?? {};
+    const { url, title, targetType = "ALL", targetId, streamVolume, durationSec } = req.body ?? {};
     if (!url || typeof url !== "string" || !url.trim()) {
       return res.status(400).json({ error: "url kötelező" });
     }
@@ -666,6 +737,7 @@ router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Re
         source:            { type: "stream", url: url.trim() },
         tenantId:          tid(req),
         title:             title?.trim() || "Internetrádió",
+        durationSec:       typeof durationSec === "number" && isFinite(durationSec) ? durationSec : undefined,
         deviceIdsToUnmute: candidateIds,
         persistent:        true,
       });
@@ -770,6 +842,7 @@ router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, 
         source:            { type: "url", url: file.fileUrl },
         tenantId:          tid(req),
         title:             file.originalName,
+        durationSec:       file.durationSec ?? undefined,
         deviceIdsToUnmute: candidateIds,
       });
     }
@@ -791,5 +864,112 @@ router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, 
   } catch (err: any) {
     console.error("[RADIO/play-now] error:", err);
     return res.status(500).json({ error: err?.message || "Failed to play file" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ÉLŐ LEJÁTSZÁS-VEZÉRLÉS (seek/pause/resume/status) – YouTube fül élő adásba
+// küldött videója, ill. Hangfájl könyvtár élő seek-sávja. Csak akkor hat,
+// ha ÉPP egy RADIO típusú job aktívan szól (vagy user által szüneteltetve
+// van) – ld. audio-mixer.ts `seekRadio`/`pauseRadio`/`resumeRadio`/
+// `getRadioLiveState` kommentjeit a pontos szemantikáért.
+// ═══════════════════════════════════════════════════════════════════════════
+
+router.post("/live/seek", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const { positionSec } = req.body ?? {};
+    if (typeof positionSec !== "number" || !isFinite(positionSec) || positionSec < 0) {
+      return res.status(400).json({ error: "positionSec kötelező, nem-negatív szám" });
+    }
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    const ok = SnapcastService.seekRadio(tid(req), positionSec);
+    if (!ok) return res.status(409).json({ error: "Nincs éppen élő rádió-lejátszás" });
+    return res.json({ ok: true });
+  } catch (err) { console.error("[RADIO/live/seek]", err); return res.status(500).json({ error: "Failed to seek" }); }
+});
+
+router.post("/live/pause", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    const ok = SnapcastService.pauseRadio(tid(req));
+    if (!ok) return res.status(409).json({ error: "Nincs éppen élő rádió-lejátszás" });
+    return res.json({ ok: true });
+  } catch (err) { console.error("[RADIO/live/pause]", err); return res.status(500).json({ error: "Failed to pause" }); }
+});
+
+router.post("/live/resume", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    const ok = SnapcastService.resumeRadio(tid(req));
+    if (!ok) return res.status(409).json({ error: "Nincs szüneteltetett élő lejátszás" });
+    return res.json({ ok: true });
+  } catch (err) { console.error("[RADIO/live/resume]", err); return res.status(500).json({ error: "Failed to resume" }); }
+});
+
+// GET /radio/live/status – a frontend LiveProgressBar 1mp-enként pollozza
+// (nem canWrite-hoz kötött, csak olvasás – a `/ytplaylists/:id/status`
+// mintáját követve).
+router.get("/live/status", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    const state = SnapcastService.getRadioLiveState(tid(req));
+    return res.json({ ok: true, state });
+  } catch (err) { console.error("[RADIO/live/status]", err); return res.status(500).json({ error: "Failed to fetch live status" }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// YOUTUBE – IDŐZÍTETT LEJÁTSZÁS
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A yt-dlp-vel kinyert közvetlen CDN-URL (`/yt-live-url`) lejáró, aláírt
+// link – nem alkalmas órákkal/napokkal későbbre időzítésre. Ezért időzítéskor
+// a MEGLÉVŐ letöltési pipeline-t használjuk (mint a `buildYoutubePlaylist`):
+// előbb letöltjük+tároljuk MP3-ként egy normál RadioFile rekordként, majd a
+// fenti `createSchedule()` helperrel egy szokványos ütemezést hozunk létre
+// rá – nincs új adatmodell, és az időzített pillanatban a fájl már helyben
+// van (nem függ egy időközben lejárt YouTube-linktől).
+router.post("/youtube/schedule", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const { url, title, targetType, targetId, scheduledAt } = req.body ?? {};
+    if (!url || typeof url !== "string" || !isYoutubeUrl(url)) {
+      return res.status(400).json({ error: "Érvényes YouTube URL szükséges" });
+    }
+    if (!targetType || !scheduledAt) return res.status(400).json({ error: "targetType and scheduledAt are required" });
+    const scheduledDate = new Date(scheduledAt);
+    if (isNaN(scheduledDate.getTime())) return res.status(400).json({ error: "Invalid scheduledAt date" });
+    if (scheduledDate < new Date())     return res.status(400).json({ error: "scheduledAt must be in the future" });
+
+    const hash    = crypto.randomBytes(12).toString("hex");
+    const outTmpl = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}.%(ext)s`);
+    await runCmd(YT_DLP_BIN, ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K", "--no-playlist", "--output", outTmpl, "--no-warnings", url.trim()]);
+
+    const filename   = `radio_yt_${hash}.mp3`;
+    const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
+    if (!fs.existsSync(outputPath)) return res.status(422).json({ error: "A videó letöltése sikertelen" });
+
+    const sizeBytes   = fs.statSync(outputPath).size;
+    const durationSec = await getAudioDurationSec(outputPath);
+    const fileUrl     = `${baseUrl()}/uploads/radio/${filename}`;
+    const radioFile   = await prisma.radioFile.create({
+      data: {
+        tenantId: tid(req), filename,
+        originalName: `${(typeof title === "string" && title.trim()) || "YouTube videó"}.mp3`,
+        sizeBytes, durationSec, fileUrl, createdById: uid(req),
+      },
+    });
+
+    const result = await createSchedule({
+      tid: tid(req), uid: uid(req), radioFileId: radioFile.id,
+      targetType, targetId, scheduledAt: scheduledDate,
+    });
+    if (!result.ok) return res.status(result.status).json({ error: result.error, conflict: (result as any).conflict });
+    return res.status(201).json({ ok: true, schedule: result.schedule, radioFile });
+  } catch (err: any) {
+    console.error("[youtube/schedule]", err?.message);
+    return res.status(500).json({ error: "Failed to schedule YouTube video" });
   }
 });
