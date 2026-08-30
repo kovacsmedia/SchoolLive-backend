@@ -543,10 +543,16 @@ export class TenantAudioMixer extends EventEmitter {
    *  RADIO se aktívan szóló, se user-paused állapotban. */
   getRadioLiveState(): { active: boolean; paused: boolean; positionSec: number; durationSec?: number; title?: string } | null {
     if (this.active && this.active.job.jobType === "RADIO") {
+      // FONTOS: a job.resumeBytes-t is hozzá kell adni, nem csak az AKTUÁLIS
+      // ffmpeg-szegmens által eddig kiírt bytesWritten-t – seek/resume után
+      // ugyanis egy TELJESEN ÚJ ffmpeg-folyamat indul (bytesWritten=0-ról),
+      // az abszolút pozíció ettől a bázistól számítva helyes (ugyanez a
+      // minta, mint a `pauseRadio()`-ban lent). Enélkül a seek-sáv minden
+      // tekerés/resume után hamisan 0:00-ra ugrott vissza.
       return {
         active: true,
         paused: false,
-        positionSec: this.active.bytesWritten / BYTES_PER_SEC,
+        positionSec: ((this.active.job.resumeBytes ?? 0) + this.active.bytesWritten) / BYTES_PER_SEC,
         durationSec: this.active.job.durationSec,
         title: this.active.job.title,
       };
