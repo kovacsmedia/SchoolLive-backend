@@ -449,10 +449,9 @@ router.delete("/:id", authJwt, requireTenant, async (req, res) => {
         where: { id },
         data: { isActive: false },
       });
-      // Session törlése hogy ne tudjon visszajelentkezni
-      await prisma.$executeRaw`
-        UPDATE "User" SET "activeSessionId" = NULL WHERE id = ${id}
-      `.catch(() => {});
+      // Összes munkamenet törlése (minden bejelentkezett kliens, pl. a
+      // teremenkénti webplayerek is), hogy ne tudjon visszajelentkezni.
+      await prisma.userSession.deleteMany({ where: { userId: id } }).catch(() => {});
       return res.json({ ok: true, deleted: false, deactivated: true });
     }
 
@@ -485,6 +484,64 @@ router.delete("/:id", authJwt, requireTenant, async (req, res) => {
       });
     }
     return res.status(500).json({ error: "Failed to delete user" });
+  }
+});
+
+/**
+ * GET /admin/users/:id/sessions
+ * Az adott user aktív bejelentkezett kliensei – elsősorban a több teremben
+ * is használt, megosztott PLAYER-fiók webplayer-példányainak áttekintésére
+ * (melyik böngészőből/eszközről, mikor látta utoljára a backend).
+ */
+router.get("/:id/sessions", authJwt, requireTenant, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!user?.role || !requireAdminReadAccess(user)) return res.status(403).json({ error: "Forbidden" });
+    if (!user.tenantId) return res.status(400).json({ error: "Tenant context required" });
+
+    const id = getParamId(req);
+    if (!id) return res.status(400).json({ error: "Missing id" });
+
+    const target = await prisma.user.findFirst({ where: { id, tenantId: user.tenantId }, select: { id: true } });
+    if (!target) return res.status(404).json({ error: "User not found" });
+
+    const sessions = await prisma.userSession.findMany({
+      where: { userId: id },
+      orderBy: { lastSeenAt: "desc" },
+      select: { id: true, clientType: true, clientKey: true, userAgent: true, createdAt: true, lastSeenAt: true },
+    });
+
+    return res.json({ ok: true, sessions });
+  } catch (err) {
+    console.error("[GET USER SESSIONS]", err);
+    return res.status(500).json({ error: "Failed to fetch sessions" });
+  }
+});
+
+/**
+ * DELETE /admin/users/:id/sessions/:sessionRowId
+ * Egy konkrét munkamenet (pl. egy adott termi webplayer) kényszerített
+ * kijelentkeztetése – a user TÖBBI munkamenete változatlan marad.
+ */
+router.delete("/:id/sessions/:sessionRowId", authJwt, requireTenant, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!user?.role || !requireAdminWriteAccess(user)) return res.status(403).json({ error: "Forbidden" });
+    if (!user.tenantId) return res.status(400).json({ error: "Tenant context required" });
+
+    const id = getParamId(req);
+    const sessionRowId = String(req.params.sessionRowId ?? "");
+    if (!id || !sessionRowId) return res.status(400).json({ error: "Missing id" });
+
+    const target = await prisma.user.findFirst({ where: { id, tenantId: user.tenantId }, select: { id: true } });
+    if (!target) return res.status(404).json({ error: "User not found" });
+
+    const r = await prisma.userSession.deleteMany({ where: { id: sessionRowId, userId: id } });
+    if (r.count === 0) return res.status(404).json({ error: "Session not found" });
+    return res.status(204).send();
+  } catch (err) {
+    console.error("[DELETE USER SESSION]", err);
+    return res.status(500).json({ error: "Failed to revoke session" });
   }
 });
 

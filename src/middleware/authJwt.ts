@@ -22,26 +22,26 @@ export async function authJwt(req: Request, res: Response, next: NextFunction) {
   try {
     const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET) as JwtPayload;
 
-    // Single-session enforcement, MINDEN kérésen (nem csak bejelentkezéskor):
-    // ha időközben valaki (akár ugyanaz a user másik eszközről/böngészőből)
-    // helyesen bejelentkezett, az auth.service.ts login() felülírja a
-    // User.activeSessionId-t – ez a régi tokent AZONNAL érvénytelenné teszi,
-    // nem kell várni a 15 perces TTL-re. Ezzel egy időben lastSeenAt is
-    // frissül (egy kérésben, RETURNING-gel).
-    const rows = await prisma.$queryRaw<{ activeSessionId: string | null }[]>`
-      UPDATE "User" SET "lastSeenAt" = NOW() WHERE id = ${decoded.sub}
-      RETURNING "activeSessionId"
-    `;
-    const currentSessionId = rows[0]?.activeSessionId ?? null;
-
+    // Multi-session enforcement, MINDEN kérésen (nem csak bejelentkezéskor):
+    // a token csak akkor érvényes, ha a `sessionId`-jéhez TARTOZIK egy még
+    // létező UserSession sor (ld. auth.service.ts login()) – ez ÉLŐBEN tartja
+    // a user ÖSSZES párhuzamos kliensét (pl. több teremben futó webplayer),
+    // csak az EXPLICIT kijelentkeztetett/törölt session esik ki. Ezzel egy
+    // időben lastSeenAt is frissül (egy update-ben).
+    //
     // decoded.sessionId hiánya = régi formátumú token (a funkció bevezetése
-    // előtt kiadva) – ezt még átengedjük, a session-mezők a legközelebbi
-    // login/refresh-kor úgyis frissülnek.
-    if (decoded.sessionId && currentSessionId !== decoded.sessionId) {
-      return res.status(401).json({
-        error:   "session_superseded",
-        message: "Ezt a fiókot valaki más helyről jelentkeztette be.",
+    // előtt kiadva) – ezt még átengedjük, a köv. login úgyis friss tokent ad.
+    if (decoded.sessionId) {
+      const r = await prisma.userSession.updateMany({
+        where: { sessionId: decoded.sessionId, userId: decoded.sub },
+        data:  { lastSeenAt: new Date() },
       });
+      if (r.count === 0) {
+        return res.status(401).json({
+          error:   "session_revoked",
+          message: "Ez a munkamenet megszűnt (kijelentkeztetve lett).",
+        });
+      }
     }
 
     req.user = decoded;

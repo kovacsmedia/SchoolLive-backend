@@ -175,9 +175,44 @@ model User {
   youtubePlaylists YoutubePlaylist[] @relation("YoutubePlaylistCreatedBy")
   firmwareReleases FirmwareRelease[] @relation("FirmwareCreatedBy")
 
+  sessions UserSession[]
+
   @@index([tenantId])
   @@index([role])
   @@index([isActive])
+}
+
+// Multi-session támogatás: egy user (pl. a több teremben is használt,
+// megosztott PLAYER-fiók) EGYSZERRE több bejelentkezett kliensről is
+// aktív lehet – a korábbi `User.activeSessionId` egyetlen mezős, felülíró
+// megoldás minden új bejelentkezéskor kiléptette az ÖSSZES többi klienst
+// (pl. a másik terem webplayerét). Minden sikeres login egy ÚJ sort szúr be
+// ide (nem felülír), az authJwt middleware pedig a token `sessionId`-jének
+// LÉTEZÉSÉT ellenőrzi ebben a táblában (nem egyenlőségét egyetlen mezővel).
+model UserSession {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // A JWT payload `sessionId` mezőjével egyezik – ez alapján azonosítja az
+  // authJwt middleware, melyik sor tartozik az adott tokenhez.
+  sessionId String @unique
+
+  // "web" = normál admin böngésző-bejelentkezés, "webplayer" = PLAYER
+  // szerepkörű fiók (a user.role alapján a login()-ban derül ki).
+  clientType String @default("web")
+
+  // Kliens-oldali, localStorage-ban tárolt, böngészőnként stabil (de nem
+  // valódi hardver-) azonosító – ugyanaz a böngésző/profil több loginon át
+  // is ugyanazt küldi, így megkülönböztethető "ez a gép" vs "az a gép".
+  clientKey String?
+  userAgent String?
+  ipAddress String?
+
+  createdAt  DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  @@index([userId])
 }
 
 model Device {

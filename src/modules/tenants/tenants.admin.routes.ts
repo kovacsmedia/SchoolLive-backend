@@ -233,10 +233,9 @@ router.delete("/:id", authJwt, async (req, res) => {
     if (!permanent) {
       // Soft delete
       await prisma.tenant.update({ where: { id }, data: { isActive: false } });
-      // Userek session-jeit is töröljük
-      await prisma.$executeRaw`
-        UPDATE "User" SET "activeSessionId" = NULL WHERE "tenantId" = ${id}
-      `.catch(() => {});
+      // Userek összes munkamenetét is töröljük (minden bejelentkezett
+      // kliens, pl. a teremenkénti webplayerek is)
+      await prisma.userSession.deleteMany({ where: { user: { tenantId: id } } }).catch(() => {});
       return res.json({ ok: true, deleted: false, deactivated: true });
     }
 
