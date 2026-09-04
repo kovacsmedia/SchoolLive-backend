@@ -4,7 +4,13 @@ export const env = {
   NODE_ENV: process.env.NODE_ENV ?? "development",
   PORT: Number(process.env.PORT ?? 3000),
   JWT_ACCESS_SECRET: process.env.JWT_ACCESS_SECRET ?? "",
-  JWT_ACCESS_TTL: process.env.JWT_ACCESS_TTL ?? "15m",
+  // A TÉNYLEGES munkamenet-életciklust a UserSession tábla vezérli (ld.
+  // auth.service.ts login()/logout(), authJwt.ts) – egy sor törlése azonnal
+  // érvényteleníti a hozzá tartozó tokent, FÜGGETLENÜL ennek a lejáratától.
+  // Emiatt maga a JWT lejárati ideje itt csak egy nagyon távoli, defenzív
+  // felső korlát: a user NE essen ki írás/gépelés közben egy régi, rövid
+  // (15 perces) TTL miatt – ez volt a korábbi zavaró viselkedés.
+  JWT_ACCESS_TTL: process.env.JWT_ACCESS_TTL ?? "3650d",
 
   // ── Multi-node cluster ─────────────────────────────────────────────────
   //

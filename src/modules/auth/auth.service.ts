@@ -32,18 +32,27 @@ export async function login(email: string, password: string, client: LoginClient
     tenantName = tenant?.name ?? null;
   }
 
-  // ── Multi-session: helyes jelszó = AZONNALI belépés, ÚJ kliensként ───────
-  // Nincs várakozás, nincs "already_logged_in" elutasítás – ez egy
-  // kommunikációs rendszer felhasználói felülete, mindig rendelkezésre kell
-  // állnia. A korábbi egyetlen `User.activeSessionId` mező FELÜLÍRÁSA helyett
-  // (ami minden új bejelentkezéskor azonnal kiléptette az ÖSSZES többi
-  // klienst – pl. egy másik teremben futó webplayert) most egy ÚJ
-  // UserSession sor jön létre: több kliens (pl. a megosztott PLAYER-fiókkal
-  // bejelentkezett, teremenkénti webplayerek) egyszerre, egymást nem
-  // kiütve maradhat bejelentkezve. Az authJwt middleware a sessionId
-  // LÉTEZÉSÉT nézi ebben a táblában, nem egyenlőségét egy globális mezővel.
+  // ── Session-szemantika: PLAYER = multi-session, mindenki más = single ───
+  //
+  // PLAYER (megosztott webplayer-fiók, teremenként egy böngésző-példány):
+  //   minden bejelentkezés ÚJ, egymást nem kiütő UserSession sort kap – a
+  //   Terem A webplayerének belépése NEM léptetheti ki a Terem B webplayerét.
+  //   Az ilyen session-t KIZÁRÓLAG a device.lifecycle.ts zárja le, ha a hozzá
+  //   tartozó Device 10 percnél régebben nem beaconolt (ld. ott).
+  //
+  // Mindenki más (ember-admin fiók): a régi, "single session" szemantika –
+  // egy ÚJ, helyes jelszavas bejelentkezés a felhasználó ÖSSZES korábbi
+  // munkamenetét lezárja. Ez SZÁNDÉKOS (nem hiba, amit korábban a webplayer
+  // miatt kijavítottunk): embernél a "bejelentkeztem egy másik gépről"
+  // tényleg azt jelenti, hogy az előző helyet nem használja tovább.
+  //
+  // Egyik ágnál SINCS idő-alapú lejárat (ld. env.ts JWT_ACCESS_TTL) – a
+  // munkamenet csak explicit logout / (ember esetén) új login / (PLAYER
+  // esetén) a device 10 perces offline-timeoutja miatt szűnik meg, SOSEM
+  // "csendben", gépelés/hosszabb inaktivitás közben.
   const sessionId = crypto.randomUUID();
-  const clientType = user.role === "PLAYER" ? "webplayer" : "web";
+  const isPlayer = user.role === "PLAYER";
+  const clientType = isPlayer ? "webplayer" : "web";
 
   const payload: JwtPayload = {
     sub:        user.id,
@@ -54,6 +63,10 @@ export async function login(email: string, password: string, client: LoginClient
   };
 
   const token = signAccessToken(payload);
+
+  if (!isPlayer) {
+    await prisma.userSession.deleteMany({ where: { userId: user.id } });
+  }
 
   await prisma.userSession.create({
     data: {
@@ -72,12 +85,11 @@ export async function login(email: string, password: string, client: LoginClient
   };
 }
 
-// Aktív (még nem lejárt, és még nem felülírt) token cseréje egy friss
-// TTL-űre, újra bejelentkezés (jelszó megadása) nélkül. A frontend ezt
-// hívja periodikusan, amíg az admin fül aktív/fókuszban van, hogy egy
-// éppen dolgozó felhasználó munkamenete ne járjon le a 15 perces
-// access-token TTL miatt. A sessionId változatlan marad a payloadban,
-// úgyhogy nem kell semmit frissíteni az adatbázisban.
+// Aktív token cseréje egy friss TTL-űre, jelszó megadása nélkül. Mivel a
+// JWT_ACCESS_TTL mostantól gyakorlatilag lejárat nélküli (ld. env.ts), ez
+// már nem kritikus-útvonal – csak defenzív frissítés. A sessionId
+// változatlan marad a payloadban, úgyhogy nem kell semmit frissíteni az
+// adatbázisban.
 export async function refresh(payload: JwtPayload) {
   const token = signAccessToken(payload);
   return { accessToken: token };

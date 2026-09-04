@@ -250,14 +250,21 @@ class SyncEngineClass {
           snapHost = env.NODE_HOSTNAME; // multi-node: mindig EZ a node a snap-cél, sosem egy globális fix host (ld. terv Fázis 7)
           snapPort = tenant?.snapPort ?? null;
         } else if (token) {
-          // Browser: a JWT-ben benne van a userId (payload.sub).
-          // A Device-t userId+tenantId párral oldjuk fel (egy player-user-hez
-          // egy browser-device, lásd player.device.controller register).
+          // Browser: a JWT-ben benne van a userId (payload.sub). EGY PLAYER-
+          // fiókot TÖBB böngésző/terem is használhat egyszerre (ld.
+          // auth.service.ts – PLAYER = multi-session), ezért a Device-t
+          // userId+tenantId+clientId hármassal oldjuk fel (NEM csak
+          // userId+tenantId – az korábban azt okozta, hogy több webplayer
+          // ugyanannak, tetszőlegesen kiválasztott Device-nak lett feloldva,
+          // ellehetetlenítve az egyenkénti Snap-célzást). `deviceId` itt már
+          // a kliens saját clientId-ja (ld. a metódus elején a WS query
+          // param feloldását), ugyanaz, amit a player.device.controller
+          // register() a Device.clientId mezőjébe ír.
           const decoded = jwt.decode(token) as any;
           const userIdFromToken: string | undefined = decoded?.sub;
           if (userIdFromToken) {
             const dev = await prisma.device.findFirst({
-              where: { userId: userIdFromToken, tenantId },
+              where: { userId: userIdFromToken, tenantId, clientId: deviceId },
               select: { id: true, syncOffsetMs: true },
             });
             if (dev) {

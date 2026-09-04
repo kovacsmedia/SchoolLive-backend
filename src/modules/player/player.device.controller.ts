@@ -22,9 +22,12 @@ function getTenantId(req: Request): string {
 // admin-approval flow – azokat a /devices/provision és /admin/devices/* útvonalak
 // kezelik, nem ez.
 //
-// Idempotens: egy userId+tenantId párhoz egy Device. Második böngészőből
-// belépve ugyanazt a Device-rekordot kapja vissza, csak frissítjük az
-// online/ipAddress/lastSeenAt-t.
+// FONTOS: a PLAYER-fiókot TÖBB böngésző/terem is használhatja egyszerre
+// (ld. auth.service.ts – PLAYER = multi-session), ezért a Device-kulcs
+// userId+tenantId+clientId (NEM csak userId+tenantId – az korábban azt
+// okozta, hogy a második terem bejelentkezése felülírta az első Device
+// sorát, "ellopva" tőle a clientId-t/nevet). Idempotens: ugyanaz a böngésző
+// (ugyanaz a clientId) mindig ugyanazt a Device-rekordot kapja vissza.
 export async function registerPlayerDevice(req: Request, res: Response) {
   try {
     const user     = getUser(req);
@@ -40,9 +43,10 @@ export async function registerPlayerDevice(req: Request, res: Response) {
     const mac = `WP-${clientId}`;
     const loginTime = new Date();
 
-    // Ha már van Device ehhez a userId+tenantId-hez → csak frissítjük.
+    // Ha már van Device EHHEZ a konkrét böngészőhöz (userId+tenantId+clientId)
+    // → csak frissítjük. Más böngészők (más clientId) saját sorukat kapják.
     const existingDevice = await prisma.device.findFirst({
-      where: { userId, tenantId },
+      where: { userId, tenantId, clientId },
       select: { id: true, name: true, online: true },
     });
 
@@ -78,11 +82,15 @@ export async function registerPlayerDevice(req: Request, res: Response) {
       return res.json({ ok: true, status: "active", deviceId: existingDevice.id });
     }
 
-    // Még nincs Device → automatikusan létrehozzuk. A PLAYER-szerep maga a
-    // jogosultság (nem kell admin-jóváhagyás). Név alapja a User displayName-je
-    // (ha nincs, az email). Ütközéskor (két PLAYER ugyanazzal a displayName-mel
-    // ugyanazon tenant alatt) emailre fallback-elünk, ami User-szinten globálisan
-    // unique.
+    // Még nincs Device EHHEZ a böngészőhöz → automatikusan létrehozzuk. A
+    // PLAYER-szerep maga a jogosultság (nem kell admin-jóváhagyás). Név
+    // alapja a User displayName-je (ha nincs, az email) + a clientId-ből
+    // képzett rövid, jól olvasható azonosító (ugyanaz a "WP-XXXXXXXX" forma,
+    // amit a webplayer a saját képernyőjén is mutat) – ez teszi a nevet
+    // EGYEDIVÉ több, ugyanazzal a PLAYER-fiókkal bejelentkezett terem/gép
+    // esetén is (@@unique([tenantId, name])), ÉS ez adja a felhasználó által
+    // kért "hardverazonosító a név mellett" megjelenítést is, mindenhol
+    // (Eszközök lista, cél-választók stb.) – nincs hozzá külön frontend-kód.
     const owner = await prisma.user.findUnique({
       where: { id: userId },
       select: { email: true, displayName: true },
@@ -92,9 +100,10 @@ export async function registerPlayerDevice(req: Request, res: Response) {
       return res.status(404).json({ error: "User not found" });
     }
 
-    const friendly  = owner.displayName?.trim() || owner.email.split("@")[0];
-    const primary   = `Webplayer – ${friendly}`;
-    const fallback  = `Webplayer – ${owner.email}`;
+    const friendly = owner.displayName?.trim() || owner.email.split("@")[0];
+    const hwTag    = `WP-${String(clientId).replace(/-/g, "").slice(0, 8).toUpperCase()}`;
+    const primary  = `Webplayer – ${friendly} (${hwTag})`;
+    const fallback = `Webplayer – ${owner.email} (${hwTag})`;
 
     let created: { id: string } | null = null;
     for (const candidateName of [primary, fallback]) {
@@ -120,9 +129,10 @@ export async function registerPlayerDevice(req: Request, res: Response) {
         break;
       } catch (e: any) {
         // P2002 = unique constraint (tenantId+name vagy tenantId+clientId).
-        // Először a primary nevet próbáljuk, aztán a fallback-emailt; ha mindkettő
-        // ütközik, az kivételes (két PLAYER user pontosan ugyanazzal az emaillel
-        // egy tenant alatt nem fordulhat elő, mert email globálisan unique).
+        // A hwTag a névben már gyakorlatilag kizárja az ütközést; a
+        // fallback csak a végképp valószínűtlen esetre marad (pl. ugyanaz
+        // a clientId két user alatt is regisztrált volna, ami nem fordulhat
+        // elő, mert a lookup is clientId-alapú).
         if (e?.code !== "P2002") throw e;
         console.warn(
           `[PLAYER] register: Device name ütközés "${candidateName}", próbálkozás fallback névvel`
@@ -148,6 +158,10 @@ export async function registerPlayerDevice(req: Request, res: Response) {
 }
 
 // ─── POST /player/device/beacon ───────────────────────────────────────────
+// Csak a legacy webplayer (VirtualPlayerLegacy.tsx) HTTP-pollozású útvonala –
+// a modern webplayer WS-en (SyncEngine BEACON) megy. Ugyanúgy clientId-
+// alapú a Device-feloldás, hogy több, ugyanazzal a PLAYER-fiókkal
+// bejelentkezett terem ne írja felül egymás sorát.
 export async function beaconPlayerDevice(req: Request, res: Response) {
   try {
     const user     = getUser(req);
@@ -156,16 +170,14 @@ export async function beaconPlayerDevice(req: Request, res: Response) {
 
     if (!userId) return res.status(401).json({ error: "Missing user id" });
 
-    const { ipAddress } = req.body ?? {};
+    const { ipAddress, clientId } = req.body ?? {};
 
-    const device = await prisma.device.findFirst({
-      where: { userId, tenantId },
-      select: { id: true },
-    });
+    const device = clientId
+      ? await prisma.device.findFirst({ where: { userId, tenantId, clientId }, select: { id: true } })
+      : null;
 
     if (!device) {
       // Még pending – frissítjük a lastSeenAt-t
-      const { clientId } = req.body ?? {};
       if (clientId) {
         const mac = `WP-${clientId}`;
         await prisma.pendingDevice.updateMany({
@@ -197,6 +209,8 @@ export async function beaconPlayerDevice(req: Request, res: Response) {
 }
 
 // ─── POST /player/device/poll ─────────────────────────────────────────────
+// Legacy webplayer – ld. beaconPlayerDevice kommentje a clientId-alapú
+// feloldás indokáról.
 export async function pollPlayerCommands(req: Request, res: Response) {
   try {
     const user     = getUser(req);
@@ -205,10 +219,10 @@ export async function pollPlayerCommands(req: Request, res: Response) {
 
     if (!userId) return res.status(401).json({ error: "Missing user id" });
 
-    const device = await prisma.device.findFirst({
-      where: { userId, tenantId },
-      select: { id: true, name: true },
-    });
+    const { clientId } = req.body ?? {};
+    const device = clientId
+      ? await prisma.device.findFirst({ where: { userId, tenantId, clientId }, select: { id: true, name: true } })
+      : null;
 
     if (!device) {
       return res.json({ ok: true, status: "pending", command: null });
@@ -281,6 +295,8 @@ export async function pollPlayerCommands(req: Request, res: Response) {
 }
 
 // ─── POST /player/device/ack ──────────────────────────────────────────────
+// Legacy webplayer – ld. beaconPlayerDevice kommentje a clientId-alapú
+// feloldás indokáról.
 export async function ackPlayerCommand(req: Request, res: Response) {
   try {
     const user     = getUser(req);
@@ -289,13 +305,12 @@ export async function ackPlayerCommand(req: Request, res: Response) {
 
     if (!userId) return res.status(401).json({ error: "Missing user id" });
 
-    const { commandId } = req.body ?? {};
+    const { commandId, clientId } = req.body ?? {};
     if (!commandId) return res.status(400).json({ error: "commandId is required" });
 
-    const device = await prisma.device.findFirst({
-      where: { userId, tenantId },
-      select: { id: true },
-    });
+    const device = clientId
+      ? await prisma.device.findFirst({ where: { userId, tenantId, clientId }, select: { id: true } })
+      : null;
 
     if (!device) return res.status(404).json({ error: "Device not found" });
 
