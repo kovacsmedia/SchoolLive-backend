@@ -243,6 +243,33 @@ router.post("/translate", authJwt, requireTenant, async (req: Request, res: Resp
   }
 });
 
+// POST /messages/tts-preview – CSAK generálás, küldés/kiszórás nélkül.
+// Nincs Message DB-rekord, nincs device-célzás/snap-lejátszás – a frontend
+// a visszaadott fileUrl-t egy <audio> előnézetben játssza le és/vagy
+// letöltésre kínálja ("generáld és hallgasd vissza, mielőtt elküldenéd").
+// Ugyanazt a névképzést kapja a fájl, mint a ténylegesen elküldött üzenetek
+// (ld. tts.service.ts buildTtsFilename) – ha a user utána mégis elküldi,
+// nincs "kétféle" fájlnév-stílus.
+router.post("/tts-preview", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const tid = tenantId(req);
+    const { text, voice = "anna", preBellSoundId } = req.body ?? {};
+    if (!text?.trim()) return res.status(400).json({ error: "Text is required" });
+
+    const introPath = (typeof preBellSoundId === "string" && preBellSoundId.trim())
+      ? await resolveIntroSoundPath(tid, preBellSoundId.trim())
+      : null;
+
+    const { filename, durationMs } = await generateTTS(text.trim(), voice, introPath);
+    const fileUrl = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${filename}`;
+
+    return res.json({ ok: true, fileUrl, filename, durationMs });
+  } catch (err) {
+    console.error("[MESSAGES/tts-preview] hiba:", err);
+    return res.status(500).json({ error: "Failed to generate preview" });
+  }
+});
+
 // POST /messages – TTS üzenet küldése
 router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {

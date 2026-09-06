@@ -7,6 +7,8 @@ import { spawn, execSync } from "child_process";
 import path                from "path";
 import fs                  from "fs";
 import crypto              from "crypto";
+import { stripAccents }    from "../utils/text";
+import { budapestDateTimeParts } from "../utils/budapest-time";
 
 const PIPER_BIN  = "/opt/schoollive/piper/piper";
 const MODELS_DIR = "/opt/schoollive/piper/models";
@@ -102,6 +104,37 @@ export const NORMALIZE_COMPRESS_FILTER =
   "loudnorm=I=-12:TP=-1.0:LRA=7," +
   "alimiter=limit=0.97:attack=5:release=50";
 
+// ── Fájlnév-képzés az üzenet szövegéből ───────────────────────────────────────
+// Cél: "<üzenet első 2 szava, ékezet nélkül>_<YYYY-MM-DD>_<óraperc>.opus" –
+// ember-olvasható fájlnév letöltéskor/listázáskor, ahelyett hogy csak egy
+// random hash lenne. Az időbélyeg a tényleges (Europe/Budapest) helyi idő,
+// nem a szerver saját (esetleg UTC) órája.
+function sanitizeFilenameWord(w: string): string {
+  return stripAccents(w).replace(/[^a-zA-Z0-9]/g, "");
+}
+
+function buildTtsFilename(text: string): string {
+  const words = text
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map(sanitizeFilenameWord)
+    .filter(Boolean);
+  const base = words.length > 0 ? words.join("_") : "uzenet";
+  const { date, hm } = budapestDateTimeParts();
+
+  // Ütközés-védelem: ha két üzenet ugyanazzal a 2 szóval indul ugyanabban a
+  // percben, a második ne írja felül az első fájlját.
+  let filename = `${base}_${date}_${hm}.opus`;
+  let n = 2;
+  while (fs.existsSync(path.join(AUDIO_DIR, filename))) {
+    filename = `${base}_${date}_${hm}-${n}.opus`;
+    n++;
+  }
+  return filename;
+}
+
 // ── generateTTS ───────────────────────────────────────────────────────────────
 // Visszaad: { filename, durationMs }
 // filename = az /audio/ könyvtárban lévő WAV fájl neve
@@ -131,8 +164,10 @@ export async function generateTTS(
   // A klienseknek a snap streamen át megy a hang, és a snapserver Opus
   // codec-kel sugároz – ezért a backend is Opus-ban tárolja a render output-ot.
   // Helytakarékos (1/10–1/20 a WAV-hoz képest), és a snapserver natívan
-  // fogadja file-source-ként.
-  const finalFile  = path.join(AUDIO_DIR, `tts_${hash}.opus`);
+  // fogadja file-source-ként. A VÉGSŐ fájl neve (ellentétben a fenti,
+  // eldobható köztes fájlokkal) ember-olvasható, az üzenet szövegéből
+  // képzett – ld. buildTtsFilename().
+  const finalFile  = path.join(AUDIO_DIR, buildTtsFilename(text));
 
   // 1. Szöveg → WAV (Piper)
   await runProcess(PIPER_BIN, [

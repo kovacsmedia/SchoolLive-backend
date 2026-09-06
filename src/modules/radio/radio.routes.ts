@@ -46,7 +46,12 @@ const upload = multer({
   storage,
   limits: { fileSize: 200 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    const allowed = [".mp3", ".wav", ".ogg", ".m4a", ".aac"];
+    // .opus KÜLÖN felvéve: a Snapcast-sugárzás maga is Opus-kódekkel megy
+    // (ld. snapcast.service.ts pipe-forrás `codec=opus`), ezért natívan
+    // feltölthetőnek KELL lennie, nem csak az `audio/*` mimetype-fallback-en
+    // keresztül (ami böngészőtől/OS-től függően nem mindig ad helyes
+    // mimetype-ot .opus fájlra).
+    const allowed = [".mp3", ".wav", ".ogg", ".m4a", ".aac", ".opus"];
     const ext = path.extname(file.originalname).toLowerCase();
     if (allowed.includes(ext) || file.mimetype.startsWith("audio/")) cb(null, true);
     else cb(new Error("Only audio files are allowed"));

@@ -45,10 +45,19 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   fileFilter: (_req, file, cb) => {
-    if (file.mimetype === "audio/mpeg" || file.originalname.endsWith(".mp3")) {
+    // .opus KÜLÖN felvéve: a Snapcast-sugárzás maga is Opus-kódekkel megy
+    // (ld. snapcast.service.ts pipe-forrás `codec=opus`), ezért natívan
+    // feltölthetőnek KELL lennie, nem csak MP3-nak.
+    const name = file.originalname.toLowerCase();
+    if (
+      file.mimetype === "audio/mpeg" ||
+      file.mimetype.startsWith("audio/") ||
+      name.endsWith(".mp3") ||
+      name.endsWith(".opus")
+    ) {
       cb(null, true);
     } else {
-      cb(new Error("Only MP3 files allowed"));
+      cb(new Error("Only audio files allowed"));
     }
   },
 });

@@ -41,3 +41,18 @@ export function isBudapestWeekend(now: Date = new Date()): boolean {
   }).format(now);
   return dayOfWeek === "Sat" || dayOfWeek === "Sun";
 }
+
+/** Aktuális (Europe/Budapest) naptári dátum és óra:perc, fájlnév-célra
+ *  (pl. TTS-generálás – ld. tts.service.ts) – `{ date: "YYYY-MM-DD", hm: "HHmm" }`. */
+export function budapestDateTimeParts(now: Date = new Date()): { date: string; hm: string } {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Budapest",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(now);
+  const get = (t: string) => parts.find(p => p.type === t)?.value ?? "00";
+  return {
+    date: `${get("year")}-${get("month")}-${get("day")}`,
+    hm:   `${get("hour")}${get("minute")}`,
+  };
+}
