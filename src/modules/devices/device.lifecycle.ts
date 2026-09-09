@@ -6,10 +6,10 @@
 // Szabályok:
 //   1. Online → offline transition
 //      Ha egy Device legutóbbi lastSeenAt (beacon/poll) > 10 perce,
-//      online: false-ra állítjuk. Ha a Device egy webplayer (PLAYER-fiók
-//      böngésző-példánya), ezzel EGYÜTT a hozzá tartozó UserSession sort is
-//      lezárjuk (ld. auth.service.ts – ez a PLAYER-munkamenetek EGYETLEN
-//      megszűnési módja, a user más aktív webplayerei érintetlenek).
+//      online: false-ra állítjuk. Ez CSAK állapotjelző az admin felületen –
+//      a webplayer munkamenetét NEM zárjuk le vele (a korábbi ilyen logika
+//      kiléptette a termekben futó lejátszókat, ld. lentebb a részletes
+//      magyarázatot).
 //
 //   2. Stale provisioning takarítás (1 óra)
 //      - DeviceProvisionSession-ök, amelyek 1 óránál régebbiek, törölve.
@@ -38,25 +38,22 @@ let _running = false;
 async function markStaleDevicesOffline(): Promise<number> {
   const threshold = new Date(Date.now() - OFFLINE_AFTER_MS);
 
-  // A PLAYER-fiók (webplayer) munkameneteinek EGYETLEN megszűnési oka a
-  // hozzá tartozó Device 10 perces offline-timeoutja (ld. auth.service.ts
-  // login() kommentje). FONTOS: ez a lekérdezés SZÁNDÉKOSAN NEM szűr
-  // `online: true`-ra – a modern (WS-alapú) webplayernél a kapcsolat
-  // bontásakor (SyncEngine onDeviceDisconnected) a Device AZONNAL
-  // online:false-ra vált, jóval a 10 perces határ előtt, tehát ha itt is az
-  // `online` flag-re szűrnénk, a session sosem záródna le WS-alapú
-  // lecsatlakozásnál. A KIZÁRÓLAGOS mérce a `lastSeenAt` elévülése (10 perc
-  // óta nincs friss beacon/reconnect) – ez ad valódi türelmi időt egy rövid
-  // hálózati kimaradásnak/tab-újratöltésnek, mielőtt a session megszűnne.
-  const goingOffline = await prisma.device.findMany({
-    where: {
-      lastSeenAt: { lt: threshold },
-      authType: "JWT",
-      userId: { not: null },
-    },
-    select: { id: true, userId: true, clientId: true, name: true },
-  });
-
+  // ELTÁVOLÍTVA: a webplayer munkamenetének lezárása 10 perc offline után.
+  //
+  // Itt korábban a JWT-auth (webplayer) Device-okhoz tartozó UserSession
+  // sorokat töröltük, ha a `lastSeenAt` 10 percnél régebbi volt. Ez a
+  // gyakorlatban KILÉPTETTE a termekben futó webplayereket: elég volt egy 10
+  // percnél hosszabb hálózati kimaradás vagy egy elhúzódó backend-leállás, és
+  // a session eltűnt → a köv. kérés 401 `session_revoked` → a kliens a
+  // bejelentkező képernyőre került, holott senki nem nyúlt hozzá.
+  //
+  // A követelmény egyértelmű: a webplayer sem magától, sem a backend miatt
+  // NEM léphet ki. A UserSession tábla hizlalása ellen a lenti
+  // `purgeStaleSessions()` (30 nap érintetlenség) véd, ami bőven a normál
+  // használat fölött van, és nem büntet egy átmeneti kiesést.
+  //
+  // Az eszköz `online` flagjének kivezetése (lentebb) VÁLTOZATLAN – az csak
+  // egy állapotjelző az admin felületen, nem érinti a hitelesítést.
   const r = await prisma.device.updateMany({
     where: {
       online: true,
@@ -67,20 +64,6 @@ async function markStaleDevicesOffline(): Promise<number> {
 
   if (r.count > 0) {
     console.log(`[DEVICE-LIFECYCLE] ${r.count} eszköz offline-ra állítva (>10 perc beacon nélkül)`);
-  }
-
-  for (const dev of goingOffline) {
-    if (!dev.userId || !dev.clientId) continue;
-    try {
-      const closed = await prisma.userSession.deleteMany({
-        where: { userId: dev.userId, clientKey: dev.clientId, clientType: "webplayer" },
-      });
-      if (closed.count > 0) {
-        console.log(`[DEVICE-LIFECYCLE] Webplayer munkamenet lezárva (offline >10 perc): ${dev.name}`);
-      }
-    } catch (e) {
-      console.error(`[DEVICE-LIFECYCLE] Webplayer session-zárás hiba (${dev.name}):`, e);
-    }
   }
 
   return r.count;
@@ -132,10 +115,11 @@ async function purgeStaleProvisioning(): Promise<number> {
   return total;
 }
 
-// A UserSession tábla korábban SOSEM takarodott: a `logout()` törli a saját
-// sorát, a webplayer-sorokat a fenti offline-timeout zárja, de egy egyszerűen
-// bezárt admin böngésző (nincs sendBeacon, elszállt hálózat, összeomlott gép)
-// sora örökre bennmaradt. A tábla korlátlanul nőtt, és minden authJwt-hívás
+// A UserSession tábla korábban SOSEM takarodott: a `logout()` csak a saját
+// sorát törli, de egy egyszerűen bezárt böngésző (nincs sendBeacon, elszállt
+// hálózat, összeomlott gép) sora örökre bennmaradt. Mostantól EZ az egyetlen
+// automatikus takarítás – a webplayer 10 perces offline-alapú kiléptetése
+// megszűnt (ld. fentebb). A tábla korlátlanul nőtt, és minden authJwt-hívás
 // ezen keresztül keresett.
 //
 // A `JWT_ACCESS_TTL` 3650d óta a token maga nem jár le, ezért az elhagyott

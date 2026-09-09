@@ -11,7 +11,10 @@ import { ackCommand } from "./devices.controller";
 
 export const devicesRouter = Router();
 
-// később RBAC-ot teszünk rá, most csak auth + tenant
+// Nincs szerepkör-szűrés: az OPERATOR elrejtése az Eszközök laptól
+// SZÁNDÉKOSAN csak a felületen történik (App.tsx RequireRole + AppShell
+// NAV_ITEMS). A cél az, hogy hozzá nem értő felhasználó véletlenül ne
+// piszkáljon eszközbeállítást – nem biztonsági határ.
 devicesRouter.get("/", authJwt, requireTenant, listDevices);
 devicesRouter.post("/register", authJwt, requireTenant, registerDevice);
 devicesRouter.post("/beacon", deviceAuth, deviceBeacon);

@@ -102,8 +102,32 @@ function userRole(req: Request): string { return (req as any).user?.role as stri
 
 const ORG_ADMIN_ROLES = ["ORG_ADMIN", "TENANT_ADMIN", "SUPER_ADMIN"];
 
+// Az ÜZENETKÜLDÉSHEZ szükséges végpontok szerepkör-listája.
+//
+// Az OPERATOR ("Közreműködő") az Üzenetek lapot használja, és ott MINDEN
+// funkciónak működnie kell nála – beleértve a "következő szünetre" időzítést
+// és az üzenet előtti intro hang választását. Mindkettő a csengetés-modul
+// végpontjaiból táplálkozik:
+//   • GET /bells/templates    → ebből számolja a frontend a köv. szünet
+//                               időpontját (getNextBreakTime)
+//   • GET/POST/DELETE /bells/intro-sounds → az üzenetszerkesztő intro-hang
+//                               blokkja
+//
+// A csengetési rend SZERKESZTÉSE (sablonok írása, naptár, csengőhangok,
+// szerkesztési zár) továbbra is `canEdit` – oda az OPERATOR nem fér be, és
+// az Eszközök laphoz hasonlóan a Csengetés lapot sem látja.
+const MESSAGING_ROLES = [...ORG_ADMIN_ROLES, "OPERATOR"];
+
 function canEdit(req: Request, res: Response, next: NextFunction) {
   if (!ORG_ADMIN_ROLES.includes(userRole(req))) {
+    return res.status(403).json({ error: "Insufficient permissions" });
+  }
+  next();
+}
+
+/** Az üzenetküldéshez kellő végpontok kapuja – az OPERATOR-t is beengedi. */
+function canUseMessaging(req: Request, res: Response, next: NextFunction) {
+  if (!MESSAGING_ROLES.includes(userRole(req))) {
     return res.status(403).json({ error: "Insufficient permissions" });
   }
   next();
@@ -210,7 +234,7 @@ function notifyAllClients(tenantId: string): void {
 
 // ── Sablonok ───────────────────────────────────────────────────────────────
 
-bellsRouter.get("/templates", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
+bellsRouter.get("/templates", authJwt, requireTenant, canUseMessaging, async (req: Request, res: Response) => {
   const templates = await prisma.bellScheduleTemplate.findMany({
     where: { tenantId: tid(req) },
     include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
@@ -511,7 +535,7 @@ const introUpload = multer({
   },
 });
 
-bellsRouter.get("/intro-sounds", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
+bellsRouter.get("/intro-sounds", authJwt, requireTenant, canUseMessaging, async (req: Request, res: Response) => {
   const sounds = await prisma.bellSoundFile.findMany({
     where:   { tenantId: tid(req), kind: "MESSAGE_INTRO" },
     orderBy: [{ createdAt: "asc" }],
@@ -519,7 +543,7 @@ bellsRouter.get("/intro-sounds", authJwt, requireTenant, canEdit, async (req: Re
   res.json({ ok: true, sounds });
 });
 
-bellsRouter.post("/intro-sounds", authJwt, requireTenant, canEdit, introUpload.single("file"), async (req: Request, res: Response) => {
+bellsRouter.post("/intro-sounds", authJwt, requireTenant, canUseMessaging, introUpload.single("file"), async (req: Request, res: Response) => {
   const file = (req as any).file as Express.Multer.File | undefined;
   if (!file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -550,7 +574,7 @@ bellsRouter.post("/intro-sounds", authJwt, requireTenant, canEdit, introUpload.s
   res.status(201).json({ ok: true, sound });
 });
 
-bellsRouter.delete("/intro-sounds/:id", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
+bellsRouter.delete("/intro-sounds/:id", authJwt, requireTenant, canUseMessaging, async (req: Request, res: Response) => {
   const soundId = req.params.id as string;
   const sound   = await prisma.bellSoundFile.findFirst({
     where: { id: soundId, tenantId: tid(req), kind: "MESSAGE_INTRO" },
