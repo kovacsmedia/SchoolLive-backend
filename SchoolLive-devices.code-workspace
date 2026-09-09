@@ -1,25 +1,22 @@
 {
 	"folders": [
 		{
-			"path": "../../../Dokumentumok/SchoolLive-devices"
-		},
-		{
 			"path": "."
 		},
 		{
 			"path": "../SchoolLive-frontend"
 		},
 		{
-			"name": "SchoolLive-windows",
-			"path": "../SchoolLive-windows/SchoolLive-windows"
+			"path": "../SchoolLive-devices"
 		},
 		{
-			"name": "SchoolLive-linux",
-			"path": "../SchoolLive-linux/SchoolLive-linux"
+			"path": "../SchoolLive-multidevices"
 		},
 		{
-			"name": "SchoolLive-android",
-			"path": "../SchoolLive-android/SchoolLive-android"
+			"path": "../SchoolLive-linux"
+		},
+		{
+			"path": "../SchoolLive-windows"
 		}
 	],
 	"settings": {}

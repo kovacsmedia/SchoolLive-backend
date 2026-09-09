@@ -7,7 +7,9 @@ const { WebSocketServer } = WS;
 import { app }                  from "./app";
 import { env }                  from "./config/env";
 import { startBellsScheduler }  from "./modules/bells/bell.scheduler";
+import { ensureDefaultBellSounds } from "./modules/bells/bell-sound-paths";
 import { startRadioScheduler }  from "./modules/radio/radio.scheduler";
+import { startMessageScheduler } from "./modules/messages/message.scheduler";
 import { startDeviceLifecycleScheduler } from "./modules/devices/device.lifecycle";
 import { startClusterHeartbeat } from "./modules/cluster/cluster.heartbeat";
 import { startLeaderElection, releaseLeadershipIfHeld } from "./modules/cluster/cluster.leader";
@@ -56,9 +58,17 @@ server.on("upgrade", (req, socket, head) => {
   }
 });
 
+// ── Default csengetőhangok ────────────────────────────────────────────────────
+// Az `audio/` ki van zárva az rsyncből (felhasználói tartalom), ezért egy
+// frissen telepített node-on üres lenne. A repóval szállított `assets/bells/`-ből
+// bemásoljuk a hiányzó defaultokat, hogy a node az ELSŐ perctől csengetőképes
+// legyen. Idempotens: meglévő fájlt nem ír felül.
+ensureDefaultBellSounds();
+
 // ── Schedulers ────────────────────────────────────────────────────────────────
 startBellsScheduler();
 startRadioScheduler();
+startMessageScheduler();
 startDeviceLifecycleScheduler();
 
 // ── Cluster (multi-node) ─────────────────────────────────────────────────────

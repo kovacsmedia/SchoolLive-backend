@@ -4,7 +4,6 @@ const { WebSocketServer } = WS;
 type WebSocket = WS;
 import type { IncomingMessage }        from "http";
 import jwt                             from "jsonwebtoken";
-import bcrypt                          from "bcrypt";
 import { env }                         from "../config/env";
 
 export type SyncAction = "BELL" | "TTS" | "PLAY_URL" | "STOP_PLAYBACK" | "SYNC_BELLS" | "OTA_UPDATE"
@@ -139,17 +138,11 @@ class SyncEngineClass {
 
     if (deviceKey && !token) {
       try {
-        const { prisma } = await import("../prisma/client");
-        const devices = await prisma.device.findMany({
-          where:  { deviceKeyHash: { not: null } },
-          select: { id: true, tenantId: true, deviceKeyHash: true },
-        });
-        let matched: { id: string; tenantId: string } | null = null;
-        for (const d of devices) {
-          if (!d.deviceKeyHash) continue;
-          const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
-          if (ok) { matched = d; break; }
-        }
+        // Indexelt feloldás. Korábban ez a lekérdezés MINDEN eszközt behúzott,
+        // és soronként bcrypt.compare-t futtatott – egy backend-újraindítás
+        // utáni tömeges ESP32-újracsatlakozásnál ez percekig 100% CPU volt.
+        const { findDeviceByKey } = await import("../modules/devices/device-key");
+        const matched = await findDeviceByKey(deviceKey);
         if (!matched) { ws.close(4004, "Invalid device key"); return; }
         deviceId = matched.id; tenantId = matched.tenantId; clientType = "esp32";
         console.log(`[SyncEngine] ESP32 auth OK: ${deviceId} tenant=${tenantId}`);
@@ -287,6 +280,13 @@ class SyncEngineClass {
       serverNow:      new Date(nowMs).toISOString(),
       serverNowMs:    nowMs,
       deviceId,
+      // Multi-node: a kliensnek szüksége van a saját tenantId-jára, hogy a
+      // `GET /cluster/locate?tenantId=…` fallbackot használni tudja, ha a
+      // NODE_REASSIGNED push NEM érkezett meg (mert a régi node hirtelen
+      // meghalt). A böngésző ezt a JWT-ből is kiolvassa, a deviceKey-jel
+      // hitelesített kliensek (ESP32 / Android / Python) viszont eddig sehol
+      // nem kapták meg. Saját tenant-azonosító, nem érzékeny adat.
+      tenantId,
       // snapDeviceId: a Device.id, amit a webplayer a snap-HELLO ID mezőjéhez
       // használ. ESP32-nél azonos a deviceId-vel; browser-nél a clientId
       // (localStorage UUID) helyett a tényleges Device.id, amit a snapserver
@@ -346,12 +346,18 @@ class SyncEngineClass {
 
     const unmutedSet = new Set(targetDeviceIds && targetDeviceIds.length > 0
       ? targetDeviceIds
-      : allOnline.map(c => c.deviceId));   // ha nincs szűkítés → mindenki
+      : allOnline.map(c => c.dbDeviceId));   // ha nincs szűkítés → mindenki
 
     // ACK-ot csak az unmutált (célzott) klienesektől várunk – a többi nem
     // is csinál semmit, tőlük nem kell ack.
+    //
+    // A `targetDeviceIds` valódi Device.id-kat tartalmaz, ezért a kliens
+    // `dbDeviceId`-jével kell egyeztetni (böngészőnél a `deviceId` a
+    // localStorage clientId, ami sosem egyezne) – korábban emiatt a
+    // webplayertől SOHA nem vártunk ACK-ot, és a sync-profiljába sem
+    // került minta.
     const expected = allOnline
-      .filter(c => unmutedSet.has(c.deviceId))
+      .filter(c => unmutedSet.has(c.dbDeviceId) || unmutedSet.has(c.deviceId))
       .map(c => c.deviceId);
 
     const leadMs   = this.computeLeadTime(expected.length > 0 ? expected : allOnline.map(c => c.deviceId));
@@ -499,9 +505,18 @@ class SyncEngineClass {
       if (client.tenantId !== tenantId) continue;
       if (client.ws.readyState !== 1) continue;
       if (deviceIds) {
-        // Közvetlen egyezés VAGY zóna ID-ként a master ez az eszköz
-        const directMatch = deviceIds.includes(client.deviceId);
-        const zoneMatch   = deviceIds.some(id => this.zoneToMaster.get(id) === client.deviceId);
+        // A hívók MINDIG valódi Device.id-kat adnak át (DB-ből). Ez ESP32/natív
+        // kliensnél megegyezik a WS regisztrációs kulccsal, BÖNGÉSZŐNÉL VISZONT
+        // NEM: ott a `deviceId` a kliens localStorage clientId-ja, a valódi
+        // Device.id a `dbDeviceId`. Emiatt a célzott üzenetek (SET_SYNC_OFFSET,
+        // SET_CHANNEL_MODE, per-eszköz COMMAND push) SOHA nem értek el a
+        // webplayerhez – a szinkron-csúszka némán nem csinált semmit.
+        // Az `isDeviceOnline()` már helyesen nézte mindkettőt, ez a szűrő nem.
+        const directMatch = deviceIds.includes(client.deviceId)
+                         || deviceIds.includes(client.dbDeviceId);
+        const zoneMatch   = deviceIds.some(id =>
+          this.zoneToMaster.get(id) === client.deviceId ||
+          this.zoneToMaster.get(id) === client.dbDeviceId);
         if (!directMatch && !zoneMatch) continue;
       }
       if (!seen.has(client.deviceId)) {

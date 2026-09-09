@@ -11,6 +11,7 @@ import { Router, Request, Response } from "express";
 import { prisma }                    from "../../prisma/client";
 import { randomBytes }               from "crypto";
 import { env }                       from "../../config/env";
+import { findDeviceByKey } from "./device-key";
 
 const router = Router();
 
@@ -114,33 +115,17 @@ router.get("/info", async (req: Request, res: Response) => {
     const deviceKey = req.headers["x-device-key"] as string;
     if (!deviceKey) return res.status(400).json({ error: "x-device-key required" });
 
-    const bcrypt  = await import("bcrypt");
-    const devices = await prisma.device.findMany({
-      where:  { deviceKeyHash: { not: null }, authType: "KEY" },
-      select: {
-        id:            true,
-        deviceKeyHash: true,
-        tenantId:      true,
-        tenant: { select: { name: true } },
-      },
-    });
+    // Indexelt feloldás (ld. device-key.ts) – korábban itt is végigfutott az
+    // ÖSSZES eszközön egy-egy bcrypt.compare.
+    const matched = await findDeviceByKey(deviceKey, true);
+    if (!matched) return res.status(401).json({ error: "Invalid device key" });
 
-    let matchedId:   string | null = null;
-    let tenantId:    string | null = null;
-    let tenantName:  string | null = null;
-
-    for (const d of devices) {
-      if (!d.deviceKeyHash) continue;
-      const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
-      if (ok) {
-        matchedId  = d.id;
-        tenantId   = d.tenantId ?? null;
-        tenantName = d.tenant?.name ?? null;
-        break;
-      }
-    }
-
-    if (!matchedId) return res.status(401).json({ error: "Invalid device key" });
+    const matchedId = matched.id;
+    const tenantId  = matched.tenantId ?? null;
+    const tenantRow = tenantId
+      ? await prisma.tenant.findUnique({ where: { id: tenantId }, select: { name: true } })
+      : null;
+    const tenantName = tenantRow?.name ?? null;
 
     // deviceId + tenantId a válaszban – a kliens (Windows/Linux/Android)
     // ezt cache-eli, hogy a multi-node cluster discovery-hez
@@ -160,20 +145,9 @@ router.post("/beacon", async (req: Request, res: Response) => {
     const deviceKey = req.headers["x-device-key"] as string;
     if (!deviceKey) return res.status(400).json({ error: "x-device-key header required" });
 
-    const bcrypt  = await import("bcrypt");
-    const devices = await prisma.device.findMany({
-      where:  { deviceKeyHash: { not: null }, authType: "KEY" },
-      select: { id: true, deviceKeyHash: true },
-    });
-
-    let deviceId: string | null = null;
-    for (const d of devices) {
-      if (!d.deviceKeyHash) continue;
-      const ok = await bcrypt.compare(deviceKey, d.deviceKeyHash);
-      if (ok) { deviceId = d.id; break; }
-    }
-
-    if (!deviceId) return res.status(401).json({ error: "Invalid device key" });
+    const matchedBeacon = await findDeviceByKey(deviceKey, true);
+    if (!matchedBeacon) return res.status(401).json({ error: "Invalid device key" });
+    const deviceId = matchedBeacon.id;
 
     const ipAddress = (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim()
       ?? req.socket.remoteAddress ?? null;
@@ -222,21 +196,9 @@ router.get("/snap-port", async (req: Request, res: Response) => {
     const deviceKey = req.headers["x-device-key"] as string;
     if (!deviceKey) return res.status(400).json({ error: "x-device-key kötelező" });
 
-    const bcrypt  = await import("bcrypt");
-    const devices = await prisma.device.findMany({
-      where:  { deviceKeyHash: { not: null }, authType: "KEY" },
-      select: { id: true, deviceKeyHash: true, tenantId: true },
-    });
-
-    let tenantId: string | null = null;
-    for (const d of devices) {
-      if (!d.deviceKeyHash) continue;
-      if (await bcrypt.compare(deviceKey, d.deviceKeyHash)) {
-        tenantId = d.tenantId; break;
-      }
-    }
-
-    if (!tenantId) return res.status(401).json({ error: "Ismeretlen eszköz" });
+    const matchedSnap = await findDeviceByKey(deviceKey, true);
+    if (!matchedSnap) return res.status(401).json({ error: "Ismeretlen eszköz" });
+    const tenantId = matchedSnap.tenantId;
 
     const tenant = await prisma.tenant.findUnique({
       where:  { id: tenantId },

@@ -90,8 +90,22 @@ export async function login(email: string, password: string, client: LoginClient
 // már nem kritikus-útvonal – csak defenzív frissítés. A sessionId
 // változatlan marad a payloadban, úgyhogy nem kell semmit frissíteni az
 // adatbázisban.
-export async function refresh(payload: JwtPayload) {
-  const token = signAccessToken(payload);
+export async function refresh(payload: JwtPayload & { iat?: number; exp?: number }) {
+  // FONTOS: a hívó a MÁR DEKÓDOLT tokent adja át (authJwt → req.user), ami a
+  // `jwt.verify` miatt tartalmazza az `iat` és `exp` regisztrált claimeket is.
+  // A jsonwebtoken v9 viszont HIBÁT DOB, ha a payloadban van `exp` ÉS az
+  // options-ben `expiresIn` ("Bad \"options.expiresIn\" option the payload
+  // already has an \"exp\" property") – a `signAccessToken` pedig mindig ad
+  // `expiresIn`-t. Ezért a két időbélyeg-claimet ki KELL hagyni; az újat
+  // úgyis a friss `expiresIn` generálja.
+  //
+  // Enélkül a végpont MINDEN hívásnál eldobott promise-ba futott (Express 4
+  // nem kapja el az async handler rejectjét), a frontend 5 percenkénti
+  // refresh-tickje pedig a hibát logoutként kezeli (AuthContext.tsx) – ez
+  // volt a valódi oka a "csendben kiléptet" tünetnek, amit a JWT_ACCESS_TTL
+  // 3650d-re emelése csak elfedett, de nem szüntetett meg.
+  const { iat: _iat, exp: _exp, ...claims } = payload;
+  const token = signAccessToken(claims);
   return { accessToken: token };
 }
 

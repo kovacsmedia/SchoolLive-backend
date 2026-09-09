@@ -7,9 +7,17 @@ import axios from "axios";
 import { execSync } from "child_process";
 import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
+import { requireTenant } from "../../middleware/tenant";
 import { broadcastSyncBells } from "./bell.scheduler";
 import { stripAccents } from "../../utils/text";
 import { todayInBudapest } from "../../utils/budapest-time";
+import { findDeviceByKey } from "../devices/device-key";
+import {
+  bellSoundTenantDir,
+  bellSoundDiskPath,
+  bellSoundUrlPath,
+  DEFAULT_BELL_SOUNDS,
+} from "./bell-sound-paths";
 
 /** ffprobe alapú hossz-mérés ms-ben. Hiba/elérhetetlenség esetén null. */
 function probeDurationMs(filePath: string): number | null {
@@ -36,7 +44,22 @@ const DEFAULT_SOUNDS = ["jelzocsengo.mp3", "kibecsengo.mp3"];
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, AUDIO_DIR),
+  destination: (req, _file, cb) => {
+    // A requireTenant middleware a route-láncban a multer ELŐTT fut, tehát
+    // req.tenantId itt már be van állítva. Ha valamiért mégsem, a régi,
+    // lapos könyvtárba esünk vissza (működő, csak nem szeparált) – sosem
+    // dobunk el egy feltöltést emiatt.
+    const tenantId = (req as any).tenantId as string | undefined;
+    if (!tenantId) return cb(null, AUDIO_DIR);
+    const dir = bellSoundTenantDir(tenantId);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    } catch (e) {
+      console.error("[BELLS] tenant hang-könyvtár létrehozás hiba:", e);
+      cb(null, AUDIO_DIR);
+    }
+  },
   // Ékezetmentes fájlnév – a downstream eszközöknek (ESP / Python kliens /
   // snapclient) így biztosan nem lesz baja a "csengő.mp3" típusú nevekkel.
   filename: (_req, file, cb) => cb(null, stripAccents(file.originalname)),
@@ -62,10 +85,17 @@ const upload = multer({
   },
 });
 
+// A tenant-kontextust KIZÁRÓLAG a requireTenant middleware állítja be
+// (req.tenantId), ami szerepkör-tudatos: SUPER_ADMIN-nál az x-tenant-id
+// headerből, mindenki másnál a TOKENBŐL veszi.
+//
+// KORÁBBAN ez a függvény minden hívónál elsőbbséget adott az x-tenant-id
+// headernek, a router pedig nem használt requireTenant-et – így egy "A"
+// iskola TENANT_ADMIN-ja pusztán a header átírásával olvashatta ÉS
+// ÍRHATTA a "B" iskola csengetési rendjét, sablonjait és hangfájljait.
+// (Mellékhatásként a multi-node ownership-ellenőrzés is kimaradt.)
 function tid(req: Request): string {
-  const fromHeader = req.headers["x-tenant-id"] as string;
-  if (fromHeader) return fromHeader;
-  return (req as any).user?.tenantId as string;
+  return (req as any).tenantId as string;
 }
 function uid(req: Request): string { return (req as any).user?.sub as string; }
 function userRole(req: Request): string { return (req as any).user?.role as string; }
@@ -87,15 +117,9 @@ function makeVersion(scope: string, bells: any[]): string {
 async function authenticateDevice(req: Request): Promise<any | null> {
   const deviceKey = req.headers["x-device-key"] as string;
   if (!deviceKey) return null;
-
-  const bcrypt = await import("bcrypt");
-  const devices = await prisma.device.findMany({ where: { authType: "KEY" } });
-  for (const d of devices) {
-    if (d.deviceKeyHash && await bcrypt.compare(deviceKey, d.deviceKeyHash)) {
-      return d;
-    }
-  }
-  return null;
+  // Indexelt feloldás (ld. device-key.ts) – korábban minden KEY-auth eszközre
+  // lefutott egy bcrypt.compare, ráadásul a TELJES sorokat behúzva.
+  return await findDeviceByKey(deviceKey, true);
 }
 
 // Tanév: szeptember 1 – július 1. Ha a mai budapesti dátum >= augusztus,
@@ -186,7 +210,7 @@ function notifyAllClients(tenantId: string): void {
 
 // ── Sablonok ───────────────────────────────────────────────────────────────
 
-bellsRouter.get("/templates", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.get("/templates", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const templates = await prisma.bellScheduleTemplate.findMany({
     where: { tenantId: tid(req) },
     include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
@@ -195,7 +219,7 @@ bellsRouter.get("/templates", authJwt, canEdit, async (req: Request, res: Respon
   res.json({ ok: true, templates });
 });
 
-bellsRouter.post("/templates", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.post("/templates", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const { name, bells } = req.body;
   if (!name || !Array.isArray(bells)) {
     return res.status(400).json({ error: "name and bells required" });
@@ -226,7 +250,7 @@ bellsRouter.post("/templates", authJwt, canEdit, async (req: Request, res: Respo
   res.status(201).json({ ok: true, template });
 });
 
-bellsRouter.put("/templates/:id", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.put("/templates/:id", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const templateId = req.params.id as string;
   const { name, bells } = req.body;
   const template = await prisma.bellScheduleTemplate.findFirst({
@@ -257,7 +281,7 @@ bellsRouter.put("/templates/:id", authJwt, canEdit, async (req: Request, res: Re
   res.json({ ok: true, template: updated });
 });
 
-bellsRouter.delete("/templates/:id", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.delete("/templates/:id", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const templateId = req.params.id as string;
   const template = await prisma.bellScheduleTemplate.findFirst({
     where: { id: templateId, tenantId: tid(req) },
@@ -272,7 +296,7 @@ bellsRouter.delete("/templates/:id", authJwt, canEdit, async (req: Request, res:
   res.json({ ok: true });
 });
 
-bellsRouter.put("/templates/:id/set-default", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.put("/templates/:id/set-default", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const templateId = req.params.id as string;
 
   const template = await prisma.bellScheduleTemplate.findFirst({
@@ -303,7 +327,7 @@ bellsRouter.put("/templates/:id/set-default", authJwt, canEdit, async (req: Requ
 
 // ── Naptár ─────────────────────────────────────────────────────────────────
 
-bellsRouter.get("/calendar", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.get("/calendar", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const year = parseInt(req.query.year as string) || new Date().getFullYear();
   const from = new Date(`${year}-01-01`);
   const to   = new Date(`${year}-12-31`);
@@ -316,7 +340,7 @@ bellsRouter.get("/calendar", authJwt, canEdit, async (req: Request, res: Respons
   res.json({ ok: true, days });
 });
 
-bellsRouter.post("/calendar/init", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.post("/calendar/init", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const year = parseInt(req.body.year) || new Date().getFullYear();
   try {
     // CSAK a tényleges munkaszüneti napokat töltjük be (kb. 13 nap):
@@ -352,7 +376,7 @@ bellsRouter.post("/calendar/init", authJwt, canEdit, async (req: Request, res: R
   }
 });
 
-bellsRouter.put("/calendar/:date", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.put("/calendar/:date", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const { isHoliday, templateId, note } = req.body;
   const dateStr = req.params.date as string;
   const date    = new Date(dateStr);
@@ -389,7 +413,7 @@ bellsRouter.put("/calendar/:date", authJwt, canEdit, async (req: Request, res: R
 
 // ── Hangfájlok ────────────────────────────────────────────────────────────
 
-bellsRouter.get("/sounds", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.get("/sounds", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const sounds = await prisma.bellSoundFile.findMany({
     where: { tenantId: tid(req) },
     orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
@@ -397,7 +421,7 @@ bellsRouter.get("/sounds", authJwt, canEdit, async (req: Request, res: Response)
   res.json({ ok: true, sounds });
 });
 
-bellsRouter.post("/sounds", authJwt, canEdit, upload.single("file"), async (req: Request, res: Response) => {
+bellsRouter.post("/sounds", authJwt, requireTenant, canEdit, upload.single("file"), async (req: Request, res: Response) => {
   const file = (req as any).file as Express.Multer.File | undefined;
   if (!file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -431,7 +455,7 @@ bellsRouter.post("/sounds", authJwt, canEdit, upload.single("file"), async (req:
   res.status(201).json({ ok: true, sound });
 });
 
-bellsRouter.delete("/sounds/:id", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.delete("/sounds/:id", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const soundId = req.params.id as string;
   const sound   = await prisma.bellSoundFile.findFirst({
     where: { id: soundId, tenantId: tid(req) },
@@ -439,8 +463,18 @@ bellsRouter.delete("/sounds/:id", authJwt, canEdit, async (req: Request, res: Re
   if (!sound) return res.status(404).json({ error: "Not found" });
   if (sound.isDefault) return res.status(403).json({ error: "Cannot delete default sound" });
 
-  const filePath = path.join(AUDIO_DIR, sound.filename);
-  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  // A feloldón keresztül: a tenant saját könyvtárában lévő fájlt törli, és
+  // csak akkor nyúl a régi, lapos elrendezésű fájlhoz, ha ennek a tenantnak
+  // ott van a hangja. Korábban vakon `AUDIO_DIR/<filename>`-t törölt, ami
+  // névütközésnél EGY MÁSIK ISKOLA hangfájlját vitte el.
+  // FONTOS: a feloldó mostantól default hangra esik vissza, ha a kért fájl
+  // nincs meg – törlésnél tehát a `isFallback` ágat KI KELL zárni, különben
+  // egy hiányzó feltöltés törlése a KÖZÖS default hangot vinné el.
+  const resolvedForDelete = bellSoundDiskPath(tid(req), sound.filename);
+  if (resolvedForDelete && !resolvedForDelete.isFallback) {
+    try { fs.unlinkSync(resolvedForDelete.path); }
+    catch (e) { console.error(`[BELLS] hangfájl törlés hiba (${resolvedForDelete.path}):`, e); }
+  }
 
   await prisma.bellSoundFile.delete({ where: { id: sound.id } });
 
@@ -477,7 +511,7 @@ const introUpload = multer({
   },
 });
 
-bellsRouter.get("/intro-sounds", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.get("/intro-sounds", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const sounds = await prisma.bellSoundFile.findMany({
     where:   { tenantId: tid(req), kind: "MESSAGE_INTRO" },
     orderBy: [{ createdAt: "asc" }],
@@ -485,7 +519,7 @@ bellsRouter.get("/intro-sounds", authJwt, canEdit, async (req: Request, res: Res
   res.json({ ok: true, sounds });
 });
 
-bellsRouter.post("/intro-sounds", authJwt, canEdit, introUpload.single("file"), async (req: Request, res: Response) => {
+bellsRouter.post("/intro-sounds", authJwt, requireTenant, canEdit, introUpload.single("file"), async (req: Request, res: Response) => {
   const file = (req as any).file as Express.Multer.File | undefined;
   if (!file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -516,7 +550,7 @@ bellsRouter.post("/intro-sounds", authJwt, canEdit, introUpload.single("file"), 
   res.status(201).json({ ok: true, sound });
 });
 
-bellsRouter.delete("/intro-sounds/:id", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.delete("/intro-sounds/:id", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const soundId = req.params.id as string;
   const sound   = await prisma.bellSoundFile.findFirst({
     where: { id: soundId, tenantId: tid(req), kind: "MESSAGE_INTRO" },
@@ -548,7 +582,7 @@ export async function resolveIntroSoundPath(tenantId: string, soundId: string): 
 
 // ── Szerkesztési zár ───────────────────────────────────────────────────────
 
-bellsRouter.post("/lock", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.post("/lock", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   const existing = await prisma.bellScheduleLock.findUnique({ where: { tenantId: tid(req) } });
   if (existing && existing.userId !== uid(req)) {
     const age = Date.now() - existing.lockedAt.getTime();
@@ -565,7 +599,7 @@ bellsRouter.post("/lock", authJwt, canEdit, async (req: Request, res: Response) 
   res.json({ ok: true, lock });
 });
 
-bellsRouter.delete("/lock", authJwt, canEdit, async (req: Request, res: Response) => {
+bellsRouter.delete("/lock", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   await prisma.bellScheduleLock.deleteMany({
     where: { tenantId: tid(req), userId: uid(req) },
   });
@@ -585,19 +619,34 @@ bellsRouter.get("/version", async (req: Request, res: Response) => {
   res.json({ ok: true, todayVersion, defaultVersion, isHoliday });
 });
 
-// ── /today – JWT-vel is elérhető (VirtualPlayer) ──────────────────────────
+// ── /today – kétféle hívó, kétféle hitelesítés ────────────────────────────
+//
+// Eszköz (ESP32 / natív kliens): `x-device-key` header → a tenant a Device
+//   rekordból jön.
+// Böngésző (VirtualPlayer / admin): JWT → authJwt + requireTenant, a tenant
+//   a tokenből (SUPER_ADMIN-nál az x-tenant-id headerből).
+//
+// KORÁBBAN ez a route hitelesítés NÉLKÜL kiszolgált bárkit, aki küldött egy
+// `x-tenant-id` headert (a régi `tid()` vakon elhitte), az app.ts-ben lévő,
+// helyesen védett `/bells/today` pedig SOSEM futott le, mert az
+// `app.use("/bells", bellsRouter)` előbb van regisztrálva, mint az.
 
-bellsRouter.get("/today", async (req: Request, res: Response) => {
-  let tenantId = tid(req);
-  if (!tenantId) {
-    const device = await authenticateDevice(req);
-    if (!device) return res.status(401).json({ error: "Unauthorized" });
-    tenantId = device.tenantId;
-  }
-  if (!tenantId) return res.status(400).json({ error: "Tenant required" });
-
+async function sendTodayBells(res: Response, tenantId: string) {
   const today = todayInBudapest();
   const { bells, isHoliday } = await resolveTodayBells(tenantId, today);
+
+  // A hangfájlok TÉNYLEGES URL-je fájlnevenként. A tenant-szeparált tárolás
+  // (audio/bells/<tenantId>/…) óta a kliens NEM tudja magától összerakni az
+  // utat – a szerver tudja, melyik fájl van a tenant könyvtárában és melyik
+  // maradt a régi, lapos helyen. Additív mező: aki nem ismeri, figyelmen
+  // kívül hagyja. (A /bells/sync `sounds[]` tömbje ugyanezt adja az
+  // eszköz-kulccsal hitelesített klienseknek.)
+  const soundUrls: Record<string, string> = {};
+  for (const b of bells as any[]) {
+    if (b.soundFile && !soundUrls[b.soundFile]) {
+      soundUrls[b.soundFile] = bellSoundUrlPath(tenantId, b.soundFile);
+    }
+  }
 
   return res.json({
     ok: true,
@@ -608,7 +657,31 @@ bellsRouter.get("/today", async (req: Request, res: Response) => {
       type:      b.type,
       soundFile: b.soundFile,
     })),
+    soundUrls,
   });
+}
+
+// Első lépcső: ha van device-kulcs, azzal hitelesítünk és válaszolunk.
+// Ha nincs, `next()` – a kérés a JWT-ágra (authJwt + requireTenant) esik.
+async function todayViaDeviceKey(req: Request, res: Response, next: NextFunction) {
+  if (!req.headers["x-device-key"]) return next();
+  try {
+    const device = await authenticateDevice(req);
+    if (!device) return res.status(401).json({ error: "Invalid device key" });
+    return await sendTodayBells(res, device.tenantId);
+  } catch (err) {
+    console.error("[BELLS/today] device-ág hiba:", err);
+    return res.status(500).json({ error: "Failed to fetch today bells" });
+  }
+}
+
+bellsRouter.get("/today", todayViaDeviceKey, authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    return await sendTodayBells(res, tid(req));
+  } catch (err) {
+    console.error("[BELLS/today] JWT-ág hiba:", err);
+    return res.status(500).json({ error: "Failed to fetch today bells" });
+  }
 });
 
 // ── Teljes tanévnyi naptár (szept 1 – júl 1) – minden sablon + minden
@@ -626,7 +699,7 @@ async function buildFullYearCalendar(tenantId: string): Promise<{
 }> {
   const { start, end } = schoolYearRange(todayInBudapest());
 
-  const [templates, calendarDays, sounds] = await Promise.all([
+  const [templates, calendarDays] = await Promise.all([
     prisma.bellScheduleTemplate.findMany({
       where:   { tenantId },
       include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
@@ -635,7 +708,6 @@ async function buildFullYearCalendar(tenantId: string): Promise<{
       where:   { tenantId, date: { gte: start, lt: end } },
       orderBy: { date: "asc" },
     }),
-    prisma.bellSoundFile.findMany({ where: { tenantId, kind: "SCHEDULE" } }),
   ]);
 
   const templatesOut = templates.map((t: any) => ({
@@ -648,11 +720,13 @@ async function buildFullYearCalendar(tenantId: string): Promise<{
     isHoliday:  d.isHoliday,
     templateId: d.templateId,
   }));
-  const soundsOut = sounds.map((s: any) => ({
-    filename:  s.filename,
-    url:       `/audio/bells/${s.filename}`,
-    sizeBytes: s.sizeBytes,
-  }));
+  // Ugyanaz a garantált lista, mint a /bells/sync `sounds` mezőjében – így a
+  // `fullYearVersion` is változik, ha egy default hang bekerül/frissül, tehát
+  // az eszközök újraszinkronizálnak.
+  const soundsOut = await buildSoundsList(
+    tenantId,
+    templatesOut.flatMap((t: any) => t.bells.map((b: any) => b.soundFile)).filter(Boolean),
+  );
 
   const fullYearVersion = crypto.createHash("md5")
     .update(JSON.stringify({ templatesOut, calendarOut, soundsOut }))
@@ -678,10 +752,6 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
   const { bells, defaultBells, isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(device.tenantId, today);
 
-  const sounds = await prisma.bellSoundFile.findMany({
-    where: { tenantId: device.tenantId, kind: "SCHEDULE" },
-  });
-
   const fullYear = await buildFullYearCalendar(device.tenantId);
 
   res.json({
@@ -701,11 +771,14 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
       type:      b.type,
       soundFile: b.soundFile,
     })),
-    sounds: sounds.map((s: any) => ({
-      filename:  s.filename,
-      url:       `/audio/bells/${s.filename}`,
-      sizeBytes: s.sizeBytes,
-    })),
+    // A default hangokat és minden ténylegesen hivatkozott fájlnevet MINDIG
+    // tartalmaz – az eszköz ebből takarít, ld. buildSoundsList().
+    sounds: await buildSoundsList(device.tenantId, [
+      ...bells.map((b: any) => b.soundFile),
+      ...defaultBells.map((b: any) => b.soundFile),
+      ...((fullYear.templates as any[]) ?? []).flatMap((t: any) =>
+        (t?.bells ?? []).map((b: any) => b.soundFile)),
+    ].filter(Boolean)),
     updatedAt: new Date().toISOString(),
     // Új, additív mezők: a teljes tanévnyi naptár. A régi kliensek ezeket
     // egyszerűen figyelmen kívül hagyják (bells/defaultBells/sounds
@@ -720,16 +793,76 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
 
 // ── Shared helper – SyncEngine is hívja WS SCHEDULE_SYNC push-hoz ─────────────
 
+// ── Hanglista összeállítása a klienseknek ──────────────────────────────────
+//
+// KRITIKUS: az eszközök (ESP32 BellManager) ebből a listából takarítanak – a
+// LittleFS-ről TÖRLIK azt az .mp3-at, ami itt nem szerepel. Ha tehát a lista
+// hiányos, az eszköz kidobja a saját (gyári vagy korábban letöltött) hangját,
+// és a rá hivatkozó csengetés NÉMÁN elmarad.
+//
+// Ezért a lista MINDIG tartalmazza:
+//   1. a tenant saját feltöltött hangjait (BellSoundFile),
+//   2. a default hangokat (jelzocsengo/kibecsengo) – ezek a firmware LittleFS
+//      képében is benne vannak, és minden `soundFile` nélküli bejegyzés
+//      ezekre hivatkozik,
+//   3. minden olyan fájlnevet, amire a csengetési rend TÉNYLEGESEN hivatkozik,
+//      akkor is, ha a hozzá tartozó DB-rekord időközben törlődött.
+async function buildSoundsList(
+  tenantId: string,
+  referencedFilenames: string[] = [],
+): Promise<Array<{ filename: string; url: string; sizeBytes: number }>> {
+  const rows = await prisma.bellSoundFile.findMany({
+    where: { tenantId, kind: "SCHEDULE" },
+  });
+
+  const out = new Map<string, { filename: string; url: string; sizeBytes: number }>();
+
+  const add = (filename: string, sizeBytes?: number) => {
+    if (!filename || out.has(filename)) return;
+    const resolved = bellSoundDiskPath(tenantId, filename);
+    // Csak a TÉNYLEGESEN létező fájl kerülhet a listába. A default-fallback
+    // (`isFallback`) itt NEM jó: az URL a hiányzó fájlra mutatna, amit az
+    // eszköz 404-re futva újra és újra próbálna letölteni. A hiányzó hangot
+    // a kliens a SAJÁT gyári defaultjával pótolja (ld. BellManager
+    // resolveLocalSound), a szerver pedig a snap-ágon szintén defaulttal
+    // csenget – csend egyik esetben sem lesz.
+    if (!resolved || resolved.isFallback) return;
+    let size = sizeBytes ?? 0;
+    if (!size) {
+      try { size = fs.statSync(resolved.path).size; } catch { size = 0; }
+    }
+    out.set(filename, {
+      filename,
+      url: bellSoundUrlPath(tenantId, filename),
+      sizeBytes: size,
+    });
+  };
+
+  for (const r of rows as any[]) add(r.filename, r.sizeBytes);
+  for (const name of DEFAULT_BELL_SOUNDS) add(name);
+  for (const name of referencedFilenames) add(name);
+
+  return [...out.values()];
+}
+
 export async function buildScheduleSyncPayload(tenantId: string): Promise<object> {
   const today = todayInBudapest();
   const { bells, defaultBells, isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(tenantId, today);
 
-  const sounds = await prisma.bellSoundFile.findMany({
-    where: { tenantId, kind: "SCHEDULE" },
-  });
-
   const fullYear = await buildFullYearCalendar(tenantId);
+
+  // A ténylegesen hivatkozott fájlnevek: a mai + a default menetrendből ÉS a
+  // teljes tanévnyi sablonokból, hogy egy jövőbeli nap hangja se hiányozzon.
+  const referenced = new Set<string>();
+  for (const b of [...(bells as any[]), ...(defaultBells as any[])]) {
+    if (b?.soundFile) referenced.add(b.soundFile);
+  }
+  for (const t of (fullYear.templates as any[] ?? [])) {
+    for (const b of (t?.bells ?? [])) if (b?.soundFile) referenced.add(b.soundFile);
+  }
+
+  const sounds = await buildSoundsList(tenantId, [...referenced]);
 
   return {
     type:           "SCHEDULE_SYNC",
@@ -738,7 +871,7 @@ export async function buildScheduleSyncPayload(tenantId: string): Promise<object
     defaultVersion,
     bells:          bells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
     defaultBells:   defaultBells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
-    sounds:         sounds.map((s: any) => ({ filename: s.filename, url: `/audio/bells/${s.filename}`, sizeBytes: s.sizeBytes })),
+    sounds,
     updatedAt:      new Date().toISOString(),
     // Additív mezők – teljes tanévnyi naptár (ld. buildFullYearCalendar).
     schoolYear:        fullYear.schoolYear,

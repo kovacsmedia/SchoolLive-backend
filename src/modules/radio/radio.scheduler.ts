@@ -9,6 +9,7 @@
 import { prisma }          from "../../prisma/client";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
+import { isOwnedByThisNode } from "../cluster/tenant-ownership";
 
 const TICK_INTERVAL_MS   = 10_000;   // 10s tick (pontosabb időzítéshez)
 const LOOKAHEAD_MS       = 15_000;   // 15s előre néz (elég a felkészüléshez)
@@ -45,6 +46,15 @@ async function tick() {
     for (const schedule of due) {
       // Már folyamatban van? (előző tick már beütemezte)
       if (_pendingTimeouts.has(schedule.id)) continue;
+
+      // Multi-node: csak a saját node-hoz rendelt tenantok ütemezéseit
+      // dolgozzuk fel. Enélkül MINDEN node lefuttatta ezt: a snap-lejátszást
+      // ugyan megfogta a SnapcastService ownership-kapuja, de a lenti
+      // offline-ág `deviceCommand.createMany`-je nem (a nem-tulajdonos
+      // node-on minden eszköz offline-nak látszik) – duplikált QUEUED
+      // parancsok minden eszközre –, és a `status: DISPATCHED` írásán is
+      // versenyeztek a node-ok.
+      if (!isOwnedByThisNode(schedule.tenantId)) continue;
 
       try {
         await scheduleDispatch(schedule);
@@ -167,9 +177,11 @@ async function scheduleDispatch(schedule: {
       console.warn(`[RADIO-SCHEDULER] ⚠️ Snapserver offline: ${schedule.tenantId}`);
     }
 
-    // Státusz frissítés
-    await prisma.radioSchedule.update({
-      where: { id: schedule.id },
+    // Státusz frissítés – feltételes (csak PENDING-ről), hogy egy esetleges
+    // dupla belépés (pl. ownership-váltás közben) ne írja felül egy másik
+    // node már lezárt dispatchét.
+    await prisma.radioSchedule.updateMany({
+      where: { id: schedule.id, status: "PENDING" },
       data:  { status: "DISPATCHED", dispatchedAt: new Date() },
     });
 

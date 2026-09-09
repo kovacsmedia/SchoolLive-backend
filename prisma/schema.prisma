@@ -228,6 +228,15 @@ model Device {
   authType      DeviceAuthType @default(KEY)
   deviceKeyHash String?
 
+  // Az eszközkulcs SHA-256 lenyomata – KIZÁRÓLAG indexelt kereséshez.
+  // A hitelesítés továbbra is a `deviceKeyHash` bcrypt-ellenőrzése; ez a mező
+  // csak kiválasztja az egyetlen szóba jövő sort, hogy ne kelljen minden
+  // eszközre bcrypt.compare-t futtatni (ld. src/modules/devices/device-key.ts).
+  // Nullable: a natív eszközök provisioningkor kész bcrypt hasht küldenek, a
+  // szerver a nyílt kulcsot nem látja – ott az első sikeres hitelesítéskor
+  // töltődik ki.
+  deviceKeyLookup String?
+
   clientId String?
   userId   String?
 
@@ -286,6 +295,7 @@ model Device {
   @@index([tenantId, online])
   @@index([tenantId, lastSeenAt])
   @@index([userId])
+  @@index([deviceKeyLookup])
   @@unique([tenantId, name])
   @@unique([tenantId, clientId])
 }

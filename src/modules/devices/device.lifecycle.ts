@@ -132,10 +132,34 @@ async function purgeStaleProvisioning(): Promise<number> {
   return total;
 }
 
+// A UserSession tábla korábban SOSEM takarodott: a `logout()` törli a saját
+// sorát, a webplayer-sorokat a fenti offline-timeout zárja, de egy egyszerűen
+// bezárt admin böngésző (nincs sendBeacon, elszállt hálózat, összeomlott gép)
+// sora örökre bennmaradt. A tábla korlátlanul nőtt, és minden authJwt-hívás
+// ezen keresztül keresett.
+//
+// A `JWT_ACCESS_TTL` 3650d óta a token maga nem jár le, ezért az elhagyott
+// sorokat idő alapján kell kivezetni. 30 nap érintetlenség bőven a normál
+// használat FÖLÖTT van (a frontend 5 percenként frissít, ami lastSeenAt-et is
+// ír), tehát élő munkamenetet nem zárhat be.
+const SESSION_STALE_MS = 30 * 24 * 60 * 60 * 1000;   // 30 nap
+
+async function purgeStaleSessions(): Promise<number> {
+  const threshold = new Date(Date.now() - SESSION_STALE_MS);
+  const r = await prisma.userSession.deleteMany({
+    where: { lastSeenAt: { lt: threshold } },
+  });
+  if (r.count > 0) {
+    console.log(`[DEVICE-LIFECYCLE] ${r.count} elhagyott munkamenet törölve (>30 nap inaktív)`);
+  }
+  return r.count;
+}
+
 async function tick(): Promise<void> {
   try {
     await markStaleDevicesOffline();
     await purgeStaleProvisioning();
+    await purgeStaleSessions();
   } catch (e) {
     console.error("[DEVICE-LIFECYCLE] tick hiba:", e);
   }

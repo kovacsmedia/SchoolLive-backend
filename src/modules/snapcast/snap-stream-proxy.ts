@@ -68,6 +68,18 @@ async function handleSnapStreamConnection(
     return;
   }
 
+  // Multi-node cluster: ugyanaz a kapu, mint a SyncEngine WS accept-jén, a
+  // requireTenant middleware-en és a SnapcastService.getEngine()-en – ez volt
+  // az EGYETLEN stateful belépési pont, amiről lemaradt. Enélkül a webplayer
+  // egy olyan node-ra nyitotta a snap-streamet, ahol a tenant snapservere már
+  // nem is fut: a TCP-kapcsolat csendben elhalt, és a kliens NEM kapott 4009-et,
+  // amiből tudhatta volna, hogy másik node-ot kell keresnie.
+  const { isOwnedByThisNode } = await import("../cluster/tenant-ownership");
+  if (!isOwnedByThisNode(tenantId)) {
+    ws.close(4009, "Tenant not hosted on this node");
+    return;
+  }
+
   // Tenant snapPort feloldása.
   const tenant = await prisma.tenant.findUnique({
     where: { id: tenantId },

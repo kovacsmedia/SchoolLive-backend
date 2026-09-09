@@ -54,8 +54,18 @@ export async function postLogout(req: Request, res: Response) {
 
 export async function postRefresh(req: Request, res: Response) {
   if (!req.user) return res.status(401).json({ error: "Unauthenticated" });
-  const result = await authService.refresh(req.user);
-  res.json(result);
+  // Explicit try/catch: az Express 4 NEM kapja el az async handlerek
+  // elutasított promise-ait – egy itt dobott hiba korábban azt jelentette,
+  // hogy a kérés válasz nélkül lógott a kliens timeoutjáig. A frontend
+  // refresh-tickje ezt logoutként kezeli, tehát ennek a végpontnak MINDIG
+  // válaszolnia kell valamit.
+  try {
+    const result = await authService.refresh(req.user);
+    res.json(result);
+  } catch (err) {
+    console.error("[AUTH/refresh] token aláírás hiba:", err);
+    res.status(500).json({ error: "Failed to refresh token" });
+  }
 }
 
 export async function getMeHandler(req: Request, res: Response) {

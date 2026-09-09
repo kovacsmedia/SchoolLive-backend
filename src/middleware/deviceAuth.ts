@@ -1,25 +1,15 @@
 import { Request, Response, NextFunction } from "express";
-import { prisma } from "../prisma/client";
-import bcrypt from "bcrypt";
+import { findDeviceByKey } from "../modules/devices/device-key";
 
 export async function deviceAuth(req: Request, res: Response, next: NextFunction) {
   const key = req.header("x-device-key");
   if (!key) return res.status(401).json({ error: "Missing device key" });
 
-  // ✅ csak KEY authType device-okra próbálunk
-  const devices = await prisma.device.findMany({
-    where: { authType: "KEY" },
-    select: { id: true, deviceKeyHash: true, tenantId: true },
-  });
+  // Indexelt feloldás – korábban itt MINDEN KEY-auth eszközre lefutott egy
+  // bcrypt.compare (ld. device-key.ts).
+  const device = await findDeviceByKey(key, true);
+  if (!device) return res.status(401).json({ error: "Invalid device key" });
 
-  for (const d of devices) {
-    if (!d.deviceKeyHash) continue; // safety
-    const ok = await bcrypt.compare(key, d.deviceKeyHash);
-    if (ok) {
-      (req as any).device = { id: d.id, tenantId: d.tenantId };
-      return next();
-    }
-  }
-
-  return res.status(401).json({ error: "Invalid device key" });
+  (req as any).device = { id: device.id, tenantId: device.tenantId };
+  return next();
 }

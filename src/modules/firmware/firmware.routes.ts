@@ -16,6 +16,7 @@ import { prisma }        from "../../prisma/client";
 import { authJwt }       from "../../middleware/authJwt";
 import { requireTenant } from "../../middleware/tenant";
 import { SyncEngine }    from "../../sync/SyncEngine";
+import { findDeviceByKey } from "../devices/device-key";
 
 const router = Router();
 
@@ -136,19 +137,10 @@ router.get("/check", async (req: Request, res: Response) => {
     if (!deviceKey) return res.status(401).json({ error: "x-device-key kötelező" });
     const safeKey = deviceKey as string;
 
-    // Eszköz azonosítása
-    const keyHash = crypto.createHash("sha256").update(safeKey).digest("hex");
-    // bcrypt a szkémában – keressük az összes eszközt (kis szám)
-    const bcrypt = require("bcrypt");
-    const devices = await prisma.device.findMany({
-      where:  { deviceKeyHash: { not: null } },
-      select: { id: true, tenantId: true, deviceKeyHash: true },
-    });
-    let device: { id: string; tenantId: string } | null = null;
-    for (const d of devices) {
-      if (!d.deviceKeyHash) continue;
-      if (await bcrypt.compare(safeKey, d.deviceKeyHash)) { device = d; break; }
-    }
+    // Eszköz azonosítása – indexelt feloldás (ld. device-key.ts). Korábban a
+    // "keressük az összes eszközt (kis szám)" megjegyzéssel MINDEN eszközre
+    // lefutott egy bcrypt.compare; OTA-körnél ez egyszerre sok eszköztől jön.
+    const device = await findDeviceByKey(safeKey);
     if (!device) return res.status(401).json({ error: "Ismeretlen eszköz" });
 
     // Legújabb kompatibilis firmware lekérése – hwModel > deviceClass > ALL prioritás
@@ -208,17 +200,9 @@ router.post("/ota-status", async (req: Request, res: Response) => {
 
     const { version, status, progress, error: errMsg } = req.body;
 
-    const bcrypt  = require("bcrypt");
-    const devices = await prisma.device.findMany({
-      where:  { deviceKeyHash: { not: null } },
-      select: { id: true, deviceKeyHash: true },
-    });
-    let deviceId: string | null = null;
-    for (const d of devices) {
-      if (!d.deviceKeyHash) continue;
-      if (await bcrypt.compare(safeKey2, d.deviceKeyHash)) { deviceId = d.id; break; }
-    }
-    if (!deviceId) return res.status(401).json({ error: "Ismeretlen eszköz" });
+    const otaDevice = await findDeviceByKey(safeKey2);
+    if (!otaDevice) return res.status(401).json({ error: "Ismeretlen eszköz" });
+    const deviceId = otaDevice.id;
 
     const otaStatus =
       status === "SUCCESS"    ? "UP_TO_DATE"  :

@@ -5,6 +5,7 @@ import { prisma } from "../../prisma/client";
 import bcrypt from "bcrypt";
 import crypto from "crypto";
 import { authJwt } from "../../middleware/authJwt";
+import { deviceKeyLookupHash } from "./device-key";
 
 const router = Router();
 
@@ -204,6 +205,10 @@ router.post("/activate", authJwt, async (req, res) => {
     // Új deviceKey generálás – MULTIZONE esetén mind a 4 zóna ezt osztja meg
     const deviceKey = crypto.randomBytes(24).toString("hex");
     const deviceKeyHash = await bcrypt.hash(deviceKey, 10);
+    // Indexelt keresési kulcs (ld. device-key.ts) – a szerver itt generálja a
+    // nyílt kulcsot, tehát rögtön kitölthető. MULTIZONE-nál mind a 4 sor
+    // ugyanezt kapja, mert ugyanazon a deviceKey-en osztoznak.
+    const deviceKeyLookup = deviceKeyLookupHash(deviceKey);
 
     // Mastereszköz létrehozása (Z1, vagy egyetlen eszköz nem-MULTIZONE esetén)
     const device = await prisma.device.create({
@@ -213,6 +218,7 @@ router.post("/activate", authJwt, async (req, res) => {
         deviceClass: deviceClass as any,
         authType: "KEY",
         deviceKeyHash,
+        deviceKeyLookup,
         firmwareVersion: pending.firmwareVersion,
         ipAddress: pending.ipAddress,
         clientId: pendingId,
@@ -231,6 +237,7 @@ router.post("/activate", authJwt, async (req, res) => {
           deviceClass: "MULTIZONE" as const,
           authType: "KEY" as const,
           deviceKeyHash,
+          deviceKeyLookup,
           parentDeviceId: device.id,
           zoneIndex: i + 2,
           firmwareVersion: pending.firmwareVersion,
@@ -351,7 +358,12 @@ router.post("/provision/confirm", async (req, res) => {
 
     const device = await prisma.device.update({
       where: { id: matchedSession.deviceId },
-      data: { name: matchedSession.name, deviceKeyHash },
+      data: {
+        name: matchedSession.name,
+        deviceKeyHash,
+        // Indexelt keresési kulcs – ld. device-key.ts.
+        deviceKeyLookup: deviceKeyLookupHash(deviceKey),
+      },
       select: { id: true, tenantId: true, name: true },
     });
 

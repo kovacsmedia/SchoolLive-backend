@@ -6,6 +6,8 @@ import { authJwt } from "../../middleware/authJwt";
 import { allocateNextSnapPort, SNAP_PORT_RANGE } from "../snapcast/snap-port-allocator";
 import { SnapcastService } from "../snapcast/snapcast.service";
 import { pickLeastLoadedNode } from "../cluster/cluster.rebalancer";
+import { DEFAULT_BELL_SOUNDS, bellSoundDiskPath } from "../bells/bell-sound-paths";
+import fs from "fs";
 
 const router = Router();
 
@@ -133,12 +135,45 @@ router.post("/", authJwt, async (req, res) => {
       return res.status(500).json({ error: "Failed to allocate snapPort after retries" });
     }
 
+    // A default csengetőhangok rekordjai. KRITIKUS, nem kozmetika:
+    // az eszközök a /bells/sync `sounds` listájából TAKARÍTANAK – amit nem
+    // látnak benne, azt törlik a saját tárhelyükről. Egy seedelés nélküli új
+    // tenantnál a lista üres lenne, tehát az eszköz kidobná a firmware-rel
+    // szállított gyári hangjait, és a rájuk hivatkozó csengetés NÉMÁN
+    // elmaradna. (A fájlok maguk az `audio/bells/`-ben vannak, oda a
+    // szerver indulásakor kerülnek ki – ld. ensureDefaultBellSounds.)
+    await seedDefaultBellSounds(created.id);
+
     return res.status(201).json({ ok: true, tenant: created });
   } catch (err: any) {
     console.error(err);
     return res.status(500).json({ error: "Failed to create tenant" });
   }
 });
+
+/**
+ * A két default csengetőhang BellSoundFile rekordjának létrehozása egy
+ * tenanthoz. Idempotens (upsert), tehát meglévő tenantra is nyugodtan
+ * ráfuttatható.
+ */
+async function seedDefaultBellSounds(tenantId: string): Promise<void> {
+  for (const filename of DEFAULT_BELL_SOUNDS) {
+    try {
+      const resolved = bellSoundDiskPath(tenantId, filename);
+      let sizeBytes = 0;
+      if (resolved) {
+        try { sizeBytes = fs.statSync(resolved.path).size; } catch { sizeBytes = 0; }
+      }
+      await prisma.bellSoundFile.upsert({
+        where:  { tenantId_filename: { tenantId, filename } },
+        update: {},
+        create: { tenantId, filename, sizeBytes, isDefault: true, kind: "SCHEDULE" },
+      });
+    } catch (e) {
+      console.error(`[TENANTS] default hang seed hiba (${tenantId}/${filename}):`, e);
+    }
+  }
+}
 
 /**
  * PATCH /admin/tenants/:id

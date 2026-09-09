@@ -102,8 +102,26 @@ async function tick(): Promise<void> {
       select: { id: true, assignedNodeId: true },
     });
 
+    // A DRAINING node-ok NEM halottak: heartbeatelnek, futtatják a tenantjaikat,
+    // csak ÚJAT nem kapnak. A rájuk mutató tenantok ezért NEM árvák.
+    //
+    // Korábban az `activeNodeIds` (csak ACTIVE) alapján árvának minősültek, és
+    // az árva-ág AZONNAL, a csengetés-tudatos biztonságos ablak MEGKERÜLÉSÉVEL
+    // mozgatta őket. Így egy node DRAINING-re állítása – ami kifejezetten egy
+    // óvatos, kézi staging lépés akart lenni – tanóra közben, hang közben
+    // rántotta el az összes iskoláját. A DRAINING node tenantjait az
+    // egyenletesség-pass viszi el, a biztonságos ablakot betartva.
+    const drainingNodes = await prisma.clusterNode.findMany({
+      where:  { status: "DRAINING" },
+      select: { id: true },
+    });
+    const liveNodeIds = new Set<string>([
+      ...activeNodeIds,
+      ...drainingNodes.map((n) => n.id),
+    ]);
+
     // ── 1) Árvák: null vagy halott/ismeretlen node-ra mutat → azonnal ──────
-    const orphans = tenants.filter((t) => !t.assignedNodeId || !activeNodeIds.has(t.assignedNodeId));
+    const orphans = tenants.filter((t) => !t.assignedNodeId || !liveNodeIds.has(t.assignedNodeId));
     const countByNode = new Map<string, number>();
     for (const n of activeNodes) countByNode.set(n.id, 0);
     for (const t of tenants) {
@@ -137,6 +155,18 @@ async function tick(): Promise<void> {
       if (c > targetPerNode) overloadedNow.add(n.id);
     }
 
+    // A DRAINING node-okat MINDIG "túlterheltnek" tekintjük, amíg van rajtuk
+    // tenant – így az egyenletesség-pass fokozatosan leüríti őket, de a
+    // csengetés-tudatos biztonságos ablakot betartva (tickenként max 1
+    // tenant, és csak tanóra közben). Ez a "drain" szó tényleges jelentése.
+    for (const n of drainingNodes) {
+      const c = tenants.filter((t) => t.assignedNodeId === n.id).length;
+      if (c > 0) {
+        countByNode.set(n.id, c);
+        overloadedNow.add(n.id);
+      }
+    }
+
     // Streak-számlálók frissítése: csak az aktuálisan túlterhelt node-oknak
     // nő a streakje, a többinek nullázódik (vagy törlődik a Map-ből).
     for (const n of activeNodes) {
@@ -148,10 +178,28 @@ async function tick(): Promise<void> {
     }
     // Már nem aktív node-ok streakjét is töröljük, ne szivárogjon a Map.
     for (const nodeId of [..._overloadStreak.keys()]) {
-      if (!activeNodeIds.has(nodeId)) _overloadStreak.delete(nodeId);
+      if (!liveNodeIds.has(nodeId)) _overloadStreak.delete(nodeId);
     }
 
-    const readyToRebalance = activeNodes.find(
+    // Streak-számlálás a DRAINING node-okra is (ld. fent).
+    for (const n of drainingNodes) {
+      if (overloadedNow.has(n.id)) {
+        _overloadStreak.set(n.id, (_overloadStreak.get(n.id) ?? 0) + 1);
+      } else {
+        _overloadStreak.delete(n.id);
+      }
+    }
+
+    const rebalanceSources: NodeRow[] = [
+      // A DRAINING node-ok elöl: őket akarjuk leüríteni.
+      ...(await prisma.clusterNode.findMany({
+        where:  { status: "DRAINING" },
+        select: { id: true, hostname: true },
+        orderBy: { hostname: "asc" },
+      })),
+      ...activeNodes,
+    ];
+    const readyToRebalance = rebalanceSources.find(
       (n) => (_overloadStreak.get(n.id) ?? 0) >= env.CLUSTER_REBALANCE_OVERLOAD_TICKS
     );
 

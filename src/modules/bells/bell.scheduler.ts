@@ -7,12 +7,14 @@
 //   • getBellMs() timezone fix megmarad
 
 import { prisma }          from "../../prisma/client";
+import { env }             from "../../config/env";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
 import { execSync }        from "child_process";
-import path                from "path";
 import { randomUUID }      from "crypto";
 import { todayInBudapest, getBellMs, isBudapestWeekend } from "../../utils/budapest-time";
+import { isOwnedByThisNode } from "../cluster/tenant-ownership";
+import { bellSoundDiskPath, bellSoundUrlPath } from "./bell-sound-paths";
 
 const TICK_INTERVAL_MS = 30_000;
 const LOOKAHEAD_MS     = 90_000;
@@ -33,6 +35,7 @@ const MIN_FUTURE_MS    = 1_000;
 const SNAP_PIPE_LEAD_MS = 3_200;
 
 let _running = false;
+let _startedAtMs = Date.now();
 const _dispatched      = new Set<string>();
 const _pendingTimeouts = new Map<string, ReturnType<typeof setTimeout>[]>();
 
@@ -73,9 +76,41 @@ async function tick() {
   }
 
   try {
-    const tenants = await prisma.tenant.findMany({ select: { id: true } });
+    // Multi-node: CSAK a saját node-hoz rendelt, AKTÍV tenantokat dolgozzuk fel.
+    //
+    // Enélkül minden node lefuttatta minden tenant csengetését. A snap-oldalt
+    // ugyan megfogta a SnapcastService ownership-kapuja, DE a lenti
+    // `deviceCommand.createMany` offline-ágat nem: a nem-tulajdonos node-on
+    // MINDEN eszköz offline-nak látszik (nincs hozzá WS-kapcsolat), így minden
+    // csengetéskor minden eszközre duplikált QUEUED parancs keletkezett –
+    // dupla/késleltetett csengetés a kliensen, és korlátlanul növő tábla.
+    const tenants = await prisma.tenant.findMany({
+      where:  { isActive: true },
+      select: { id: true },
+    });
+    let owned = 0;
     for (const tenant of tenants) {
+      if (!isOwnedByThisNode(tenant.id)) continue;
+      owned++;
       await scheduleTenantBells(tenant.id, now, horizon);
+    }
+
+    // Diagnosztika: ha VAN aktív tenant, de egyet sem birtokolunk, az vagy egy
+    // teljesen üres (staging/DRAINING) node, vagy a cluster-lánc (heartbeat →
+    // leader → rebalancer → ownership poller) akadt el. Utóbbi esetben néma
+    // maradna minden csengetés, ezért ezt KI KELL írni – a hangot amúgy is
+    // ugyanez az ownership-kapu védi (SnapcastService.getEngine), tehát ez a
+    // log nem új függőséget jelez, hanem láthatóvá teszi a meglévőt.
+    // Induláskor még nincs kiosztás: a heartbeat → leader-election →
+    // rebalancer → ownership-poller lánc ~20 mp alatt áll fel. Az első
+    // percben ezért NEM figyelmeztetünk, különben minden deploy után hamis
+    // riasztás menne a logba. A 90 mp-es lookahead miatt eközben egyetlen
+    // csengetés sem esik ki.
+    if (tenants.length > 0 && owned === 0 && Date.now() - _startedAtMs > 60_000) {
+      console.warn(
+        `[BELLS-SCHEDULER] ⚠️ ${tenants.length} aktív tenant, de egyik sincs ehhez a node-hoz rendelve ` +
+        `(${env.NODE_HOSTNAME}) – ellenőrizd a cluster-állapotot: GET /admin/cluster/status`
+      );
     }
   } catch (e) {
     console.error("[BELLS-SCHEDULER] tick error:", e);
@@ -121,6 +156,33 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
     if (_dispatched.has(dispatchKey)) continue;
     if (_pendingTimeouts.has(dispatchKey)) continue;
 
+    // A hangfájl helyét a bell-sound-paths feloldója adja: elsődlegesen a
+    // tenant saját `audio/bells/<tenantId>/` könyvtára, visszaesésként a régi,
+    // lapos elrendezés (ld. ott a részletes kommentet). Enélkül két iskola
+    // azonos nevű hangja ugyanarra a fájlra mutatna.
+    //
+    // "A CSENGETÉS SOSEM MARADHAT EL": a feloldó a tenant fájlja → régi lapos
+    // hely → default hang sorrendben keres, tehát egy hiányzó vagy törölt
+    // feltöltés legrosszabb esetben MÁS hangot ad, csendet SOSEM.
+    const resolved = bellSoundDiskPath(tenantId, bell.soundFile, bell.type);
+    if (resolved?.isFallback) {
+      console.warn(
+        `[BELLS-SCHEDULER] ⚠️ Hiányzó hangfájl: ${bell.soundFile} ` +
+        `(tenant=${tenantId}, ${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}) ` +
+        `– DEFAULT hanggal csengetünk: ${resolved.path}`
+      );
+    } else if (!resolved) {
+      // Ide csak sérült telepítésnél juthatunk (még a repóval szállított
+      // default sincs meg). A snap-lejátszás kimarad, de a WS-parancs
+      // MEGY: a kliensek a saját, firmware-be épített default hangjukból
+      // lejátsszák. Ez az utolsó védvonal.
+      console.error(
+        `[BELLS-SCHEDULER] ⛔ Egyetlen hangfájl sem oldható fel (${bell.soundFile}, tenant=${tenantId}) – ` +
+        `ellenőrizd az assets/bells/ meglétét a szerveren! A kliensek helyi másolatból játszanak.`
+      );
+    }
+    const soundPath = resolved?.path ?? null;
+
     _dispatched.add(dispatchKey);
 
     const prepareDelay = Math.max(0, waitMs - PREPARE_LEAD_MS);
@@ -129,9 +191,13 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
     // szólaljon meg a chime – szinkron a kliens HUD/unmute idővel.
     const snapDelay    = Math.max(0, waitMs - SNAP_PIPE_LEAD_MS);
     const commandId    = randomUUID();
-    const audioUrl     = `https://api.schoollive.hu/audio/bells/${bell.soundFile}`;
-    const soundPath    = path.join(process.cwd(), "audio", "bells", bell.soundFile);
-    const durationMs   = getAudioDurationMs(soundPath);
+    // A letöltési URL-nek ANNAK a node-nak kell mutatnia, ahol az eszköz
+    // ténylegesen van – korábban ez fixen "api.schoollive.hu" volt, BASE_URL
+    // fallback nélkül is (szemben a messages/radio/firmware modulokkal), így
+    // egy második node-on lévő iskola eszközei az első node-ról töltöttek
+    // volna – pont annak a kiesését hivatott kezelni a multi-node felállás.
+    const audioUrl     = `${process.env.BASE_URL ?? `https://${env.NODE_HOSTNAME}`}${bellSoundUrlPath(tenantId, bell.soundFile)}`;
+    const durationMs   = soundPath ? getAudioDurationMs(soundPath) : null;
     const bellTimeStr  = `${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}`;
 
     console.log(`[BELLS-SCHEDULER] Ütemezve: ${bellTimeStr} | wait=${Math.round(waitMs/1000)}s | dur=${durationMs}ms`);
@@ -180,6 +246,9 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
       try {
         const snapOnline = await SnapcastService.isSnapserverOnline(tenantId);
         if (!snapOnline) return;
+        // Nincs helyi fájl → nincs mit a mixerbe adni (a WS-értesítés már
+        // kiment, a kliensek a saját másolatukból játszanak).
+        if (!soundPath) return;
 
         // Csengetés MINDIG minden snap-csatlakozott klienshez megy → NEM adunk
         // explicit `deviceIdsToUnmute`-ot. Az `applyTargetingToClients` ekkor
@@ -217,6 +286,7 @@ export function cancelPendingBells() {
 export function startBellsScheduler() {
   if (_running) return;
   _running = true;
+  _startedAtMs = Date.now();
   console.log("[BELLS-SCHEDULER] Indult (tick: 30s, lookahead: 90s, min_future: 1s)");
   tick();
   setInterval(tick, TICK_INTERVAL_MS);

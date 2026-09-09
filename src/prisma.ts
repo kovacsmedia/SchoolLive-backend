@@ -1,15 +1,4 @@
-import { PrismaClient } from "@prisma/client";
-
-declare global {
-  // eslint-disable-next-line no-var
-  var __prisma: PrismaClient | undefined;
-}
-
-// Hot-reload / dev alatt ne nyissunk sok connectiont
-const prisma = global.__prisma ?? new PrismaClient();
-
-if (process.env.NODE_ENV !== "production") {
-  global.__prisma = prisma;
-}
-
-export default prisma;
+// Visszafelé kompatibilis default export – a példány maga a `prisma/client.ts`
+// singletonja (ld. ott a magyarázatot). Korábban ez a fájl SAJÁT PrismaClientet
+// példányosított, így egy processzben két connection pool futott.
+export { prisma as default } from "./prisma/client";

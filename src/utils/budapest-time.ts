@@ -20,18 +20,49 @@ export function todayInBudapest(now: Date = new Date()): Date {
  * PARAMÉTER NAPTÁRI NAPJÁRA nézve (DST-helyes – nem egyszerű óra-eltolás,
  * hanem tényleges timezone-konverzió, mert nyári/téli időszámítás
  * határnapján egy fix eltolás hibás lenne).
+ *
+ * FONTOS – a korábbi implementáció csak UTC szerver-időzónában adott helyes
+ * eredményt. A `new Date(d.toLocaleString("en-US", {timeZone}))` trükk a
+ * visszaparszolásnál a SZERVER lokális időzónáját használja, így a kiszámolt
+ * eltolásba beleszivárgott a szerver saját offsetje: az eredmény
+ * `helyes + serverOffset` lett. Az első node UTC-n fut, ezért ez sosem
+ * derült ki – de egy `TZ=Europe/Budapest` beállítású új node-on MINDEN
+ * csengetés 1-2 órával elcsúszott volna.
+ *
+ * Az alábbi változat nem függ a szerver időzónájától: az `Intl` formatterrel
+ * KIOLVASSA, hogy egy adott UTC pillanat mennyi Budapesten, és ebből
+ * számolja a tényleges offsetet.
  */
+function budapestOffsetMsAt(utcMs: number): number {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Budapest",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(utcMs));
+  const get = (t: string) => Number(parts.find(p => p.type === t)?.value ?? "0");
+  // A budapesti fali-óra ugyanezekkel a mezőkkel, UTC-ként értelmezve.
+  const asUtc = Date.UTC(get("year"), get("month") - 1, get("day"),
+                         get("hour"), get("minute"), get("second"));
+  return asUtc - utcMs;   // pl. CEST-ben +2h
+}
+
 export function getBellMs(hour: number, minute: number, now: Date = new Date()): number {
   const budapestDateStr = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Europe/Budapest",
     year: "numeric", month: "2-digit", day: "2-digit",
   }).format(now);
   const [y, m, d] = budapestDateStr.split("-").map(Number);
-  const bellLocalStr = `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00`;
-  const tempDate   = new Date(`${bellLocalStr}Z`);
-  const budapestMs = new Date(tempDate.toLocaleString("en-US", { timeZone: "Europe/Budapest" })).getTime();
-  const offsetMs   = tempDate.getTime() - budapestMs;
-  return new Date(`${bellLocalStr}Z`).getTime() + offsetMs;
+
+  // A keresett fali-óra UTC-ként értelmezve – ebből az offset levonásával
+  // kapjuk a tényleges UTC pillanatot.
+  const wallAsUtc = Date.UTC(y, m - 1, d, hour, minute, 0);
+
+  // Az offsetet magánál a találgatott pillanatnál mérjük, majd egyszer
+  // korrigálunk: DST-váltás napján az első becslés még a váltás rossz
+  // oldalára eshet, a második már nem.
+  let guess = wallAsUtc - budapestOffsetMsAt(wallAsUtc);
+  guess     = wallAsUtc - budapestOffsetMsAt(guess);
+  return guess;
 }
 
 /** Hétvége-e (Europe/Budapest) a `now` időpontban. */

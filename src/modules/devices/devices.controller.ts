@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { prisma } from "../../prisma/client";
 import crypto from "crypto";
 import bcrypt from "bcrypt";
+import { deviceKeyLookupHash } from "./device-key";
 
 // ---- Retry/Timeout config ----
 const BASE_ACK_TIMEOUT_MS = 30_000;
@@ -56,6 +57,10 @@ export async function registerDevice(req: Request, res: Response) {
 
   const deviceKey = crypto.randomBytes(24).toString("hex");
   const deviceKeyHash = await bcrypt.hash(deviceKey, 10);
+  // Indexelt keresési kulcs (ld. device-key.ts). Itt a szerver generálja a
+  // nyílt kulcsot, tehát rögtön ki tudjuk tölteni – nincs szükség a későbbi
+  // backfillre.
+  const deviceKeyLookup = deviceKeyLookupHash(deviceKey);
 
   const device = await prisma.device.create({
     data: {
@@ -64,6 +69,7 @@ export async function registerDevice(req: Request, res: Response) {
       name,
       authType: "KEY",
       deviceKeyHash,
+      deviceKeyLookup,
       online: false,
       volume: 5,
       muted: false,

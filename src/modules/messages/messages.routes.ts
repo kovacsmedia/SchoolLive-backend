@@ -11,6 +11,11 @@ import { resolveIntroSoundPath } from "../bells/bells.routes";
 import { stripAccents }    from "../../utils/text";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
+import {
+  resolveTargetDeviceIds,
+  getCandidateDeviceIds,
+} from "./message.dispatch";
+import { cancelScheduledMessage } from "./message.scheduler";
 import { randomUUID }      from "crypto";
 import { execFileSync }    from "child_process";
 import multer              from "multer";
@@ -128,35 +133,12 @@ const audioUpload = multer({
 function tenantId(req: Request): string { return (req as any).tenantId as string; }
 function userId(req: Request):   string { return (req as any).user?.sub as string; }
 
-async function resolveDeviceIds(
-  tid: string, targetType: string, targetId?: string
-): Promise<string[] | null> {
-  if (targetType === "ALL") return null;
-  if (targetType === "DEVICE" && targetId) return [targetId];
-  if (targetType === "GROUP" && targetId) {
-    return (await prisma.deviceGroupMember.findMany({
-      where:  { groupId: targetId },
-      select: { deviceId: true },
-    })).map(m => m.deviceId);
-  }
-  if (targetType === "ORG_UNIT" && targetId) {
-    return (await prisma.device.findMany({
-      where:  { tenantId: tid, orgUnitId: targetId, online: true },
-      select: { id: true },
-    })).map(d => d.id);
-  }
-  return [];
-}
-
-async function getCandidateIds(tid: string, targetIds: string[] | null): Promise<string[]> {
-  if (targetIds === null) {
-    return (await prisma.device.findMany({
-      where:  { tenantId: tid, online: true },
-      select: { id: true },
-    })).map(d => d.id);
-  }
-  return targetIds;
-}
+// A cél-feloldás a message.dispatch.ts-be került, mert az időzített ág
+// (message.scheduler.ts) is ugyanezt hívja – egy forrás, hogy a kétféle
+// (azonnali / ütemezett) út ne csússzon szét. A régi, lokális nevek
+// megmaradnak aliasként, hogy a hívási helyek változatlanok lehessenek.
+const resolveDeviceIds  = resolveTargetDeviceIds;
+const getCandidateIds   = getCandidateDeviceIds;
 
 // GET /messages
 router.get("/", authJwt, requireTenant, async (req: Request, res: Response) => {
@@ -341,17 +323,14 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
           })),
         });
       }
-    } else {
-      const scheduledCandidates = targetIds === null
-        ? (await prisma.device.findMany({ where: { tenantId: tid }, select: { id: true } })).map(d => d.id)
-        : targetIds;
-      await prisma.deviceCommand.createMany({
-        data: scheduledCandidates.map(deviceId => ({
-          tenantId: tid, deviceId, messageId: message.id, status: "QUEUED" as const,
-          payload: { action: "TTS", url: fileUrl, text: text.trim(), title, scheduledAt: scheduledTime?.toISOString() ?? null },
-        })),
-      });
     }
+    // Időzített ág: NEM csinálunk itt semmit. A Message rekord `scheduledAt`
+    // mezője az egyetlen szükséges állapot – a message.scheduler.ts a megadott
+    // pillanatban ugyanazt a `dispatchMessageNow()`-t hívja, mint az azonnali
+    // ág fent. (Korábban itt előre kiírt QUEUED DeviceCommand sorok álltak
+    // `payload.scheduledAt`-tal, amit EGYETLEN kliens sem olvasott – az
+    // időzített üzenet vagy sosem szólalt meg, vagy rossz időben, a következő
+    // eszköz-újracsatlakozáskor kitolva.)
 
     return res.status(201).json({ ok: true, message });
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to create message" }); }
@@ -429,17 +408,9 @@ router.post("/audio", authJwt, requireTenant, audioUpload.single("audio"), async
           })),
         });
       }
-    } else {
-      const scheduledCandidates = targetIds === null
-        ? (await prisma.device.findMany({ where: { tenantId: tid }, select: { id: true } })).map(d => d.id)
-        : targetIds;
-      await prisma.deviceCommand.createMany({
-        data: scheduledCandidates.map(deviceId => ({
-          tenantId: tid, deviceId, messageId: message.id, status: "QUEUED" as const,
-          payload: { action: "TTS", url: fileUrl, title, scheduledAt: scheduledTime?.toISOString() ?? null },
-        })),
-      });
     }
+    // Időzített ág: ld. a POST / megfelelő kommentjét – a kiküldést a
+    // message.scheduler.ts végzi a Message.scheduledAt alapján.
 
     console.log(`[MESSAGES] Hangfelvétel elküldve: ${processedFilename} | tenant: ${tid}`);
     return res.status(201).json({ ok: true, message });
@@ -561,17 +532,27 @@ router.post("/:id/replay", authJwt, requireTenant, async (req: Request, res: Res
       // Eredeti üzenet `playedAt` frissítése
       await prisma.message.update({ where: { id: original.id }, data: { playedAt: new Date() } });
     } else {
-      const scheduledCandidates = targetIds === null
-        ? (await prisma.device.findMany({ where: { tenantId: tid }, select: { id: true } })).map(d => d.id)
-        : targetIds;
-      await prisma.deviceCommand.createMany({
-        data: scheduledCandidates.map(deviceId => ({
-          tenantId: tid, deviceId, messageId: original.id, status: "QUEUED" as const,
-          payload: { action: "TTS", url: original.fileUrl, text: original.text ?? undefined,
-                     title: original.title ?? "Üzenet",
-                     scheduledAt: scheduledTime?.toISOString() ?? null },
-        })),
+      // Időzített replay: ÚJ Message rekordot hozunk létre (ugyanarra a már
+      // legenerált fájlra mutatva), mert a message.scheduler.ts a
+      // `Message.scheduledAt` + `playedAt: null` páros alapján dolgozik – az
+      // eredeti rekord `scheduledAt`-jának felülírása elrontaná az eredeti
+      // üzenet előzményét, a `playedAt` nullázása pedig egy már lejátszott
+      // üzenetet tenne újra "függővé". Így az időzített ismétlés önálló,
+      // követhető sorként jelenik meg az üzenetlistában.
+      const scheduledCopy = await prisma.message.create({
+        data: {
+          tenantId:    tid,
+          createdById: userId(req),
+          type:        "TTS",
+          title:       original.title,
+          text:        original.text,
+          fileUrl:     original.fileUrl,
+          targetType:  targetType as any,
+          targetId:    targetId ?? null,
+          scheduledAt: scheduledTime,
+        },
       });
+      return res.json({ ok: true, replayed: false, scheduled: true, messageId: scheduledCopy.id });
     }
 
     return res.json({ ok: true, replayed: true });
@@ -605,6 +586,10 @@ router.delete("/:id", authJwt, requireTenant, async (req: Request, res: Response
     const id   = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     if (user?.role !== "SUPER_ADMIN" && user?.role !== "TENANT_ADMIN") return res.status(403).json({ error: "Forbidden" });
     await prisma.message.delete({ where: { id, tenantId: tid } });
+    // Ha az üzenet időzített volt és a scheduler már betöltötte a memóriába
+    // egy setTimeout-ra, azt is le kell mondani – különben a törölt üzenet
+    // még megszólalna (a DB-sor már nincs meg, de a timer fut).
+    cancelScheduledMessage(id);
     return res.json({ ok: true });
   } catch (err) { console.error(err); return res.status(500).json({ error: "Failed to delete message" }); }
 });

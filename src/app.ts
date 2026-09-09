@@ -18,7 +18,6 @@ import contactRouter            from "./modules/contact/contact.routes";
 import firmwareRouter           from "./modules/firmware/firmware.routes";
 import clusterAdminRoutes       from "./modules/cluster/cluster.admin.routes";
 import { authJwt }              from "./middleware/authJwt";
-import { requireTenant }        from "./middleware/tenant";
 import prisma                   from "./prisma";
 import { SyncEngine }           from "./sync/SyncEngine";
 import nativeRoutes from "./modules/devices/devices.native.routes";
@@ -98,40 +97,10 @@ app.use("/uploads/radio", express.static(path.join(process.cwd(), "uploads", "ra
 app.use("/firmware/files", express.static(path.join(process.cwd(), "uploads", "firmware")));
 
 // ── /bells/today ──────────────────────────────────────────────────────────────
-
-app.get("/bells/today", authJwt, requireTenant, async (req, res) => {
-  try {
-    const tenantId = (req as any).tenantId as string;
-    const today    = new Date();
-    today.setHours(0, 0, 0, 0);
-
-    const calDay = await (prisma as any).bellCalendarDay.findUnique({
-      where:   { tenantId_date: { tenantId, date: today } },
-      include: { template: { include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } } } },
-    }).catch(() => null);
-
-    if (calDay?.isHoliday) return res.json({ ok: true, bells: [], isHoliday: true });
-
-    let bells: any[] = [];
-    if (calDay?.template?.bells?.length) {
-      bells = calDay.template.bells;
-    } else {
-      const def = await (prisma as any).bellScheduleTemplate.findFirst({
-        where:   { tenantId, isDefault: true },
-        include: { bells: { orderBy: [{ hour: "asc" }, { minute: "asc" }] } },
-      }).catch(() => null);
-      bells = def?.bells ?? [];
-    }
-
-    return res.json({
-      ok:        true,
-      isHoliday: false,
-      bells:     bells.map((b: any) => ({
-        hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile,
-      })),
-    });
-  } catch (err) {
-    console.error("/bells/today error:", err);
-    return res.status(500).json({ error: "Failed to fetch today bells" });
-  }
-});
+//
+// ELTÁVOLÍTVA. Itt korábban egy `app.get("/bells/today", authJwt, requireTenant, …)`
+// állt, ami SOSEM futott le: az `app.use("/bells", bellsRouter)` fentebb van
+// regisztrálva, és az Express a sorrend szerint az első illeszkedő kezelőt
+// hívja – tehát mindig a router `/today` végpontja válaszolt. A route mostantól
+// egy helyen él, a bells.routes.ts-ben, ott kapott rendes hitelesítést
+// (device-kulcs VAGY JWT+requireTenant).
