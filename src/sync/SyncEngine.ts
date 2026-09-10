@@ -646,6 +646,20 @@ class SyncEngineClass {
     const { volume, muted, firmwareVersion, statusPayload } = msg;
     try {
       const { prisma } = await import("../prisma/client");
+
+      // ── Újraindulás-észlelés ───────────────────────────────────────────
+      // A `statusPayload` csak PILLANATKÉP – minden beacon felülírja. Egy
+      // TÁVOLI eszköznél viszont a soros monitor nem elérhető, tehát az
+      // újraindulásokról előzményt kell vezetnünk, különben egy
+      // újraindulási ciklus csak a helyszínen diagnosztizálható.
+      //
+      // A jel egyszerű és megbízható: az eszköz `uptimeSec`-je VISSZAESETT
+      // az előző beaconhoz képest → közben újraindult.
+      const prev = await prisma.device.findUnique({
+        where:  { id: dbDeviceId },
+        select: { statusPayload: true },
+      });
+
       await prisma.device.update({
         where: { id: dbDeviceId },
         data: {
@@ -657,6 +671,13 @@ class SyncEngineClass {
           statusPayload:   statusPayload ?? undefined,
         },
       });
+
+      void this.recordRebootIfDetected(
+        prisma, tenantId, dbDeviceId,
+        (prev?.statusPayload ?? null) as any,
+        statusPayload ?? null,
+        typeof firmwareVersion === "string" ? firmwareVersion : null,
+      );
 
       const tenant = await prisma.tenant.findUnique({
         where:  { id: tenantId },
@@ -674,6 +695,61 @@ class SyncEngineClass {
       }
     } catch (e) {
       console.error(`[SyncEngine] handleBeacon hiba (${dbDeviceId}):`, e);
+    }
+  }
+
+  /**
+   * Újraindulás naplózása, ha az eszköz uptime-ja visszaesett.
+   *
+   * Csak akkor ír sort, ha TÉNYLEG új indulást lát – a beacon 30 mp-enként
+   * jön, tehát a tábla nem hízik feleslegesen. Sosem dob: a diagnosztika
+   * naplózása nem akadályozhatja meg a beacon feldolgozását.
+   *
+   * A régebbi firmware-ek nem küldenek `uptimeSec`-et; ott csendben nem
+   * csinálunk semmit (nincs mit észlelni).
+   */
+  private async recordRebootIfDetected(
+    prisma: any,
+    tenantId: string,
+    dbDeviceId: string,
+    prevPayload: Record<string, any> | null,
+    nextPayload: Record<string, any> | null,
+    firmwareVersion: string | null,
+  ): Promise<void> {
+    try {
+      const nextUptime = Number(nextPayload?.uptimeSec);
+      if (!Number.isFinite(nextUptime)) return;   // régi firmware
+
+      const prevUptime = Number(prevPayload?.uptimeSec);
+      const rebooted = Number.isFinite(prevUptime)
+        ? nextUptime < prevUptime          // visszaesett → új indulás
+        : nextUptime < 120;                // első ismert beacon, friss indulás
+
+      if (!rebooted) return;
+
+      const resetReason = Number(nextPayload?.resetReason);
+
+      await prisma.deviceEvent.create({
+        data: {
+          tenantId,
+          deviceId:    dbDeviceId,
+          type:        "REBOOT",
+          resetReason: Number.isFinite(resetReason) ? resetReason : null,
+          // Az ELŐZŐ futás hossza a lényeges adat: ha rendre alacsony, ciklus van.
+          uptimeSec:   Number.isFinite(prevUptime) ? Math.round(prevUptime) : null,
+          freeHeap:    Number.isFinite(Number(nextPayload?.freeHeap))    ? Math.round(Number(nextPayload?.freeHeap))    : null,
+          minFreeHeap: Number.isFinite(Number(nextPayload?.minFreeHeap)) ? Math.round(Number(nextPayload?.minFreeHeap)) : null,
+          firmwareVersion,
+        },
+      });
+
+      console.warn(
+        `[SyncEngine] 🔄 Ujrainditas eszlelve: device=${dbDeviceId} ` +
+        `resetReason=${Number.isFinite(resetReason) ? resetReason : "?"} ` +
+        `elozo_uptime=${Number.isFinite(prevUptime) ? Math.round(prevUptime) + "s" : "?"}`
+      );
+    } catch (e) {
+      console.warn(`[SyncEngine] recordRebootIfDetected hiba (${dbDeviceId}):`, e);
     }
   }
 
@@ -701,30 +777,72 @@ class SyncEngineClass {
     }
   }
 
+  // Egy IDŐZÍTETT hangparancs meddig érvényes a besorolása után. Ami ennél
+  // régebbi, azt NEM játsszuk le – kidobjuk.
+  //
+  // "Elszalasztott jelzés nem halmozódhat fel": a csengetés egy adott
+  // pillanathoz kötött esemény. Egy órákkal későbbi lejátszás nemhogy nem
+  // segít, kifejezetten káros (tanóra közbeni csengetés). A BELL-nél
+  // ugyanaz a 120 mp, mint a kliensek pótlási ablaka (BELL_CATCHUP_MAX_S);
+  // a bemondásoknál valamivel megengedőbb.
+  private static readonly CMD_MAX_AGE_MS: Record<string, number> = {
+    BELL:     120_000,
+    TTS:      600_000,
+    PLAY_URL: 600_000,
+  };
+
   async pushPendingCommands(deviceId: string, dbDeviceId: string, tenantId: string): Promise<void> {
     const client = this.clients.get(deviceId);
     if (!client || client.ws.readyState !== 1) return;
     try {
       const { prisma } = await import("../prisma/client");
 
-      const queued = await prisma.deviceCommand.findFirst({
-        where:   { deviceId: dbDeviceId, tenantId, status: "QUEUED" },
-        orderBy: { queuedAt: "asc" },
-      });
-      if (!queued) return;
+      // Ciklus: a lejárt parancsokat ELDOBJUK (nem küldjük ki), és megyünk a
+      // következőre, amíg friss parancsot nem találunk. A felső korlát csak
+      // védőháló egy patológiásan nagy sor ellen.
+      for (let guard = 0; guard < 200; guard++) {
+        const queued = await prisma.deviceCommand.findFirst({
+          where:   { deviceId: dbDeviceId, tenantId, status: "QUEUED" },
+          orderBy: { queuedAt: "asc" },
+        });
+        if (!queued) return;
 
-      const updated = await prisma.deviceCommand.updateMany({
-        where: { id: queued.id, status: "QUEUED" },
-        data:  { status: "SENT", sentAt: new Date() },
-      });
-      if (updated.count === 0) return;
+        const action = String((queued.payload as any)?.action ?? "");
+        const maxAge = SyncEngineClass.CMD_MAX_AGE_MS[action];
+        const ageMs  = Date.now() - new Date(queued.queuedAt).getTime();
 
-      this.send(client.ws, {
-        type:      "COMMAND",
-        commandId: queued.id,
-        payload:   queued.payload,
-      });
-      console.log(`[SyncEngine] 📤 COMMAND push → ${deviceId}: ${(queued.payload as any)?.action}`);
+        if (maxAge !== undefined && ageMs > maxAge) {
+          // Lejárt: FAILED-re állítjuk, hogy ne kerüljön elő újra, és NEM
+          // küldjük ki. Így egy hosszabb ideig offline eszköz visszatérésekor
+          // nem játszik le egy egész napnyi elmaradt jelzést egymás után.
+          await prisma.deviceCommand.updateMany({
+            where: { id: queued.id, status: "QUEUED" },
+            data:  {
+              status:    "FAILED",
+              error:     `Lejárt: ${Math.round(ageMs / 1000)}s > ${Math.round(maxAge / 1000)}s`,
+              lastError: "expired",
+            },
+          });
+          console.warn(
+            `[SyncEngine] ⏳ Lejárt parancs eldobva (${action}, ${Math.round(ageMs / 1000)}s) → ${deviceId}`
+          );
+          continue;
+        }
+
+        const updated = await prisma.deviceCommand.updateMany({
+          where: { id: queued.id, status: "QUEUED" },
+          data:  { status: "SENT", sentAt: new Date() },
+        });
+        if (updated.count === 0) return;   // más vitte el közben
+
+        this.send(client.ws, {
+          type:      "COMMAND",
+          commandId: queued.id,
+          payload:   queued.payload,
+        });
+        console.log(`[SyncEngine] 📤 COMMAND push → ${deviceId}: ${action}`);
+        return;
+      }
     } catch (e) {
       console.error(`[SyncEngine] pushPendingCommands hiba (${deviceId}):`, e);
     }

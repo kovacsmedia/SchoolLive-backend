@@ -339,7 +339,22 @@ class TenantSnapEngine {
       (deviceIdsToUnmute ?? []).filter((id) => SyncEngine.isDeviceOnline(id))
     );
 
-    const timeoutMs = 3000;
+    // EGY HIBÁS KLIENS NEM TARTHATJA FEL A TÖBBIT.
+    //
+    // Korábban a ciklus addig várt (3 mp-ig), amíg az ÖSSZES célzott kliens
+    // meg nem jelent a snapserver kliens-listáján. Elég volt egyetlen olyan
+    // eszköz, amelyik WS-en online, de a snapclientje épp nem kapcsolódik
+    // (elakadt ESP, megszakadt /snap-stream), és MINDEN lejátszás 3
+    // másodpercet csúszott – a hibátlan klienseknek is.
+    //
+    // Új szabály:
+    //   • ha EGYETLEN célzott kliens sincs még fenn → érdemes várni
+    //     (úgysincs kinek szólnia), a teljes timeoutig;
+    //   • ha legalább egy fenn van → csak rövid türelmi időt adunk a
+    //     többinek, aztán INDULUNK. A későn érkezőket az `onSourceStart`
+    //     amúgy is újracélozza 0/500/1500 ms-nál.
+    const timeoutMs      = 3000;   // teljes felső korlát
+    const partialGraceMs = 600;    // ennyit várunk a hiányzókra, ha van már működő
     const pollMs = 150;
     const started = Date.now();
 
@@ -354,19 +369,30 @@ class TenantSnapEngine {
 
         const connectedIds = new Set(clients.map((c: any) => c.id));
 
-        const allWantedConnected =
-          wanted.size === 0 ||
-          [...wanted].every((id) => connectedIds.has(id));
+        const allWanted = wanted.size === 0 || [...wanted].every((id) => connectedIds.has(id));
+        const anyWanted = wanted.size === 0 || [...wanted].some((id) => connectedIds.has(id));
 
-        if (!allWantedConnected) {
-          const missing = [...wanted].filter((id) => !connectedIds.has(id));
-
-          console.log(
-            `[Snap:${this.snapPort}] várakozás célzott kliensekre: ${missing.join(", ")}`
-          );
-
+        if (!anyWanted) {
+          // Még senki – van értelme várni.
           await sleep(pollMs);
           continue;
+        }
+
+        if (!allWanted && Date.now() - started < partialGraceMs) {
+          const missing = [...wanted].filter((id) => !connectedIds.has(id));
+          console.log(
+            `[Snap:${this.snapPort}] rövid várakozás a hiányzó célzott kliensekre: ${missing.join(", ")}`
+          );
+          await sleep(pollMs);
+          continue;
+        }
+
+        if (!allWanted) {
+          const missing = [...wanted].filter((id) => !connectedIds.has(id));
+          console.warn(
+            `[Snap:${this.snapPort}] ⚠️ ${missing.length} célzott kliens nem elérhető (${missing.join(", ")}) – ` +
+            `a lejátszás a TÖBBI kliensnek INDUL, a késve érkezőket az onSourceStart újracélozza`
+          );
         }
 
         await this.applyTargetingToClients(deviceIdsToUnmute);

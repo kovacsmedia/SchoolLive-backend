@@ -139,11 +139,49 @@ async function purgeStaleSessions(): Promise<number> {
   return r.count;
 }
 
+// Egy QUEUED parancs ennél tovább nem várhat kiküldésre. A `pushPendingCommands`
+// már eldobja a lejárt HANG-parancsokat kiküldés előtt, de az csak akkor fut le,
+// ha az eszköz csatlakozik – ez a söprés attól FÜGGETLENÜL kiüríti a sort.
+//
+// "Elszalasztott jelzés nem halmozódhat fel": egy órán túl álló parancs
+// kiküldése minden típusnál értelmetlen (a csengetés ideje rég elmúlt, a
+// hangerő-állítás rég irreleváns), viszont visszacsatlakozáskor egy egész
+// napnyi sor egymás után lejátszva komoly üzemzavar.
+const COMMAND_STALE_MS = 60 * 60 * 1000;   // 1 óra
+
+async function expireStaleCommands(): Promise<number> {
+  const threshold = new Date(Date.now() - COMMAND_STALE_MS);
+  const r = await prisma.deviceCommand.updateMany({
+    where: { status: "QUEUED", queuedAt: { lt: threshold } },
+    data:  { status: "FAILED", error: "Lejárt (>1 óra a sorban)", lastError: "expired" },
+  });
+  if (r.count > 0) {
+    console.log(`[DEVICE-LIFECYCLE] ${r.count} lejárt QUEUED parancs eldobva (>1 óra)`);
+  }
+  return r.count;
+}
+
+// Az eseménynapló megőrzési ideje. Egy újraindulási ciklus diagnózisához
+// néhány nap bőven elég; 30 nap után a sorok csak helyet foglalnának.
+const EVENT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+async function purgeOldDeviceEvents(): Promise<number> {
+  const r = await prisma.deviceEvent.deleteMany({
+    where: { createdAt: { lt: new Date(Date.now() - EVENT_RETENTION_MS) } },
+  });
+  if (r.count > 0) {
+    console.log(`[DEVICE-LIFECYCLE] ${r.count} régi eszköz-esemény törölve (>30 nap)`);
+  }
+  return r.count;
+}
+
 async function tick(): Promise<void> {
   try {
+    await purgeOldDeviceEvents();
     await markStaleDevicesOffline();
     await purgeStaleProvisioning();
     await purgeStaleSessions();
+    await expireStaleCommands();
   } catch (e) {
     console.error("[DEVICE-LIFECYCLE] tick hiba:", e);
   }

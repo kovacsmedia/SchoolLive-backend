@@ -106,6 +106,7 @@ model Tenant {
   groups    DeviceGroup[]
   messages  Message[]
   commands  DeviceCommand[]
+  deviceEvents DeviceEvent[]
   radioFiles       RadioFile[]
   radioSchedules   RadioSchedule[]
   youtubePlaylists YoutubePlaylist[]
@@ -290,6 +291,7 @@ model Device {
   groupMembers      DeviceGroupMember[]
   commands          DeviceCommand[]
   provisionSessions DeviceProvisionSession[]
+  events            DeviceEvent[]
 
   @@index([tenantId])
   @@index([tenantId, online])
@@ -298,6 +300,44 @@ model Device {
   @@index([deviceKeyLookup])
   @@unique([tenantId, name])
   @@unique([tenantId, clientId])
+}
+
+// ── Eszköz-eseménynapló ────────────────────────────────────────────────────
+//
+// Egy TÁVOLI eszköznél a soros monitor nem elérhető, a `Device.statusPayload`
+// pedig csak PILLANATKÉP (minden beacon felülírja). Egy újraindulási ciklus
+// diagnózisához előzmény kell: "ma 14× indult újra, mind watchdog".
+//
+// A sorokat a SyncEngine.handleBeacon írja, amikor újraindulást észlel (az
+// eszköz uptime-ja visszaesett), illetve hibát jelent a kliens.
+// Megőrzés: a device.lifecycle 30 nap után törli.
+model DeviceEvent {
+  id       String @id @default(uuid())
+  tenantId String
+  deviceId String
+
+  // "REBOOT" | "ERROR" | "OTA" – szándékosan String, nem enum: ez egy
+  // naplótábla, és egy új eseménytípus ne igényeljen séma-migrációt.
+  type String
+
+  // Az ESP32 `esp_reset_reason()` értéke REBOOT eseménynél:
+  //   1=POWERON 3=SW 4=PANIC 5=INT_WDT 6=TASK_WDT 7=WDT 9=BROWNOUT
+  resetReason Int?
+  // Mennyi ideig futott az ELŐZŐ indulás (mp) – ha rendre alacsony, ciklus van.
+  uptimeSec   Int?
+  freeHeap    Int?
+  minFreeHeap Int?
+
+  firmwareVersion String?
+  message         String?
+
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId, createdAt])
+  @@index([tenantId, createdAt])
 }
 
 model DeviceGroup {

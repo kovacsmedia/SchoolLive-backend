@@ -227,14 +227,32 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
           });
           console.log(`[BELLS-SCHEDULER] PREPARE → ${onlineIds.length} eszköz | snap=${snapOnline}`);
         }
+        // OFFLINE eszközöknek SZÁNDÉKOSAN NEM sorolunk be DeviceCommand-ot.
+        //
+        // Korábban itt minden offline eszközre bekerült egy QUEUED "BELL"
+        // parancs. Ez két okból is hibás volt:
+        //
+        //  1. FÖLÖSLEGES: az offline lejátszás pont ezért létezik – a kliens
+        //     a saját, letárolt csengetési rendjéből és hangfájljából csenget
+        //     (BellManager::checkSchedule, ill. a Python/Android megfelelője).
+        //     A parancs ugyanazt a csengetést duplikálta.
+        //
+        //  2. VESZÉLYES: a parancsoknak nem volt lejáratuk, és a
+        //     SyncEngine.handleCmdAck az ACK után AZONNAL kitolja a
+        //     következő sorban állót. Egy hosszabb ideig offline eszköz
+        //     (pl. firmware-flashelés, boot-loop) így egy egész napnyi
+        //     csengetés-parancsot halmozott fel, majd visszacsatlakozáskor
+        //     EGYMÁS UTÁN, egymásba vágva lejátszotta mindet – ez a
+        //     "szaggatottan és hosszasan csengetett" hiba.
+        //
+        // Elmaradt jelzés NEM halmozódhat fel: ami kimaradt, az elveszett.
+        // A kliens a saját, 120 mp-es pótlási ablakán belül még bepótolja
+        // (ld. BELL_CATCHUP_MAX_S), azon túl szándékosan nem.
         if (offlineIds.length > 0) {
-          await prisma.deviceCommand.createMany({
-            data: offlineIds.map(deviceId => ({
-              tenantId, deviceId, messageId: null, status: "QUEUED" as const,
-              payload: { action: "BELL", url: audioUrl, type: bell.type,
-                         soundFile: bell.soundFile, hour: bell.hour, minute: bell.minute },
-            })),
-          });
+          console.log(
+            `[BELLS-SCHEDULER] ${offlineIds.length} offline eszköz – nem sorolunk be parancsot ` +
+            `(a kliens a saját tárolt rendjéből csenget)`
+          );
         }
       } catch (e) {
         console.error(`[BELLS-SCHEDULER] PREPARE hiba (${bellTimeStr}):`, e);

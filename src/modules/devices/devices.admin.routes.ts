@@ -443,6 +443,40 @@ router.delete("/:id", authJwt, requireTenant, async (req, res) => {
 
 // ═══ CSOPORTOK ═══════════════════════════════════════════════════════════════
 
+/**
+ * GET /admin/devices/:id/events
+ *
+ * Eszköz-eseménynapló (újraindulások, hibák) – a frontend "Hibajelzések"
+ * ablaka ezt olvassa. Távoli eszköznél ez helyettesíti a soros monitort.
+ *
+ * A `statusPayload` (aktuális pillanatkép) is visszamegy, mert a legutolsó
+ * állapot – uptime, szabad heap – önmagában is sokat elárul.
+ */
+router.get("/:id/events", authJwt, requireTenant, async (req, res) => {
+  try {
+    const tenantId = (req as any).tenantId as string;
+    const id = String(req.params.id);
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 100)));
+
+    const device = await prisma.device.findFirst({
+      where:  { id, tenantId },
+      select: { id: true, name: true, statusPayload: true, firmwareVersion: true, lastSeenAt: true },
+    });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const events = await prisma.deviceEvent.findMany({
+      where:   { deviceId: id, tenantId },
+      orderBy: { createdAt: "desc" },
+      take:    limit,
+    });
+
+    return res.json({ ok: true, device, events });
+  } catch (err) {
+    console.error("[devices/events] hiba:", err);
+    return res.status(500).json({ error: "Failed to fetch device events" });
+  }
+});
+
 router.get("/groups", authJwt, requireTenant, async (req, res) => {
   try {
     const user = (req as any).user as JwtUser;
