@@ -695,6 +695,97 @@ export class TenantAudioMixer extends EventEmitter {
     return true;
   }
 
+  // ── Tail-csend (forrás vége) ────────────────────────────────────────────
+
+  /** Egy futó tail-csend megszakítása (új job indul, vagy leállás). */
+  private cancelTailSilence(): void {
+    if (!this.tailSilence) return;
+    this.tailSilence.cancelled = true;
+    this.tailSilence = null;
+  }
+
+  /**
+   * A forrás (BELL / TTS / RADIO) vége után TAIL_SILENCE_MS csend kiírása a
+   * FIFO-ra, majd az idle csendlánc átveszi.
+   *
+   * MIÉRT: a hang utolsó mintája nagyjából akkor kerül a FIFO-ra, amikor meg
+   * is szólal – a snapserver és a kliensek pufferében viszont még ott a farka.
+   * Ha a forrás elfogytával rés keletkezik, a snapserver "we are late"-et
+   * állapít meg, előre tolja az időbélyeg-alapját, és a kliensek a még
+   * pufferelt farkat megszaggatva játsszák le.
+   *
+   * A darabolást és a nulla-puffert az idle csenddel közösen használja
+   * (SILENCE_CHUNK): a FIFO ellennyomása adja az ütemet, tehát nem tömünk be
+   * 3 másodpercnyi PCM-et egyetlen írással a snapserver puffere elé, és egy
+   * közben induló új job legfeljebb egy darabnyit vár.
+   */
+  private startTailSilence(jobType?: MixerJobType): void {
+    this.cancelTailSilence();
+    // Egyszerre csak EGY írónk lehet a FIFO-n: az idle lánc most hallgat.
+    this.stopSilenceLoop();
+
+    console.log(
+      `[Mixer:${this.tenantId}] 🔇 tail-csend ${TAIL_SILENCE_MS}ms` +
+      (jobType ? ` (${jobType} vege)` : "")
+    );
+
+    const token = { cancelled: false };
+    this.tailSilence = token;
+
+    let written = 0;
+    let done    = false;
+
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(watchdog);
+
+      if (this.tailSilence === token) this.tailSilence = null;
+      // Ha közben elindult egy forrás, AZ írja a FIFO-t – az idle lánc
+      // ilyenkor maradjon néma, különben ketten írnának ugyanoda.
+      if (!this.active) this.startSilenceLoop();
+    };
+
+    // Biztonsági háló: ha egy FIFO-írás soha nem tér vissza (nincs olvasó a
+    // másik végén), a lánc megállna, és az idle csend SOHA nem indulna újra –
+    // onnantól néma lenne a tenant streamje. A csengetés nem maradhat el.
+    const watchdog = setTimeout(() => {
+      console.warn(`[Mixer:${this.tenantId}] tail-csend időtúllépés – idle csend felengedve`);
+      finish();
+    }, TAIL_SILENCE_MS + 2000);
+
+    const step = (): void => {
+      const stream = this.fifoStream;
+
+      if (
+        token.cancelled ||
+        !this.running ||
+        !stream ||
+        stream.destroyed ||
+        this.active !== null ||
+        written >= TAIL_SILENCE_BYTES
+      ) {
+        finish();
+        return;
+      }
+
+      const n = Math.min(SILENCE_CHUNK_BYTES, TAIL_SILENCE_BYTES - written);
+      written += n;
+
+      try {
+        stream.write(
+          n === SILENCE_CHUNK_BYTES ? SILENCE_CHUNK : SILENCE_CHUNK.subarray(0, n),
+          () => step()
+        );
+      } catch (e: any) {
+        console.warn(`[Mixer:${this.tenantId}] tail-csend írás hiba: ${e.message}`);
+        finish();
+      }
+    };
+
+    step();
+  }
+
   // ── Idle csend életciklus ───────────────────────────────────────────────
 
   /**
