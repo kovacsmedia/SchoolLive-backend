@@ -309,6 +309,62 @@ router.post("/activate-web/:pendingId", authJwt, requireTenant, async (req, res)
   }
 });
 
+// ─── POST /admin/devices/:id/reboot ───────────────────────────────────────
+// Soft reset: az eszköz újraindítása távolról (WS COMMAND → REBOOT).
+//
+// SZÁNDÉKOSAN csak ONLINE eszköznek megy ki, és NEM kerül a DeviceCommand
+// sorba: egy órákkal később, váratlanul újrainduló hangszóró rosszabb, mint
+// egy elmaradt újraindítás. Ha az eszköz nem elérhető, a hívó 409-et kap.
+//
+// A `REBOOT` action a kliensprotokoll része (a Python linux/windows player
+// már régóta kezeli, az ESP32 firmware S5.2 óta) – itt csak a kiváltó
+// végpont hiányzott.
+router.post("/:id/reboot", authJwt, requireTenant, async (req, res) => {
+  try {
+    const user = (req as any).user as JwtUser;
+    if (!["SUPER_ADMIN", "TENANT_ADMIN", "ORG_ADMIN"].includes(user.role ?? "")) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const id = String(req.params.id).trim();
+    const device = await prisma.device.findFirst({
+      where:  { id, tenantId: user.tenantId! },
+      select: { id: true, name: true, online: true },
+    });
+    if (!device) return res.status(404).json({ error: "Device not found" });
+
+    const { SyncEngine } = await import("../../sync/SyncEngine");
+    if (!SyncEngine.isDeviceOnline(id)) {
+      return res.status(409).json({
+        error: `${device.name} jelenleg nem elérhető – az újraindítás csak online eszközre küldhető`,
+      });
+    }
+
+    // A három klienscsalád MÁSHOL keresi az action mezőt, ezért MINDKÉT
+    // alakot elküldjük egyetlen üzenetben:
+    //   • ESP32  – `type: "COMMAND"` + `payload.action` (DeviceAgent::handleCommand)
+    //   • Python – top-level `action` (sync_client.py → app.py _on_immediate)
+    //   • webplayer – top-level `action` (VirtualPlayer fireForAction)
+    // A `commandId` mindhárom helyen top-level, a CMD_ACK arra hivatkozik.
+    SyncEngine.broadcastImmediate(
+      user.tenantId!,
+      {
+        type:      "COMMAND",
+        commandId: `reboot-${id}-${Date.now()}`,
+        action:    "REBOOT",
+        payload:   { action: "REBOOT" },
+      },
+      [id],
+    );
+
+    console.log(`[Reboot] ${device.name} (${id}) újraindítása kérve – kérte: ${user.sub ?? "?"}`);
+    return res.json({ ok: true, message: `${device.name} újraindítása elküldve` });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Failed to reboot device" });
+  }
+});
+
 // ─── POST /admin/devices/:id/reset-provision ─────────────────────────────
 // Eszköz visszaállítása provisioning módba (törlés → kliens újra pending lesz)
 router.post("/:id/reset-provision", authJwt, requireTenant, async (req, res) => {

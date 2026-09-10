@@ -58,6 +58,43 @@ const POST_FADE_GAP_MS = 200;
 const PRE_SILENCE_MS = 1000;
 const POST_SILENCE_MS = 500;
 
+// TAIL_SILENCE_MS: a forrás UTOLSÓ mintája után ennyi csendet írunk ki
+// KÉZZEL a FIFO-ra, mielőtt a háttér silence ffmpeg visszaveszi a szót.
+//
+// MIÉRT: a csengetés végén a hang "darabosan" állt le. A job ffmpeg-je a
+// `-re` miatt real-time ütemben ír, tehát a fájl utolsó mintája nagyjából
+// akkor kerül a pipe-ba, amikor meg is szólal – a snap szerver és a
+// kliensek pufferében viszont még ott a hang farka, amit onnan még ki kell
+// játszani. Amint a forrás elfogy, a FIFO-n rés keletkezik (a SIGCONT
+// kézbesítése + az ffmpeg újraütemezése nem azonnali), a snap szerver
+// "No data" miatt idle-be megy, és a kliensek a még pufferelt farkat
+// megszaggatva vagy félbevágva játsszák le.
+//
+// 3 mp csend bőven fedi a snap szerver + kliens puffert (~1-1,5 s), így a
+// hang vége végig folytonos adatfolyamon érkezik és tisztán cseng ki.
+//
+// MINDHÁROM forrástípus végén lefut – csengetés (BELL), üzenet (TTS) és
+// rádió (RADIO) egyaránt –, mert a puffer-kiürülés nem a tartalomtól függ,
+// hanem attól, hogy elfogy az adat a FIFO-n.
+//
+// Ezt SZÁNDÉKOSAN nem ffmpeg-filterrel (apad) oldjuk meg: egy nem támogatott
+// filter-opció az ffmpeg indulását buktatná, az pedig ELMARADT CSENGETÉST
+// jelentene. A Buffer-írás nem tud így elhasalni.
+const TAIL_SILENCE_MS = 3000;
+
+// A tail-csendet 100 ms-os darabokban írjuk ki, mert a FIFO backpressure-je
+// miatt a drain-callback nagyjából valós időben jön – így egy közben induló
+// új job legfeljebb egy darabnyit vár, nem 3 másodpercet.
+const TAIL_CHUNK_MS = 100;
+
+const TAIL_SILENCE_BYTES =
+  Math.round(BYTES_PER_SEC * TAIL_SILENCE_MS / 1000 / FRAME_BYTES) * FRAME_BYTES;
+const TAIL_CHUNK_BYTES =
+  Math.round(BYTES_PER_SEC * TAIL_CHUNK_MS / 1000 / FRAME_BYTES) * FRAME_BYTES;
+
+// Egyetlen, újrafelhasznált nulla-puffer (s16le csend = csupa 0 byte).
+const TAIL_SILENCE_CHUNK = Buffer.alloc(TAIL_CHUNK_BYTES);
+
 // ── Háttér silence ffmpeg subprocess ─────────────────────────────────────────
 //
 // Egy ffmpeg subprocess folyamatosan ír real-time (-re flag) csendet
@@ -213,6 +250,11 @@ export class TenantAudioMixer extends EventEmitter {
 
   private silenceProc: ChildProcess | null = null;
   private silencePaused: boolean = false;
+
+  // Folyamatban lévő tail-csend kiírás. A `cancelled` flag-et egy új job
+  // indulása billenti át (ld. beginPendingStart) – így a csend azonnal
+  // abbamarad, és nem tolódik be a következő hang elé.
+  private tailSilence: { cancelled: boolean } | null = null;
 
   private gapTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -393,6 +435,11 @@ export class TenantAudioMixer extends EventEmitter {
   // már a bell/üzenet PCM kezdődik – a fade-out garantáltan lecsengett a
   // kliens-snap-pufferben.
   private beginPendingStart(job: MixerJob): void {
+    // Új job jön: a még futó tail-csend azonnal álljon le. Erre a
+    // PRE_SILENCE_MS (1 s) pending-fázis bőven elég időt ad, mielőtt az új
+    // forrás első PCM chunk-ja megjelenne a FIFO-n.
+    this.cancelTailSilence();
+
     console.log(
       `[Mixer:${this.tenantId}] ⏳ pre-silence ${PRE_SILENCE_MS}ms: ${job.jobType} | ${this.desc(job)}`
     );
@@ -599,7 +646,10 @@ export class TenantAudioMixer extends EventEmitter {
     const resumeBytes = (src.job.resumeBytes ?? 0) + src.bytesWritten;
     this.userPausedRadio = { job: src.job, resumeBytes };
 
-    this.killActive("interrupted");
+    // Élő szünet: a rádióadás itt ÉR VÉGET, és nem követi másik forrás –
+    // tehát ugyanúgy kell a tail-csend, mint a csengetés/üzenet végén,
+    // különben a kliensek pufferében maradt hang darabosan szakad meg.
+    this.killActive("interrupted", true);
     return true;
   }
 
@@ -687,6 +737,92 @@ export class TenantAudioMixer extends EventEmitter {
     } catch (e: any) {
       console.warn(`[Mixer:${this.tenantId}] silence pause hiba: ${e.message}`);
     }
+  }
+
+  /** Egy futó tail-csend kiírás megszakítása (új job indul, vagy leállás). */
+  private cancelTailSilence(): void {
+    if (this.tailSilence) {
+      this.tailSilence.cancelled = true;
+      this.tailSilence = null;
+    }
+  }
+
+  /**
+   * A forrás (BELL / TTS / RADIO) vége után TAIL_SILENCE_MS csend kiírása a
+   * FIFO-ra, 100 ms-os darabokban, majd a háttér silence ffmpeg
+   * visszaengedése.
+   *
+   * A darabolás miatt a FIFO backpressure-je szabja meg az ütemet (a
+   * drain-callback nagyjából valós időben jön vissza), tehát nem tömünk be
+   * 3 másodpercnyi PCM-et egyetlen írással a snap szerver puffere elé.
+   *
+   * A háttér silence ffmpeg CSAK a végén indul újra, és csak ha közben nem
+   * indult új forrás – különben ketten írnának ugyanarra a FIFO-ra.
+   */
+  private startTailSilence(jobType?: MixerJobType): void {
+    this.cancelTailSilence();
+
+    console.log(
+      `[Mixer:${this.tenantId}] 🔇 tail-csend ${TAIL_SILENCE_MS}ms` +
+      (jobType ? ` (${jobType} vege)` : "")
+    );
+
+    const token = { cancelled: false };
+    this.tailSilence = token;
+
+    let written = 0;
+    let done    = false;
+
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(watchdog);
+
+      if (this.tailSilence === token) this.tailSilence = null;
+      // Ha közben elindult egy forrás, az írja a FIFO-t – a silence ffmpeg
+      // ilyenkor MARADJON felfüggesztve, különben összekeverednének.
+      if (!this.active) this.resumeSilence();
+    };
+
+    // Biztonsági háló: ha egy FIFO-írás soha nem tér vissza (nincs olvasó a
+    // másik végén), a lánc megállna, és a háttér silence ffmpeg SOHA nem
+    // indulna újra – onnantól néma lenne a tenant streamje. A csengetés nem
+    // maradhat el, ezért időzítővel mindenképp felengedjük.
+    const watchdog = setTimeout(() => {
+      console.warn(`[Mixer:${this.tenantId}] tail-csend időtúllépés – silence ffmpeg felengedve`);
+      finish();
+    }, TAIL_SILENCE_MS + 2000);
+
+    const step = (): void => {
+      const stream = this.fifoStream;
+
+      if (
+        token.cancelled ||
+        !this.running ||
+        !stream ||
+        stream.destroyed ||
+        this.active !== null ||
+        written >= TAIL_SILENCE_BYTES
+      ) {
+        finish();
+        return;
+      }
+
+      const n = Math.min(TAIL_CHUNK_BYTES, TAIL_SILENCE_BYTES - written);
+      written += n;
+
+      try {
+        stream.write(
+          n === TAIL_CHUNK_BYTES ? TAIL_SILENCE_CHUNK : TAIL_SILENCE_CHUNK.subarray(0, n),
+          () => step()
+        );
+      } catch (e: any) {
+        console.warn(`[Mixer:${this.tenantId}] tail-csend írás hiba: ${e.message}`);
+        finish();
+      }
+    };
+
+    step();
   }
 
   /** Job vége után: silence ffmpeg folytatja, hogy a snap szerver folyamatosan
@@ -848,11 +984,12 @@ export class TenantAudioMixer extends EventEmitter {
 
       this.active = null;
 
-      // Job véget ért - a háttér silence ffmpeg folytatja a FIFO-ra írást
-      // azonnal, hogy a snap szerver ne érzékelje "No data since 120 ms"-t.
-      // Ha a következő job rögtön jön (advance() pending), az újra
-      // pauseSilence-t hív - rövid resume/pause cikus elviselhető.
-      this.resumeSilence();
+      // Job véget ért. ELŐBB kiírjuk a tail-csendet (TAIL_SILENCE_MS), hogy a
+      // snap szerver és a kliensek pufferében maradt hang-farok folytonos
+      // adatfolyamon, szakadás nélkül csenghessen ki – enélkül a csengetés
+      // vége darabosan állt le. A háttér silence ffmpeg ezután veszi vissza a
+      // szót; ha közben új job indul, a tail-csend azonnal megszakad.
+      this.startTailSilence(src.job.jobType);
 
       this.emit("source:end", {
         jobId: src.job.id,
@@ -985,7 +1122,8 @@ export class TenantAudioMixer extends EventEmitter {
       // stopByType() már kiürítette a queue-t és a pausedStack-et, mielőtt
       // a fade-out elindult. Csak lezárjuk a job-ot és folytatjuk a háttér-
       // silence-t (mint killActive), NEM advance-elünk a queue-ra.
-      this.resumeSilence();
+      // Tail-csenddel, hogy a fade-out vége is folytonosan csengjen ki.
+      this.startTailSilence(src.job.jobType);
 
       this.emit("source:end", {
         jobId:        src.job.id,
@@ -1030,7 +1168,12 @@ export class TenantAudioMixer extends EventEmitter {
     this.scheduleAdvance(POST_FADE_GAP_MS);
   }
 
-  private killActive(reason: SourceEndReason): void {
+  /**
+   * @param drainTail ha true, a háttér silence ffmpeg helyett a tail-csend
+   *        indul (ld. startTailSilence). Csak ott igaz, ahol a leállítást
+   *        NEM követi azonnal új forrás – különben két írónk lenne a FIFO-n.
+   */
+  private killActive(reason: SourceEndReason, drainTail = false): void {
     if (!this.active) return;
 
     const src = this.active;
@@ -1047,10 +1190,12 @@ export class TenantAudioMixer extends EventEmitter {
       // ignore
     }
 
+    const jobType = src.job.jobType;
     this.active = null;
 
     // Job végén/megszakításnál a háttér silence ffmpeg folytatja az írást.
-    this.resumeSilence();
+    if (drainTail) this.startTailSilence(jobType);
+    else           this.resumeSilence();
 
     this.emit("source:end", {
       jobId: src.job.id,

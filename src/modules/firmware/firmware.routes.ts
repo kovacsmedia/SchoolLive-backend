@@ -17,6 +17,7 @@ import { authJwt }       from "../../middleware/authJwt";
 import { requireTenant } from "../../middleware/tenant";
 import { SyncEngine }    from "../../sync/SyncEngine";
 import { findDeviceByKey } from "../devices/device-key";
+import { isNewerFirmware, parseFirmwareVersion } from "./firmware-version";
 
 const router = Router();
 
@@ -143,8 +144,19 @@ router.get("/check", async (req: Request, res: Response) => {
     const device = await findDeviceByKey(safeKey);
     if (!device) return res.status(401).json({ error: "Ismeretlen eszköz" });
 
-    // Legújabb kompatibilis firmware lekérése – hwModel > deviceClass > ALL prioritás
-    const latest = await prisma.firmwareRelease.findFirst({
+    // ── A kiajánlható release kiválasztása ────────────────────────────────
+    // Két SZŰRÉS, mindkettő éles incidensből származik (2026-09-10):
+    //
+    //  1. LÉTEZŐ FÁJL. A release sor és a .bin egymástól függetlenül tűnhet el
+    //     (kézi törlés, féloldalas deploy, elveszett uploads/ kötet). Korábban
+    //     a check ilyenkor is kiajánlotta a verziót, az eszköz leállította a
+    //     snap streamet, majd a letöltés 404-re futott.
+    //
+    //  2. SZIGORÚAN ÚJABB VERZIÓ. Korábban `createdAt desc` döntött, tehát a
+    //     LEGUTÓBB FELTÖLTÖTT release nyert akkor is, ha a verziószáma kisebb
+    //     volt a futónál – így egy régi .bin újratöltése (vagy a legfrissebb
+    //     sor törlése) az egész flottát VISSZAFRISSÍTETTE volna.
+    const releases = await prisma.firmwareRelease.findMany({
       where: {
         OR: [
           { targetClass: "ALL" },
@@ -154,35 +166,52 @@ router.get("/check", async (req: Request, res: Response) => {
       },
       orderBy: { createdAt: "desc" },
       select: {
-        id: true, version: true, fileUrl: true,
+        id: true, version: true, filename: true, fileUrl: true,
         sizeBytes: true, sha256: true, mandatory: true, notes: true,
       },
     });
 
-    if (!latest) return res.json({ ok: true, updateAvailable: false });
+    if (parseFirmwareVersion(curVersion) === null) {
+      // Nem tudjuk eldönteni, hogy bármi is újabb-e nála – ilyenkor NEM
+      // frissítünk. A downgrade elkerülése fontosabb, mint a frissítés.
+      console.warn(`[OTA] ${device.id}: értelmezhetetlen futó verzió ('${curVersion}') – frissítés kihagyva`);
+      return res.json({ ok: true, updateAvailable: false, current: curVersion, latest: null });
+    }
 
-    const updateAvailable = latest.version !== curVersion;
+    let latest: (typeof releases)[number] | null = null;
+    for (const r of releases) {
+      if (!isNewerFirmware(r.version, curVersion)) continue;
+
+      const binPath = path.join(FIRMWARE_DIR, r.filename);
+      if (!fs.existsSync(binPath)) {
+        console.warn(`[OTA] Release ${r.version} kihagyva: hiányzó fájl (${binPath})`);
+        continue;
+      }
+      if (!latest || isNewerFirmware(r.version, latest.version)) latest = r;
+    }
+
+    if (!latest) return res.json({ ok: true, updateAvailable: false, current: curVersion, latest: null });
 
     // OTA státusz frissítése az eszközön
-    if (updateAvailable) {
-      await (prisma.device as any).update({
-        where: { id: device.id },
-        data:  { otaStatus: "PENDING", otaVersion: latest.version },
-      }).catch(() => {});
-    }
+    await (prisma.device as any).update({
+      where: { id: device.id },
+      data:  { otaStatus: "PENDING", otaVersion: latest.version },
+    }).catch(() => {});
+
+    console.log(`[OTA] ${device.id}: ${curVersion} -> ${latest.version} kiajánlva (mandatory=${latest.mandatory})`);
 
     return res.json({
       ok: true,
-      updateAvailable,
+      updateAvailable: true,
       current:  curVersion,
-      latest: updateAvailable ? {
+      latest: {
         version:   latest.version,
         url:       latest.fileUrl,
         sizeBytes: latest.sizeBytes,
         sha256:    latest.sha256,
         mandatory: latest.mandatory,
         notes:     latest.notes,
-      } : null,
+      },
     });
   } catch (e) {
     console.error("[OTA] check hiba:", e);
