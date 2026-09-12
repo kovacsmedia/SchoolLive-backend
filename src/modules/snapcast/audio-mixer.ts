@@ -80,7 +80,39 @@ const POST_SILENCE_MS = 500;
 // Ezt SZÁNDÉKOSAN nem ffmpeg-filterrel (apad) oldjuk meg: egy nem támogatott
 // filter-opció az ffmpeg indulását buktatná, az pedig ELMARADT CSENGETÉST
 // jelentene. A Buffer-írás nem tud így elhasalni.
-const TAIL_SILENCE_MS = 3000;
+// KAPCSOLHATÓ (2026-09-12). A `SNAP_TAIL_SILENCE_MS` környezeti változóval
+// állítható, és **0 teljesen kikapcsolja** a tail-csendet.
+//
+// MIÉRT KAPCSOLHATÓ: a helyszíni tapasztalat szerint az eszköz-fagyások a
+// tail-csend bevezetése (2026-09-10 09:48) óta jelentkeznek. A fagyás oka
+// nincs bizonyítva, de ez az EGYETLEN érdemi viselkedésváltozás azon a
+// hangúton, és egy fagyó csengőrendszer rosszabb, mint egy darabosan
+// kicsengő hang. Így egy szerver-újraindítással, kódmódosítás nélkül
+// eldönthető, hogy tényleg ez-e:
+//
+//     (nincs beállítva)         → KIKAPCSOLVA, ez az alapértelmezés
+//     SNAP_TAIL_SILENCE_MS=3000 → a 09-10 és 09-12 közötti működés
+//
+// Megjegyzés: a tail-csend eredeti indoka (a hang vége "darabosan" állt le)
+// azóta MÁSHOGY is orvoslódott – a csend-lánc újraírásával megszűnt a nulla
+// tartalék a FIFO-n (ld. SILENCE_CHUNK). Lehet, hogy a tail-csendre már
+// nincs is szükség; ezt méréssel lehet eldönteni.
+const TAIL_SILENCE_MS = (() => {
+  const raw = process.env.SNAP_TAIL_SILENCE_MS;
+  // ALAPÉRTELMEZÉS: 0, azaz KIKAPCSOLVA (2026-09-12).
+  // A tail-csend eredeti indoka megszűnt: a job végén már NINCS rés a FIFO-n,
+  // mert ugyanaz a Node stream írja a csendet, mint a hang chunkjait – a
+  // váltás sorrendhelyes és mikroszekundumos. A helyszíni megfigyelés szerint
+  // viszont az eszköz-fagyások a tail-csend bevezetése óta jelentkeztek, ezért
+  // az alapértelmezés a kevesebb mozgó alkatrész.
+  if (raw === undefined || raw.trim() === "") return 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    console.warn(`[Mixer] érvénytelen SNAP_TAIL_SILENCE_MS="${raw}" – kikapcsolva marad`);
+    return 0;
+  }
+  return Math.round(n);
+})();
 
 // A tail-csend ugyanazt a darabolást és nulla-puffert használja, mint az
 // idle csend (ld. SILENCE_CHUNK) – a különbség csak annyi, hogy ez véges.
@@ -721,6 +753,14 @@ export class TenantAudioMixer extends EventEmitter {
    */
   private startTailSilence(jobType?: MixerJobType): void {
     this.cancelTailSilence();
+
+    // Kikapcsolva: a job vége után azonnal az idle csendlánc veszi át a szót,
+    // pontosan úgy, ahogy a tail-csend bevezetése ELŐTT történt.
+    if (TAIL_SILENCE_MS <= 0) {
+      if (!this.active) this.startSilenceLoop();
+      return;
+    }
+
     // Egyszerre csak EGY írónk lehet a FIFO-n: az idle lánc most hallgat.
     this.stopSilenceLoop();
 

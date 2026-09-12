@@ -7,7 +7,22 @@
     "strict": true,
     "esModuleInterop": true,
     "resolveJsonModule": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+
+    // Fordítási hiba esetén NE keletkezzen kimenet.
+    //
+    // MIÉRT: a `tsc` alapból akkor is kiírja a `dist/`-et, ha típushibát talál –
+    // csak nem nulla kóddal lép ki. A deploy-script `set -e` miatt ilyenkor
+    // megszakad a PM2 reload előtt, tehát a FUTÓ folyamat még a régi kódot
+    // hajtja... de a lemezen a `dist/` MÁR a hibás fordítás. A következő
+    // újraindulásnál (PM2 restart, szerver-újraindítás, másik node deployja)
+    // az hibás kód indul el.
+    //
+    // 2026-09-10-én pontosan ez történt: a 12:50-es build elbukott, a dist/
+    // felülíródott, és a hibás kód később némán élesbe került – a mixer
+    // `beginPendingStart()`-ja kivételt dobott, azaz SEMMI nem szólalt meg.
+    // Csengetés-kimaradás fordítási hibából: pontosan az, ami nem fordulhat elő.
+    "noEmitOnError": true
   },
   "include": ["src/**/*.ts", "prisma/**/*.ts"]
 }
