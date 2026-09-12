@@ -809,14 +809,20 @@ export class TenantAudioMixer extends EventEmitter {
         return;
       }
 
-      const n = Math.min(SILENCE_CHUNK_BYTES, TAIL_SILENCE_BYTES - written);
-      written += n;
-
+      // Ugyanaz az ellennyomás-minta, mint az idle csendnél: írunk, amíg a
+      // stream bírja, és csak akkor várunk `drain`-re. Egyszerre egy darabot
+      // beadva a cső kiürülne, és pont a tartalékot veszítenénk el, amiért
+      // ez az egész készült.
       try {
-        stream.write(
-          n === SILENCE_CHUNK_BYTES ? SILENCE_CHUNK : SILENCE_CHUNK.subarray(0, n),
-          () => step()
-        );
+        while (written < TAIL_SILENCE_BYTES) {
+          const n = Math.min(SILENCE_CHUNK_BYTES, TAIL_SILENCE_BYTES - written);
+          written += n;
+          const ok = stream.write(
+            n === SILENCE_CHUNK_BYTES ? SILENCE_CHUNK : SILENCE_CHUNK.subarray(0, n),
+          );
+          if (!ok) { stream.once("drain", step); return; }
+        }
+        finish();
       } catch (e: any) {
         console.warn(`[Mixer:${this.tenantId}] tail-csend írás hiba: ${e.message}`);
         finish();
@@ -841,6 +847,30 @@ export class TenantAudioMixer extends EventEmitter {
     const token = { cancelled: false };
     this.silenceLoop = token;
 
+    /*
+     * ── MIÉRT `while` ÉS NEM LÁNCOLT VISSZAHÍVÁS (2026-09-12) ──────────────
+     *
+     * Korábban `stream.write(chunk, () => step())` volt: egyszerre EGYETLEN
+     * 40 ms-os darab volt úton, a következőt csak az előző befejeződése után
+     * adtuk be. Ezzel a cső KIÜRÜL, és az előnyünk pontosan egy darab – 40 ms.
+     *
+     * Ez ugyanaz a nulla-tartalék hiba, ami miatt a `-re`-t levettük az
+     * ffmpeg-ekről, csak itt, a saját kódunkban. A következménye mérhető volt:
+     * a csengetés indulásakor a Node event-loop ~560 ms-ra elfoglalt (snapcast
+     * célzó RPC-k, Prisma-lekérdezés, process-spawn), a FIFO kiéhezett, a
+     * snapserver előretolta az időbélyeg-alapját, és minden kliens kemény
+     * újraszinkronra kényszerült:
+     *     `RESYNCING HARD 2: age -556306us`
+     * Ez a hallható "csuklás" a zene és a csengő találkozásánál.
+     *
+     * A helyes minta a Node szabványos ellennyomás-kezelése: ÍRUNK, amíg a
+     * `write()` false-t nem ad (a belső puffer eléri a highWaterMarkot), és
+     * csak akkor várunk, `drain`-re. Így a Node-puffer (64 kB) ÉS a cső is
+     * tele marad – együtt ~680 ms tartalék, ami elnyeli az ilyen szüneteket.
+     *
+     * A `SILENCE_CHUNK` megosztása több egyidejűleg sorban álló íráson
+     * biztonságos: csupa nulla, és soha senki nem módosítja.
+     */
     const step = (): void => {
       const stream = this.fifoStream;
 
@@ -850,7 +880,14 @@ export class TenantAudioMixer extends EventEmitter {
       }
 
       try {
-        stream.write(SILENCE_CHUNK, () => step());
+        // Addig töltjük, amíg a stream be nem jelzi, hogy elég.
+        while (stream.write(SILENCE_CHUNK)) {
+          if (token.cancelled || !this.running) {
+            if (this.silenceLoop === token) this.silenceLoop = null;
+            return;
+          }
+        }
+        stream.once("drain", step);
       } catch (e: any) {
         // A FIFO újranyitás alatt lehet átmenetileg írhatatlan. NEM adhatjuk
         // fel: a csend hiánya = a snapserver éhezése = koppanás minden
