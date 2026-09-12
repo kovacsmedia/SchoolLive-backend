@@ -226,8 +226,9 @@ async function dispatchSyncBellsToVP(tenantId: string): Promise<void> {
 
 // Mindkét értesítést egyszerre hívja – ezt használjuk minden módosítás után
 function notifyAllClients(tenantId: string): void {
-  // 1. Azonnali WS push az online eszközöknek
-  broadcastSyncBells(tenantId);
+  // 1. Azonnali WS push az online eszközöknek – a TELJES renddel, hogy az
+  //    ESP32 is frissüljön (ld. broadcastSyncBells indoklását).
+  void broadcastSyncBells(tenantId);
   // 2. DB queue az offline/JWT eszközöknek
   void dispatchSyncBellsToVP(tenantId);
 }

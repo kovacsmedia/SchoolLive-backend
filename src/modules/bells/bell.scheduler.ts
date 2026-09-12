@@ -57,9 +57,47 @@ function getAudioDurationMs(filePath: string): number | null {
 // Bell template vagy naptár módosításakor hívja a controller.
 // Minden online kliens azonnal frissíti a bell listáját.
 //
-export function broadcastSyncBells(tenantId: string): void {
-  console.log(`[BELLS-SCHEDULER] 📡 SYNC_BELLS broadcast → tenant=${tenantId}`);
-  SyncEngine.broadcastImmediate(tenantId, { action: "SYNC_BELLS" });
+export async function broadcastSyncBells(tenantId: string): Promise<void> {
+  /*
+   * A TELJES csengetési rendet küldjük, nem csak egy "nézz utána" jelzést.
+   *
+   * MIÉRT (2026-09-13): korábban ez egy csupasz `{ action: "SYNC_BELLS" }`
+   * üzenet volt. A Python kliensek és a webplayer erre újratöltenek HTTP-n, az
+   * ESP32 viszont CSAK NYUGTÁZZA és eldobja:
+   *     } else if (action == "SYNC_BELLS") { ok = true; }
+   * Így egy online eszköz a szerkesztés után is a RÉGI renddel maradt, egészen
+   * a következő újracsatlakozásig – és ha közben elment a hálózat, az offline
+   * csengetés a régi (vagy hiányzó) rend szerint ment. Éles hibaként pontosan
+   * ez fordult elő.
+   *
+   * Egyetlen üzenetben mindkét alakot elküldjük:
+   *   • `type: "SCHEDULE_SYNC"` + teljes tartalom → az ESP32 feldolgozza
+   *     (BellManager::onScheduleSync), és a `sounds` lista alapján a hiányzó
+   *     hangfájlokat is LETÖLTI – tehát a hangszinkron is megtörténik.
+   *   • `action: "SYNC_BELLS"`  → a Python kliensek és a webplayer
+   *     változatlanul újratöltenek.
+   *
+   * Fontos: ez a javítás a MÁR KINT LÉVŐ firmware-eket is elérli – az
+   * `onScheduleSync` régóta létezik, csak szerkesztéskor nem kapott adatot.
+   */
+  try {
+    // Dinamikus import: a bells.routes.ts innen importálja a
+    // `broadcastSyncBells`-t, tehát a statikus import körkörös lenne.
+    const { buildScheduleSyncPayload } = await import("./bells.routes");
+    const payload = await buildScheduleSyncPayload(tenantId);
+
+    console.log(`[BELLS-SCHEDULER] 📡 SCHEDULE_SYNC broadcast → tenant=${tenantId}`);
+    SyncEngine.broadcastImmediate(tenantId, {
+      ...(payload as object),
+      action: "SYNC_BELLS",
+    });
+  } catch (e) {
+    // Ha a teljes tartalom összeállítása elbukik, legalább a régi jelzés
+    // menjen ki: a HTTP-n újratöltő kliensek (Python, webplayer) így is
+    // értesülnek, és az ESP32 a következő verzió-ellenőrzésnél behozza.
+    console.error(`[BELLS-SCHEDULER] SCHEDULE_SYNC összeállítás hiba (${tenantId}):`, e);
+    SyncEngine.broadcastImmediate(tenantId, { action: "SYNC_BELLS" });
+  }
 }
 
 // ── Tick ──────────────────────────────────────────────────────────────────────
