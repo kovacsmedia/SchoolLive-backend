@@ -734,6 +734,17 @@ export class TenantAudioMixer extends EventEmitter {
     if (!this.tailSilence) return;
     this.tailSilence.cancelled = true;
     this.tailSilence = null;
+
+    /*
+     * A megszakított tail-lánc `finish()`-e SOSEM fut le, tehát az idle
+     * csendláncot sem indítaná el senki – a FIFO íratlan maradna a hívó
+     * (beginPendingStart) egy másodperces pre-silence ablakában. Ugyanaz a
+     * lyuk, mint az onFadeOutComplete "interrupted" ágában.
+     *
+     * TAIL_SILENCE_MS=0 mellett (alapértelmezés) ide nem jutunk el, mert
+     * tail-lánc sem indul – de a kapcsoló bekapcsolva se törhesse el.
+     */
+    if (!this.active) this.startSilenceLoop();
   }
 
   /**
@@ -1208,14 +1219,33 @@ export class TenantAudioMixer extends EventEmitter {
 
     this.active = null;
 
+    /*
+     * A FIFO-N MOSTANTÓL SENKI NEM ÍR – AZONNAL VISSZA KELL VENNI A SZÓT.
+     *
+     * Ez eddig CSAK a "stopped" ágban történt meg. A megszakítás ágán (ez fut
+     * le, amikor RÁDIÓ KÖZBEN JÖN A CSENGŐ) viszont a rádió-ffmpeg SIGTERM-et
+     * kapott, a csendlánc pedig még a rádió indulásakor leállt (pauseSilence).
+     * Így a FIFO-ra a következő ideig NEM ment adat:
+     *
+     *   POST_FADE_GAP_MS (200 ms) + PRE_SILENCE_MS (1000 ms)
+     *   + ffmpeg spawn/init (~50-200 ms)  ≈ 1250-1400 ms
+     *
+     * Ebből az OS pipe-puffer (64 kB) és a Node stream-puffer (16 kB) együtt
+     * ~426 ms-ot fed le, a maradék ~600-900 ms viszont VALÓDI lyuk: a
+     * snapserver időbélyeg-alapja előreugrik, a kliens pedig
+     *   "RESYNCING HARD 2: age -581541us"
+     * -gyel kemény újraszinkront futtat. Ez a csuklás a csengetés elején.
+     *
+     * A csendlánc indítása tehát MINDEN fade-out-befejezésre vonatkozik, nem
+     * csak a felhasználói STOP-ra.
+     */
+    this.startTailSilence(src.job.jobType);
+
     if (src.fadeOutReason === "stopped") {
       // User-initiated STOP_PLAYBACK: nincs resume/pause – a stopAll()/
       // stopByType() már kiürítette a queue-t és a pausedStack-et, mielőtt
       // a fade-out elindult. Csak lezárjuk a job-ot és folytatjuk a háttér-
       // silence-t (mint killActive), NEM advance-elünk a queue-ra.
-      // Tail-csenddel, hogy a fade-out vége is folytonosan csengjen ki.
-      this.startTailSilence(src.job.jobType);
-
       this.emit("source:end", {
         jobId:        src.job.id,
         jobType:      src.job.jobType,
