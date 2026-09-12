@@ -98,12 +98,23 @@ export function bellSoundDiskPath(
   filename: string,
   bellType?: string | null,
 ): { path: string; isFallback: boolean } | null {
-  const direct = [
-    path.join(bellSoundTenantDir(tenantId), filename),
-    path.join(BELL_AUDIO_DIR, filename),
-  ];
-  for (const p of direct) {
-    if (fs.existsSync(p)) return { path: p, isFallback: false };
+  /*
+   * ÜRES FÁJLNÉV = "a típus szerinti gyári default kell".
+   *
+   * Ellenőrzés nélkül a `path.join(dir, "")` magát a KÖNYVTÁRAT adja, az
+   * `fs.existsSync()` pedig igazat mond rá – a hívó tehát egy könyvtárra
+   * mutató "hangfájlt" kapott volna, `isFallback: false` jelzéssel. A
+   * lejátszás ezen elhasalt volna, azaz a csengetés elmarad. Üres névnél
+   * rögtön a fallback-ágra megyünk.
+   */
+  if (filename) {
+    const direct = [
+      path.join(bellSoundTenantDir(tenantId), filename),
+      path.join(BELL_AUDIO_DIR, filename),
+    ];
+    for (const p of direct) {
+      if (fs.existsSync(p)) return { path: p, isFallback: false };
+    }
   }
 
   // A kért fájl nincs meg – NEM maradhat el a csengetés, jön a default.

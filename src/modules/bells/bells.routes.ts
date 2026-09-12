@@ -503,6 +503,32 @@ bellsRouter.delete("/sounds/:id", authJwt, requireTenant, canEdit, async (req: R
 
   await prisma.bellSoundFile.delete({ where: { id: sound.id } });
 
+  /*
+   * LÓGÓ HIVATKOZÁSOK TAKARÍTÁSA.
+   *
+   * A törlés eddig csak a fájlt és a DB-sort vitte el – a csengetési rend
+   * bejegyzései viszont TOVÁBBRA IS erre a fájlnévre mutattak. A felület a
+   * régi nevet mutatta, tehát a felhasználó azt hitte, a választott hang van
+   * beállítva, közben mindenhol a gyári default szólt: az eszközön
+   * `HIANYZO hangfajl -> default`, a snap-ágon ugyanígy. A hiba így némán,
+   * "a régi beállítás maradt meg" formájában jelentkezett.
+   *
+   * Üresre állítjuk: a csengetés ettől nem marad el (üres `soundFile` esetén
+   * a típus szerinti gyári default szól), viszont a felület is azt mutatja,
+   * ami valóban történni fog.
+   */
+  const templates = await prisma.bellScheduleTemplate.findMany({
+    where:  { tenantId: tid(req) },
+    select: { id: true },
+  });
+  const cleared = await prisma.bellEntry.updateMany({
+    where: { templateId: { in: templates.map((t) => t.id) }, soundFile: sound.filename },
+    data:  { soundFile: "" },
+  });
+  if (cleared.count > 0) {
+    console.log(`[BELLS] '${sound.filename}' torolve – ${cleared.count} csengetes-bejegyzes allitva alapertelmezettre`);
+  }
+
   // Hangfájl törlésekor is értesítjük – a kliensek így tudnak takarítani a cache-ből
   notifyAllClients(tid(req));
 
