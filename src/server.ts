@@ -18,6 +18,7 @@ import { startOwnershipPoller }  from "./modules/cluster/tenant-ownership";
 import { SyncEngine }           from "./sync/SyncEngine";
 import usersAdminRoutes         from "./modules/users/users.admin.routes";
 import { createSnapStreamWss }  from "./modules/snapcast/snap-stream-proxy";
+import { createLiveInputWss }   from "./modules/radio/live-input.ws";
 
 // ── HTTP szerver (Express app becsomagolva) ───────────────────────────────────
 const server = http.createServer(app);
@@ -35,6 +36,7 @@ const syncWss = new WebSocketServer({
 SyncEngine.init(syncWss);
 
 const snapStreamWss = createSnapStreamWss();
+const liveInputWss  = createLiveInputWss();
 
 server.on("upgrade", (req, socket, head) => {
   let pathname = "";
@@ -52,6 +54,10 @@ server.on("upgrade", (req, socket, head) => {
   } else if (pathname === "/snap-stream") {
     snapStreamWss.handleUpgrade(req, socket, head, (ws) => {
       snapStreamWss.emit("connection", ws, req);
+    });
+  } else if (pathname === "/live-input") {
+    liveInputWss.handleUpgrade(req, socket, head, (ws) => {
+      liveInputWss.emit("connection", ws, req);
     });
   } else {
     socket.destroy();
@@ -86,6 +92,7 @@ server.listen(env.PORT, () => {
   console.log(`[Server] 🚀 API listening on port ${env.PORT}`);
   console.log(`[Server] 🔌 WebSocket ready: ws://localhost:${env.PORT}/sync`);
   console.log(`[Server] 🎧 Snap-stream WS ready: ws://localhost:${env.PORT}/snap-stream`);
+  console.log(`[Server] 🎙  Élő hangbemenet WS ready: ws://localhost:${env.PORT}/live-input`);
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────

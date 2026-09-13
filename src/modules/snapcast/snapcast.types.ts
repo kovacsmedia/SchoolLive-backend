@@ -13,7 +13,12 @@ export type SnapAudioSource =
   // ugrani, és csak ilyenkor szabad megszakítás után a megszakítás pontján
   // folytatni – egy élő adásnál mindkettő hibás lenne (ott az "ott tartunk,
   // ahol az adás most tart" a helyes viselkedés).
-  | { type: "stream"; url:  string; volume?: number; seekable?: boolean; };
+  | { type: "stream"; url:  string; volume?: number; seekable?: boolean; }
+  // Élő hangbemenet: nincs URL és nincs fájl – a forrás maga az ffmpeg
+  // stdin-je, amire a `/live-input` WebSocketről érkező WebM/Opus darabokat
+  // írjuk. A böngésző MediaRecorder-e a hangkártya alapértelmezett bemenetét
+  // (mikrofon / line-in) digitalizálja.
+  | { type: "live";   volume?: number; };
 
 export type SnapJobType = "BELL" | "TTS" | "RADIO";
 

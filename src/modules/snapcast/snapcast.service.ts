@@ -306,6 +306,14 @@ class TenantSnapEngine {
   // ── Élő RADIO-vezérlés (YouTube fül / Hangfájl könyvtár seek-sáv) ──────────
   // Vékony wrapperek a mixer megfelelő metódusaihoz, ld. audio-mixer.ts.
 
+  writeLiveChunk(chunk: Buffer): boolean {
+    return this.mixer?.writeLiveChunk(chunk) ?? false;
+  }
+
+  isLiveInputActive(): boolean {
+    return this.mixer?.isLiveInputActive() ?? false;
+  }
+
   seekRadio(positionSec: number): boolean {
     return this.mixer?.seekRadio(positionSec) ?? false;
   }
@@ -497,7 +505,20 @@ class TenantSnapEngine {
     jobId: string;
     jobType: MixerJobType;
     isResume?: boolean;
+    isLive?: boolean;
   }): void {
+    /*
+     * Élő hangbemenet: MOST lett aktív a forrás, tehát az ffmpeg friss
+     * stdin-t nyitott, ami fejléccel kezdődő WebM-folyamot vár. Szólunk a
+     * böngészőnek, hogy (újra)indítsa a felvevőt.
+     *
+     * Ez a friss indulásra ÉS minden csengetés/üzenet utáni folytatásra is
+     * lefut – mindkettőnél új ffmpeg indul, tehát új fejléc kell.
+     */
+    if (e.isLive) {
+      SnapcastService.notifyLiveInputReady(this.tenantId);
+    }
+
     const targets = this.jobTargets.get(e.jobId);
 
     // Forrás-csere: ha volt pending STOP_PLAYBACK broadcast a snap drainből,
@@ -706,7 +727,10 @@ class TenantSnapEngine {
     // jobs map-ben keressünk RADIO-t (rendszerint csak egy van egyszerre)
     for (const [, job] of this.jobs.entries()) {
       if (job.jobType !== "RADIO") continue;
-      const sourceType = job.source.type === "stream" ? "stream" : "file";
+      // Az élő hangbemenet a UI felé is "stream": folyamatos, ismeretlen
+      // hosszú forrás, nem egy kiterített fájl.
+      const sourceType =
+        job.source.type === "stream" || job.source.type === "live" ? "stream" : "file";
       return {
         name:   job.title ?? "Iskolarádió",
         source: sourceType,
@@ -767,6 +791,7 @@ function sourceToMixer(s: SnapAudioSource): MixerSource {
   if (s.type === "file")   return { type: "file",   path: s.path, volume: s.volume };
   if (s.type === "url")    return { type: "url",    url:  s.url,  volume: s.volume };
   if (s.type === "stream") return { type: "stream", url:  s.url,  volume: s.volume, seekable: s.seekable };
+  if (s.type === "live")   return { type: "live",                  volume: s.volume };
 
   throw new Error(`Ismeretlen SnapAudioSource: ${JSON.stringify(s)}`);
 }
@@ -858,6 +883,47 @@ class SnapcastServiceClass {
   // egy pusztán állapot-lekérdező/vezérlő hívásnál (pl. 1mp-enkénti poll),
   // ha a tenantnak épp nincs is betöltött engine-je (biztos nincs is mit
   // vezérelni/lekérdezni rajta).
+
+  // ── Élő hangbemenet ─────────────────────────────────────────────────────
+  //
+  // A `/live-input` WebSocket (live-input.ws.ts) ezeken keresztül tölti a
+  // böngészőből érkező hangot a tenant mixerébe.
+
+  writeLiveChunk(tenantId: string, chunk: Buffer): boolean {
+    return this.engines.get(tenantId)?.writeLiveChunk(chunk) ?? false;
+  }
+
+  isLiveInputActive(tenantId: string): boolean {
+    return this.engines.get(tenantId)?.isLiveInputActive() ?? false;
+  }
+
+  /*
+   * A felvevő vezérlése.
+   *
+   * Az élő forrás ffmpeg-je CSAK fejléccel kezdődő WebM-folyamot tud
+   * dekódolni, ezért a böngésző felvevője nem magától indul: megvárja, míg
+   * a forrás tényleg aktív lesz a mixerben, és akkor indul újra, friss
+   * fejléccel. Ugyanez történik minden csengetés/üzenet után is – ott a
+   * mixer új ffmpeg-et indít, tehát új fejléc kell.
+   *
+   * Tenantonként egy élő bemenet lehet; egy második csatlakozás kiszorítja
+   * az elsőt (ld. live-input.ws.ts).
+   */
+  private liveInputClients = new Map<string, (msg: { action: "start" }) => void>();
+
+  registerLiveInputClient(tenantId: string, onControl: (msg: { action: "start" }) => void): void {
+    this.liveInputClients.set(tenantId, onControl);
+  }
+
+  unregisterLiveInputClient(tenantId: string, onControl: (msg: { action: "start" }) => void): void {
+    if (this.liveInputClients.get(tenantId) === onControl) {
+      this.liveInputClients.delete(tenantId);
+    }
+  }
+
+  notifyLiveInputReady(tenantId: string): void {
+    this.liveInputClients.get(tenantId)?.({ action: "start" });
+  }
 
   seekRadio(tenantId: string, positionSec: number): boolean {
     return this.engines.get(tenantId)?.seekRadio(positionSec) ?? false;

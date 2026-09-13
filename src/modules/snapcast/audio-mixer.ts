@@ -182,7 +182,7 @@ const SILENCE_CHUNK = Buffer.alloc(SILENCE_CHUNK_BYTES);
 export type MixerJobType = "BELL" | "TTS" | "RADIO";
 
 export interface MixerSource {
-  type: "file" | "url" | "stream";
+  type: "file" | "url" | "stream" | "live";
   path?: string;
   url?: string;
   // Pre-gain érték 0..1 (lineáris). A `buildFfmpegArgs` egy `volume=X`
@@ -728,6 +728,41 @@ export class TenantAudioMixer extends EventEmitter {
     return null;
   }
 
+  // ── Élő hangbemenet ─────────────────────────────────────────────────────
+
+  /**
+   * Egy darab élő hang az ffmpeg stdin-jére.
+   *
+   * Akkor és CSAK akkor írunk, ha épp az élő forrás az aktív. Minden más
+   * esetben (pre-silence ablak, csengetés általi megszakítás, leállított
+   * bemenet) a darabot ELDOBJUK – nem pufferoljuk.
+   *
+   * MIÉRT NINCS PUFFER: élő hangnál a késleltetés a minőség. Egy csengetés
+   * alatt beérkező fél percnyi beszédet később lejátszani értelmetlen lenne
+   * (és fél perces csúszást hagyna maga után), ráadásul a WebM-clusterek
+   * fejléc nélkül úgyis dekódolhatatlanok egy frissen indult ffmpeg-nek.
+   * Helyette a forrás indulásakor a felvevő újraindul, és friss fejléccel
+   * küldi a MOSTANI hangot – ld. `live:ready`.
+   *
+   * @returns true, ha a darab tényleg a dekóderhez jutott.
+   */
+  writeLiveChunk(chunk: Buffer): boolean {
+    const src = this.active;
+    if (!src || src.killed) return false;
+    if (src.job.source.type !== "live") return false;
+
+    const stdin = src.proc.stdin;
+    if (!stdin || stdin.destroyed || !stdin.writable) return false;
+
+    stdin.write(chunk);
+    return true;
+  }
+
+  /** Szól-e éppen élő hangbemenet (aktív forrásként). */
+  isLiveInputActive(): boolean {
+    return this.active?.job.source.type === "live" && !this.active.killed;
+  }
+
   /** Élő tekerés: ha épp szól, azonnal újraindul az új pozícióról; ha épp
    *  user-paused, csak a mentett pozíciót módosítja (marad paused). */
   seekRadio(positionSec: number): boolean {
@@ -1098,13 +1133,31 @@ export class TenantAudioMixer extends EventEmitter {
       jobType:  job.jobType,
       title:    job.title,
       isResume: job.isResume === true,
+      isLive:   job.source.type === "live",
     });
 
     const args = this.buildFfmpegArgs(job);
 
+    // Élő bemenetnél az stdin a FORRÁS – oda írja a `/live-input` WS a
+    // böngészőtől érkező darabokat. Minden más forrásnál marad `ignore`.
+    const isLiveSource = job.source.type === "live";
     const proc = spawn(FFMPEG_BIN, args, {
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [isLiveSource ? "pipe" : "ignore", "pipe", "pipe"],
     });
+
+    if (isLiveSource && proc.stdin) {
+      /*
+       * EPIPE-védelem. Ha az ffmpeg bármiért meghal (rossz konténer, OOM,
+       * kill), a még futó WS-írások EPIPE-ot dobnának – kezeletlen 'error'
+       * eseményként ez leviszi a Node folyamatot, tehát az egész backendet.
+       * A csengetés soha nem maradhat el egy hangbemenet-hiba miatt.
+       */
+      proc.stdin.on("error", (e: any) => {
+        if (e?.code !== "EPIPE") {
+          console.warn(`[Mixer:${this.tenantId}] élő bemenet stdin hiba: ${e?.message}`);
+        }
+      });
+    }
 
     // Fade-in byte-szám: explicit override > stream default (1 sec) > 0 (nincs).
     const fadeInBytes = typeof job.fadeInMs === "number"
@@ -1400,7 +1453,12 @@ export class TenantAudioMixer extends EventEmitter {
     // A tekerhető stream (élőbe küldött YouTube-videó) viszont véges média:
     // ha egy csengetés félbeszakítja, ott kell folytatódnia, ahol abbamaradt.
     // Enélkül minden csengetés/üzenet után a videó ELEJÉRŐL indult újra.
-    const isLiveStream = src.job.source.type === "stream" && !src.job.source.seekable;
+    // Az élő hangbemenet ugyanilyen: ami a csengetés alatt elhangzik, az
+    // elveszett – a folytatás mindig a JELENLEGI hangot jelenti, nem a
+    // megszakítás pontját.
+    const isLiveStream =
+      src.job.source.type === "live" ||
+      (src.job.source.type === "stream" && !src.job.source.seekable);
     const resumeBytes = isLiveStream
       ? 0
       : (src.job.resumeBytes ?? 0)
@@ -1696,6 +1754,44 @@ export class TenantAudioMixer extends EventEmitter {
       ];
     }
 
+    if (src.type === "live") {
+      /*
+       * ÉLŐ HANGBEMENET – a konténer a csövön érkezik.
+       *
+       * A böngésző MediaRecorder-e WebM/Opus darabokat küld: az első darab
+       * az EBML-fejléc + a sáv-leírás, a továbbiak clusterek. A konténer
+       * streamelhető, tehát az ffmpeg menet közben demuxolja – de CSAK ha
+       * a fejlécet is megkapta. Ezért indul a felvevő MINDIG a forrás
+       * indulása UTÁN (ld. a `live:ready` jelzést): egy félbeesett stream
+       * közepéről érkező cluster fejléc nélkül dekódolhatatlan.
+       *
+       * A puffer-csökkentő kapcsolók a késleltetés miatt kellenek: a lánc
+       * (böngésző-felvevő → WS → ffmpeg → FIFO → snapserver → kliens) amúgy
+       * is másodperces nagyságrendű, ebből az ffmpeg-analízis fölösleges
+       * tétel. `-analyzeduration 0` + kis `-probesize`: a fejlécből azonnal
+       * kiderül minden, nem kell mintát gyűjteni hozzá.
+       */
+      return [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-fflags",
+        "+nobuffer+discardcorrupt",
+        "-flags",
+        "low_delay",
+        "-analyzeduration",
+        "0",
+        "-probesize",
+        "32768",
+        "-f",
+        "webm",
+        "-i",
+        "pipe:0",
+        "-vn",
+        ...out,
+      ];
+    }
+
     throw new Error(`Ismeretlen source: ${JSON.stringify(src)}`);
   }
 
@@ -1710,6 +1806,10 @@ export class TenantAudioMixer extends EventEmitter {
 
     if (j.source.type === "stream") {
       return `stream:${(j.source.url ?? "").slice(0, 60)}`;
+    }
+
+    if (j.source.type === "live") {
+      return "live:hangbemenet";
     }
 
     return "unknown";
