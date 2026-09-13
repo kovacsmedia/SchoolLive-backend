@@ -43,6 +43,22 @@ export async function registerPlayerDevice(req: Request, res: Response) {
     const mac = `WP-${clientId}`;
     const loginTime = new Date();
 
+    /*
+     * A webplayer-eszköz AUTOMATIKUSAN generált neve.
+     *
+     * Korábban `Webplayer – <fióknév> (WP-XXXXXXXX)` volt. Mivel a megosztott
+     * PLAYER-fiók neve maga is jellemzően "webplayer", ebből a listában
+     * "Webplayer – webplayer (WP-XXXXXXXX)" lett – a fióknév nem hordozott
+     * információt, csak duplázta a típust. A hardverazonosító önmagában is
+     * egyedivé teszi a nevet (böngészőnként külön clientId), ezért elég.
+     */
+    const hwTag       = `WP-${String(clientId).replace(/-/g, "").slice(0, 8).toUpperCase()}`;
+    const autoName    = `Webplayer (${hwTag})`;
+    // A RÉGI automatikus alak felismerése, hogy a már létező eszközöket
+    // csendben át tudjuk nevezni. Csak a generált mintára illeszkedőket –
+    // a kézzel adott neveket (pl. "Portás tablet") SOHA nem írjuk felül.
+    const legacyAutoNamePattern = /^Webplayer\s+–\s+.*\(WP-[0-9A-Z]{8}\)$/;
+
     // Ha már van Device EHHEZ a konkrét böngészőhöz (userId+tenantId+clientId)
     // → csak frissítjük. Más böngészők (más clientId) saját sorukat kapják.
     const existingDevice = await prisma.device.findFirst({
@@ -70,6 +86,16 @@ export async function registerPlayerDevice(req: Request, res: Response) {
         console.log(`[PLAYER] 🗑 ${staleIds.length} elmulasztott parancs törölve (device: ${existingDevice.id})`);
       }
 
+      // Önjavítás: a régi, automatikusan generált nevet a következő
+      // regisztrációnál lecseréljük az új alakra. Kézzel adott név érintetlen.
+      const renameTo =
+        legacyAutoNamePattern.test(existingDevice.name) && existingDevice.name !== autoName
+          ? autoName
+          : undefined;
+      if (renameTo) {
+        console.log(`[PLAYER] register: eszköznév frissítve "${existingDevice.name}" → "${renameTo}"`);
+      }
+
       await prisma.device.update({
         where: { id: existingDevice.id },
         data: {
@@ -77,33 +103,36 @@ export async function registerPlayerDevice(req: Request, res: Response) {
           ipAddress: ipAddress ?? undefined,
           lastSeenAt: loginTime,
           online: true,
+          ...(renameTo ? { name: renameTo } : {}),
         },
       });
       return res.json({ ok: true, status: "active", deviceId: existingDevice.id });
     }
 
     // Még nincs Device EHHEZ a böngészőhöz → automatikusan létrehozzuk. A
-    // PLAYER-szerep maga a jogosultság (nem kell admin-jóváhagyás). Név
-    // alapja a User displayName-je (ha nincs, az email) + a clientId-ből
-    // képzett rövid, jól olvasható azonosító (ugyanaz a "WP-XXXXXXXX" forma,
-    // amit a webplayer a saját képernyőjén is mutat) – ez teszi a nevet
-    // EGYEDIVÉ több, ugyanazzal a PLAYER-fiókkal bejelentkezett terem/gép
-    // esetén is (@@unique([tenantId, name])), ÉS ez adja a felhasználó által
-    // kért "hardverazonosító a név mellett" megjelenítést is, mindenhol
-    // (Eszközök lista, cél-választók stb.) – nincs hozzá külön frontend-kód.
+    // PLAYER-szerep maga a jogosultság (nem kell admin-jóváhagyás). A nevet
+    // az `autoName` adja (ld. fent): "Webplayer (WP-XXXXXXXX)". A clientId-ből
+    // képzett hardverazonosító teszi EGYEDIVÉ több, ugyanazzal a PLAYER-fiókkal
+    // bejelentkezett terem/gép esetén is (@@unique([tenantId, name])), és
+    // ugyanez jelenik meg mindenhol (Eszközök lista, cél-választók) – nincs
+    // hozzá külön frontend-kód.
+    //
+    // A user-lekérdezés már CSAK létezés-ellenőrzés: a névhez nem kell a
+    // fióknév.
     const owner = await prisma.user.findUnique({
       where: { id: userId },
-      select: { email: true, displayName: true },
+      select: { id: true },
     });
     if (!owner) {
       console.warn(`[PLAYER] register: user nem található (userId=${userId})`);
       return res.status(404).json({ error: "User not found" });
     }
 
-    const friendly = owner.displayName?.trim() || owner.email.split("@")[0];
-    const hwTag    = `WP-${String(clientId).replace(/-/g, "").slice(0, 8).toUpperCase()}`;
-    const primary  = `Webplayer – ${friendly} (${hwTag})`;
-    const fallback = `Webplayer – ${owner.email} (${hwTag})`;
+    // A hwTag böngészőnként egyedi, tehát a név is az. A `fallback` csak a
+    // gyakorlatilag lehetetlen ütközésre marad (ugyanaz a clientId két user
+    // alatt) – ilyenkor a teljes clientId farkát is beletesszük.
+    const primary  = autoName;
+    const fallback = `Webplayer (${hwTag}-${String(clientId).replace(/-/g, "").slice(8, 12).toUpperCase()})`;
 
     let created: { id: string } | null = null;
     for (const candidateName of [primary, fallback]) {

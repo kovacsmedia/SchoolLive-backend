@@ -36,9 +36,14 @@ export async function login(email: string, password: string, client: LoginClient
   //
   // PLAYER (megosztott webplayer-fiók, teremenként egy böngésző-példány):
   //   minden bejelentkezés ÚJ, egymást nem kiütő UserSession sort kap – a
-  //   Terem A webplayerének belépése NEM léptetheti ki a Terem B webplayerét.
-  //   Az ilyen session-t KIZÁRÓLAG a device.lifecycle.ts zárja le, ha a hozzá
-  //   tartozó Device 10 percnél régebben nem beaconolt (ld. ott).
+  //   Terem A webplayerének belépése NEM léptetheti ki a Terem B webplayerét,
+  //   és ugyanez igaz akkor is, ha UGYANAZZAL a fiókkal lépnek be máshonnan.
+  //
+  //   AKTUALIZÁLVA: a korábbi "10 perc offline után lezárjuk" szabály MÁR
+  //   NINCS (ld. device.lifecycle.ts – kivéve lett). Egy player-munkamenetet
+  //   mostantól csak ez a három dolog szüntet meg, mind SZÁNDÉKOS admin-
+  //   művelet: explicit kijelentkeztetés a Felhasználók oldalról, a user vagy
+  //   a tenant deaktiválása, illetve a 30 napja nem látott sorok takarítása.
   //
   // Mindenki más (ember-admin fiók): a régi, "single session" szemantika –
   // egy ÚJ, helyes jelszavas bejelentkezés a felhasználó ÖSSZES korábbi
