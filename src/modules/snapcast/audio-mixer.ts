@@ -189,6 +189,10 @@ export interface MixerSource {
   // filter-szegmenst illeszt be a chain elejére, így csak ezt a forrást
   // érinti. Csengetésre/üzenetekre nincs hatás (külön job-ok, külön gain).
   volume?: number;
+  // Csak `stream` forrásnál: véges, pozicionálható média (élőbe küldött
+  // YouTube-videó) vagy végtelen élő adás (internetrádió). Ld. a
+  // SnapAudioSource kommentjét.
+  seekable?: boolean;
 }
 
 export interface MixerJob {
@@ -733,6 +737,21 @@ export class TenantAudioMixer extends EventEmitter {
       const job = this.active.job;
       this.killActive("interrupted");
       this.beginPendingStart({ ...job, resumeBytes, isResume: true });
+      return true;
+    }
+
+    /*
+     * Még a PRE_SILENCE_MS pending-ablakban vagyunk.
+     *
+     * Ez nem elméleti eset: a YouTube fül "élő adásba küldés" közvetlenül az
+     * indítás után tekeri a megadott kezdőpozícióra, és a `play()` visszatér,
+     * mielőtt a forrás aktívvá válna. Enélkül az ág `false`-ot adott → a hívó
+     * 409-et kapott, a videó pedig az elejéről szólt. A pending job
+     * resumeBytes-át írjuk át – az ffmpeg így már a helyes pozícióval indul,
+     * és egy fölösleges kill+újraindítást is megspórolunk.
+     */
+    if (this.pending && this.pending.job.jobType === "RADIO") {
+      this.pending.job = { ...this.pending.job, resumeBytes, isResume: true };
       return true;
     }
 
@@ -1375,10 +1394,14 @@ export class TenantAudioMixer extends EventEmitter {
     }
 
     // Resume-bytes: file/url forrás esetén a megszakítás pontján folytatjuk
-    // (ffmpeg -ss). Stream forrás esetén resumeBytes=0 – élő stream-et
-    // újra-csatlakozással folytatunk a live pozíción (az aktuális élő adás).
-    const isStream   = src.job.source.type === "stream";
-    const resumeBytes = isStream
+    // (ffmpeg -ss). VALÓDI élő stream esetén resumeBytes=0 – azt
+    // újra-csatlakozással folytatjuk a live pozíción (az aktuális élő adás).
+    //
+    // A tekerhető stream (élőbe küldött YouTube-videó) viszont véges média:
+    // ha egy csengetés félbeszakítja, ott kell folytatódnia, ahol abbamaradt.
+    // Enélkül minden csengetés/üzenet után a videó ELEJÉRŐL indult újra.
+    const isLiveStream = src.job.source.type === "stream" && !src.job.source.seekable;
+    const resumeBytes = isLiveStream
       ? 0
       : (src.job.resumeBytes ?? 0)
         + (src.fadeOutStart !== null ? src.fadeOutStart : src.bytesWritten);
@@ -1391,8 +1414,8 @@ export class TenantAudioMixer extends EventEmitter {
 
     console.log(
       `[Mixer:${this.tenantId}] ⏸ pause: ${src.job.jobType}` +
-      (isStream
-        ? ` (stream → live resume)`
+      (isLiveStream
+        ? ` (élő stream → live resume)`
         : ` @ ${(resumeBytes / BYTES_PER_SEC).toFixed(2)}s`)
     );
 
@@ -1643,6 +1666,16 @@ export class TenantAudioMixer extends EventEmitter {
     }
 
     if (src.type === "stream" && src.url) {
+      /*
+       * A `-ss` CSAK tekerhető streamnél kerül be.
+       *
+       * Egy valódi internetrádió-adás végtelen és nem pozicionálható: ott a
+       * `-ss` vagy percekig olvasná és eldobná a beérkező hangot, vagy
+       * egyszerűen hibára futna. Egy élőbe küldött YouTube-videó viszont
+       * véges googlevideo-URL, ami HTTP range-kérésekkel pozicionálható –
+       * ott a seek-sáv tekerése enélkül csak ÚJRAINDÍTOTTA a lejátszást a
+       * videó elejéről, miközben a sáv a keresett pozíciót mutatta.
+       */
       return [
         "-hide_banner",
         "-loglevel",
@@ -1655,6 +1688,7 @@ export class TenantAudioMixer extends EventEmitter {
         "1",
         "-reconnect_delay_max",
         "5",
+        ...(src.seekable ? seek : []),
         "-i",
         src.url,
         "-vn",

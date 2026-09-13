@@ -579,7 +579,11 @@ model RadioFile {
 model RadioSchedule {
   id           String              @id @default(uuid())
   tenantId     String
-  radioFileId  String
+  // Fájl-alapú ütemezésnél kötelező, internetrádiónál NULL: ott nincs mit
+  // letölteni, élő streamet indítunk a `streamUrl`-ről.
+  radioFileId  String?
+  streamUrl    String?
+  streamTitle  String?
   targetType   TargetType
   targetId     String?
   scheduledAt  DateTime
@@ -593,7 +597,7 @@ model RadioSchedule {
   createdAt    DateTime            @default(now())
 
   tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  radioFile RadioFile @relation(fields: [radioFileId], references: [id], onDelete: Cascade)
+  radioFile RadioFile? @relation(fields: [radioFileId], references: [id], onDelete: Cascade)
   createdBy User      @relation("RadioScheduleCreatedBy", fields: [createdById], references: [id])
 
   @@index([tenantId])

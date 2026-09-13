@@ -5,7 +5,15 @@
 export type SnapAudioSource =
   | { type: "file";   path: string; volume?: number; }   // Bell: lokális fájl
   | { type: "url";    url:  string; volume?: number; }   // TTS / play-now URL
-  | { type: "stream"; url:  string; volume?: number; };  // Rádió: élő stream URL
+  // Rádió: élő stream URL.
+  //
+  // `seekable`: VÉGES, pozicionálható média (pl. a YouTube fülről élőbe
+  // küldött videó googlevideo-URL-je), szemben egy valódi, végtelen
+  // internetrádió-adással. Csak ilyenkor van értelme `-ss`-sel beljebb
+  // ugrani, és csak ilyenkor szabad megszakítás után a megszakítás pontján
+  // folytatni – egy élő adásnál mindkettő hibás lenne (ott az "ott tartunk,
+  // ahol az adás most tart" a helyes viselkedés).
+  | { type: "stream"; url:  string; volume?: number; seekable?: boolean; };
 
 export type SnapJobType = "BELL" | "TTS" | "RADIO";
 

@@ -33,6 +33,8 @@ async function tick() {
           lte: horizon,
         },
       },
+      // A radioFile internetrádió-ütemezésnél NULL – ott a streamUrl/streamTitle
+      // oszlop adja a forrást (a select nélkül is jön, skaláris mező).
       include: {
         radioFile: {
           select: { id: true, fileUrl: true, durationSec: true, originalName: true },
@@ -74,8 +76,36 @@ async function scheduleDispatch(schedule: {
   targetId:    string | null;
   scheduledAt: Date;
   endsAt:      Date | null;
-  radioFile:   { id: string; fileUrl: string; durationSec: number | null; originalName: string };
+  streamUrl:   string | null;
+  streamTitle: string | null;
+  radioFile:   { id: string; fileUrl: string; durationSec: number | null; originalName: string } | null;
 }) {
+  /*
+   * KÉTFÉLE FORRÁS, EGY ÚTVONAL.
+   *
+   * Fájl-ütemezés: letöltött mp3, ismert hosszal, a mixer `url` forrásként
+   * húzza, és magától véget ér (`persistent: false`).
+   *
+   * Internetrádió: élő stream, hossz nélkül. A mixernek `stream` forrásként
+   * kell indítani, és `persistent: true`-val, különben az első pufferszünetet
+   * a lejátszás végének venné és lekeverne. Pontosan ugyanaz a kombináció,
+   * amit a `/radio/play-stream` (azonnali indítás) használ – az ütemezett út
+   * nem térhet el tőle, különben más hangzana ütemezve, mint kézzel indítva.
+   */
+  const isStream    = !schedule.radioFile;
+  const sourceUrl   = schedule.radioFile?.fileUrl     ?? schedule.streamUrl  ?? "";
+  const sourceTitle = schedule.radioFile?.originalName ?? schedule.streamTitle ?? "Internetrádió";
+  const sourceDur   = schedule.radioFile?.durationSec ?? null;
+
+  if (!sourceUrl) {
+    console.error(`[RADIO-SCHEDULER] ${schedule.id}: nincs forrás (se fájl, se stream) → skip`);
+    await prisma.radioSchedule.updateMany({
+      where: { id: schedule.id, status: "PENDING" },
+      data:  { status: "DISPATCHED", dispatchedAt: new Date() },
+    });
+    return;
+  }
+
   const now         = Date.now();
   const scheduledMs = schedule.scheduledAt.getTime();
   const waitMs      = scheduledMs - now;
@@ -125,8 +155,8 @@ async function scheduleDispatch(schedule: {
         commandId,
         action:          "PLAY_URL",
         kind:            "RADIO",
-        url:             schedule.radioFile.fileUrl,
-        title:           schedule.radioFile.originalName,
+        url:             sourceUrl,
+        title:           sourceTitle,
         targetDeviceIds: onlineIds,
         snapcastActive:  snapOnline,
         playAtMs:        scheduledMs,
@@ -146,10 +176,10 @@ async function scheduleDispatch(schedule: {
           status:    "QUEUED" as const,
           payload: {
             action:      "PLAY_URL",
-            url:         schedule.radioFile.fileUrl,
-            durationSec: schedule.radioFile.durationSec,
-            radioFileId: schedule.radioFile.id,
-            title:       schedule.radioFile.originalName,
+            url:         sourceUrl,
+            durationSec: sourceDur,
+            radioFileId: schedule.radioFile?.id ?? null,
+            title:       sourceTitle,
             scheduledAt: schedule.scheduledAt.toISOString(),
             source:      "RADIO",
           },
@@ -167,13 +197,15 @@ async function scheduleDispatch(schedule: {
       const targetIds = await resolveDeviceIds(schedule.tenantId, schedule.targetType, schedule.targetId);
       await SnapcastService.play({
         type:               "RADIO",
-        source:             { type: "url", url: schedule.radioFile.fileUrl },
+        source:             isStream
+          ? { type: "stream", url: sourceUrl }
+          : { type: "url",    url: sourceUrl },
         tenantId:           schedule.tenantId,
-        title:              schedule.radioFile.originalName,
+        title:              sourceTitle,
         deviceIdsToUnmute:  targetIds,
-        persistent:         false,
+        persistent:         isStream,
       });
-      console.log(`[RADIO-SCHEDULER] 📻 Snapcast START: "${schedule.radioFile.originalName}" @ ${new Date().toISOString()}`);
+      console.log(`[RADIO-SCHEDULER] 📻 Snapcast START: "${sourceTitle}"${isStream ? " (stream)" : ""} @ ${new Date().toISOString()}`);
     } else {
       console.warn(`[RADIO-SCHEDULER] ⚠️ Snapserver offline: ${schedule.tenantId}`);
     }
@@ -212,7 +244,7 @@ async function scheduleDispatch(schedule: {
           SyncEngine.broadcastImmediate(schedule.tenantId, { action: "STOP_PLAYBACK" });
           console.log(
             `[RADIO-SCHEDULER] ⏹ Lejátszás vége (beállított időpont): ` +
-            `"${schedule.radioFile.originalName}" @ ${new Date().toISOString()}`
+            `"${sourceTitle}" @ ${new Date().toISOString()}`
           );
         } catch (e) {
           console.error(`[RADIO-SCHEDULER] Leállítás hiba (${schedule.id}):`, e);
