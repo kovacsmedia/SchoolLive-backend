@@ -4,7 +4,7 @@ import path from "path";
 import fs from "fs";
 import crypto from "crypto";
 import axios from "axios";
-import { execSync } from "child_process";
+import { execSync, execFile } from "child_process";
 import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
 import { requireTenant } from "../../middleware/tenant";
@@ -35,10 +35,30 @@ function probeDurationMs(filePath: string): number | null {
 export const bellsRouter = Router();
 
 const AUDIO_DIR = path.join(process.cwd(), "audio", "bells");
-// 4 MB tárhely – az ESP32-S3-N16R8 (16MB flash) particionálásában az
-// /audio LittleFS partíción kb. ennyi marad a firmware + littlefs +
-// updater partíciók mellett.
-const MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+
+/*
+ * CSENGETÉSI HANGOK TÁRHELY-KERETE — 6 MiB.
+ *
+ * A korlátot az ESP32 szabja meg, mert az tárolja helyben MINDET (offline
+ * csengetéshez). A LittleFS partíció 0x7F0000 = 8 323 072 bájt, és ebből nem
+ * minden a keret:
+ *
+ *   gyári default hangok (jelzocsengo+kibecsengo)   236 600 B
+ *   tanévnyi rend cache (MAX_FY_JSON_BYTES)          65 536 B
+ *   wifi.txt, bellfy.ver, superblock, dir-metaadat   ~12 000 B
+ *   blokk-kerekítés (4 kB-os blokkok, ~60 fájl)     ~123 000 B
+ *
+ * 6 MiB keret mellett ~19% marad szabadon. Ez azért kell, mert a LittleFS
+ * másoló-írásos: kevés szabad blokknál a szemétgyűjtés belassul, és az írás
+ * ENOSPC-vel elbukhat — a letöltés pedig `"w"`-vel, HELYBEN csonkít (nincs
+ * ideiglenes fájl), tehát egy elbukott csere csonka hangot hagyna.
+ * 7 MiB-nál már csak ~6,6% maradna: az kevés.
+ *
+ * A keret CSAK a "SCHEDULE" hangokra vonatkozik – ld. lent. Az üzenet-intro
+ * hangok nem kerülnek ki az eszközökre (buildSoundsList), tehát nem is
+ * fogyaszthatják az eszköz tárhelyét.
+ */
+const MAX_TOTAL_BYTES = 6 * 1024 * 1024;
 const DEFAULT_SOUNDS = ["jelzocsengo.mp3", "kibecsengo.mp3"];
 
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
@@ -442,9 +462,99 @@ bellsRouter.put("/calendar/:date", authJwt, requireTenant, canEdit, async (req: 
 
 // ── Hangfájlok ────────────────────────────────────────────────────────────
 
+/*
+ * MINDEN CSENGETÉSHANG MP3-KÉNT TÁROLÓDIK.
+ *
+ * MIÉRT: a hangot az eszköz OFFLINE a saját másolatából játssza le, és a
+ * lejátszók nem mindent tudnak. Az ESP32-n az ESP32-audioI2S kodekjei közül
+ * CSAK az MP3 él – az AAC/FLAC/OPUS/VORBIS ki van csonkolva (flash- és
+ * RAM-takarékosság, ld. audio_codecs_stubs.cpp). Egy feltöltött `.opus`
+ * csengetéshang tehát ONLINE szólna (a backend ffmpeg-gel streameli), OFFLINE
+ * viszont NÉMA maradna – pontosan az a hiba, amit a rendszer nem engedhet meg.
+ *
+ * A feltöltés-szűrő elfogadja az .opus-t (a Snapcast-stream maga is Opus), így
+ * a csapda adott volt. Ezért nem tiltunk, hanem KONVERTÁLUNK: bármit fel lehet
+ * tölteni, a tárolt alak mindig MP3 lesz. Mellékhaszon, hogy egy WAV nem
+ * eszi meg a 6 MiB-os keretet.
+ */
+/*
+ * KÓDOLÁSI SZABÁLY: jó minőség, de helytakarékos.
+ *
+ * VBR 5-ös minőség ≈ 130 kbps – iskolai hangosításon (kis hangszóró, zajos
+ * folyosó) ez hallhatóan nem különbözik a 192-320 kbps-től, viszont jóval
+ * kevesebb helyet foglal a 6 MiB-os keretből.
+ *
+ * Egy MÁR tömör MP3-at viszont NEM kódolunk újra: az generációs veszteség
+ * lenne érdemi nyereség nélkül. Csak akkor nyúlunk hozzá, ha a forrás nem
+ * MP3, vagy pazarlóan nagy bitrátájú.
+ */
+const MP3_VBR_QUALITY   = "5";   // ffmpeg -q:a, ~130 kbps VBR
+const MP3_KEEP_MAX_KBPS = 160;   // e fölött újrakódolunk
+
+/** A forrás kodekje és átlagos bitrátája. Hiba esetén null. */
+function probeAudio(filePath: string): Promise<{ codec: string; kbps: number } | null> {
+  return new Promise((resolve) => {
+    execFile(
+      "ffprobe",
+      ["-v", "quiet", "-select_streams", "a:0",
+       "-show_entries", "stream=codec_name:format=bit_rate",
+       "-of", "default=noprint_wrappers=1:nokey=1", filePath],
+      { timeout: 10_000 },
+      (err, stdout) => {
+        if (err) return resolve(null);
+        const lines = String(stdout).trim().split(/\r?\n/);
+        const codec = (lines[0] ?? "").trim().toLowerCase();
+        const bits  = parseInt((lines[1] ?? "").trim(), 10);
+        if (!codec) return resolve(null);
+        resolve({ codec, kbps: isFinite(bits) && bits > 0 ? Math.round(bits / 1000) : 0 });
+      },
+    );
+  });
+}
+
+function transcodeToMp3(srcPath: string): Promise<{ path: string; size: number } | null> {
+  const dir  = path.dirname(srcPath);
+  const base = path.basename(srcPath, path.extname(srcPath));
+  const out  = path.join(dir, `${base}.mp3`);
+  const tmp  = path.join(dir, `${base}.converting.mp3`);
+
+  return new Promise((resolve) => {
+    execFile(
+      "ffmpeg",
+      ["-y", "-i", srcPath, "-vn", "-codec:a", "libmp3lame", "-q:a", MP3_VBR_QUALITY, tmp],
+      { timeout: 60_000 },
+      (err) => {
+        if (err) {
+          try { fs.unlinkSync(tmp); } catch { /* nincs mit takarítani */ }
+          console.error(`[BELLS] MP3 konverzió sikertelen (${srcPath}):`, err.message);
+          return resolve(null);
+        }
+        try {
+          // A forrást csak a SIKERES konverzió után dobjuk el.
+          if (out !== srcPath) fs.unlinkSync(srcPath);
+          fs.renameSync(tmp, out);
+          resolve({ path: out, size: fs.statSync(out).size });
+        } catch (e: any) {
+          console.error(`[BELLS] MP3 konverzió utómunka hiba:`, e.message);
+          resolve(null);
+        }
+      },
+    );
+  });
+}
+
 bellsRouter.get("/sounds", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
+  /*
+   * CSAK a csengetési hangok. Az üzenet-intro hangoknak saját végpontja van
+   * (`/bells/intro-sounds`, `kind: "MESSAGE_INTRO"`).
+   *
+   * Eddig itt nem volt típus-szűrés, tehát az intro hangok megjelentek a
+   * csengetési rend Hangok fülén ÉS beleszámítottak a frontend
+   * tárhely-kijelzésébe is – pedig azok nem kerülnek ki az eszközökre,
+   * tehát nem fogyasztják az ESP32 LittleFS-ét (ld. MAX_TOTAL_BYTES).
+   */
   const sounds = await prisma.bellSoundFile.findMany({
-    where: { tenantId: tid(req) },
+    where: { tenantId: tid(req), kind: "SCHEDULE" },
     orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
   });
   res.json({ ok: true, sounds });
@@ -454,27 +564,81 @@ bellsRouter.post("/sounds", authJwt, requireTenant, canEdit, upload.single("file
   const file = (req as any).file as Express.Multer.File | undefined;
   if (!file) return res.status(400).json({ error: "No file uploaded" });
 
-  const existing  = await prisma.bellSoundFile.findMany({ where: { tenantId: tid(req) } });
+  /*
+   * ELŐBB a konverzió, UTÁNA a kvóta-ellenőrzés – a keretet a TÉNYLEGESEN
+   * tárolt (MP3) méret fogyasztja, nem a feltöltötté.
+   */
+  let storedPath = file.path;
+  let storedSize = file.size;
+  let storedName = stripAccents(fixUploadFilename(file.originalname));
+
+  const probe = await probeAudio(file.path);
+
+  /*
+   * Ha a mérés nem sikerült (ffprobe hiba), egy .mp3 kiterjesztésű fájlt
+   * MEGTARTUNK. Enélkül egy átmeneti hiba egy tökéletes MP3 feltöltését is
+   * elutasítaná – vagyis rosszabb lenne, mint a korábbi viselkedés.
+   */
+  const probeFailedOnMp3 =
+    probe === null && path.extname(storedName).toLowerCase() === ".mp3";
+
+  const isMp3     = probe?.codec === "mp3";
+  const isCompact =
+    probeFailedOnMp3 ||
+    (isMp3 && probe!.kbps > 0 && probe!.kbps <= MP3_KEEP_MAX_KBPS);
+
+  if (isCompact) {
+    console.log(`[BELLS] Megtartva: ${storedName} (mp3, ${probe!.kbps} kbps)`);
+  } else {
+    const conv = await transcodeToMp3(file.path);
+    if (!conv) {
+      try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+      return res.status(400).json({
+        error: "A hangfájlt nem sikerült MP3-ra alakítani. Kérjük, töltsön fel MP3-at.",
+      });
+    }
+    storedPath = conv.path;
+    storedSize = conv.size;
+    storedName = path.basename(storedName, path.extname(storedName)) + ".mp3";
+    console.log(
+      `[BELLS] Átkódolva: ${file.originalname} ` +
+      `(${probe?.codec ?? "?"}${probe?.kbps ? `, ${probe.kbps} kbps` : ""}, ${file.size} B) ` +
+      `→ ${storedName} (${storedSize} B)`
+    );
+  }
+
+  /*
+   * CSAK a "SCHEDULE" hangok fogyasztják a keretet.
+   *
+   * Korábban a `findMany` típusra szűrés NÉLKÜL összegzett, tehát az
+   * üzenet-intro hangok is elvették a helyet a csengetési hangok elől –
+   * pedig azok ki sem kerülnek az eszközökre (a `buildSoundsList` csak a
+   * `kind: "SCHEDULE"` sorokat küldi). A keret az ESP32 LittleFS-éről szól,
+   * tehát azt kell mérnie, ami TÉNYLEG odakerül.
+   */
+  const existing  = await prisma.bellSoundFile.findMany({
+    where: { tenantId: tid(req), kind: "SCHEDULE" },
+  });
   const totalUsed = existing.reduce((sum: number, s: any) => sum + s.sizeBytes, 0);
   const available = MAX_TOTAL_BYTES - totalUsed;
 
-  if (file.size > available) {
-    fs.unlinkSync(file.path);
+  if (storedSize > available) {
+    try { fs.unlinkSync(storedPath); } catch { /* ignore */ }
     return res.status(400).json({
-      error: `Not enough space. Available: ${Math.floor(available / 1024)}KB, needed: ${Math.floor(file.size / 1024)}KB`,
+      error: `Not enough space. Available: ${Math.floor(available / 1024)}KB, needed: ${Math.floor(storedSize / 1024)}KB`,
     });
   }
 
-  // A multer `filename` setter már ékezet-mentesítette → ugyanazt használjuk
-  // a DB-ben, hogy a lookup egyezzen a fájlrendszerrel.
-  const cleanName = stripAccents(fixUploadFilename(file.originalname));
+  // A multer `filename` setter már ékezet-mentesítette; konverzió esetén a
+  // kiterjesztés is .mp3-ra változott (ld. fent).
+  const cleanName = storedName;
   const sound = await prisma.bellSoundFile.upsert({
     where: { tenantId_filename: { tenantId: tid(req), filename: cleanName } },
-    update: { sizeBytes: file.size },
+    update: { sizeBytes: storedSize },
     create: {
       tenantId:  tid(req),
       filename:  cleanName,
-      sizeBytes: file.size,
+      sizeBytes: storedSize,
       isDefault: DEFAULT_SOUNDS.includes(cleanName),
     },
   });
