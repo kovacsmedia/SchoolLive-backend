@@ -478,23 +478,43 @@ export class TenantAudioMixer extends EventEmitter {
       return;
     }
 
-    // Magasabb prioritású hang megszakítja az aktuálisat fade-outtal.
+    /*
+     * Magasabb prioritású hang megszakítja az aktuálisat fade-outtal.
+     *
+     * A sorba PRIORITÁS SZERINT teszünk be, nem a sor elejére.
+     *
+     * MIÉRT: ha ugyanarra a pillanatra esik egy csengetés ÉS egy üzenet,
+     * mindkettő ezen az ágon jön be, amíg a rádió még fade-outol:
+     *   1) BELL  → unshift → sor: [BELL]
+     *   2) TTS   → unshift → sor: [TTS, BELL]     ← az üzenet ELÉ ugrott!
+     * Az `advance()` a sor elejéről vesz, tehát előbb szólt volna az üzenet,
+     * utána a csengetés. A kívánt sorrend viszont szigorúan prioritás szerinti:
+     * csengetés → üzenet → rádió.
+     *
+     * Az `insertByPriority` az azonos prioritásúak közt megtartja az érkezési
+     * sorrendet (a szigorúan alacsonyabb prioritású ELÉ szúr), tehát két
+     * egymás után küldött üzenet is a küldés sorrendjében szólal meg.
+     */
     if (this.active && job.priority < this.active.job.priority) {
-      this.queue.unshift(job);
+      this.insertByPriority(job);
       this.beginFadeOut();
       return;
     }
 
     // Magasabb prioritású hang felülír egy még meg nem szólalt pending jobot.
-    // A felülírt job a queue elejére kerül, hogy később még szóljon.
-    // Nem tüzelünk source:end-et, mert a job továbbra is élő — csak később indul.
+    // A felülírt job VISSZAKERÜL a sorba (prioritás szerint), hogy később még
+    // szóljon – nem vész el. Nem tüzelünk source:end-et, mert a job továbbra
+    // is élő, csak később indul.
     if (this.pending && job.priority < this.pending.job.priority) {
       const old = this.pending.job;
 
       clearTimeout(this.pending.timer);
       this.pending = null;
 
-      this.queue.unshift(old);
+      // Ugyanaz, mint fent: prioritás szerint vissza a sorba, nem az elejére.
+      // Különben egy félbehagyott üzenet a sorban VÁRAKOZÓ csengetés elé
+      // kerülne.
+      this.insertByPriority(old);
 
       console.log(
         `[Mixer:${this.tenantId}] ↩ pending átugorva magasabb prio miatt: ` +
@@ -1475,8 +1495,36 @@ export class TenantAudioMixer extends EventEmitter {
     // Semmi nincs soron: a csend-timer veszi át.
   }
 
+  /*
+   * Beszúrás a sorba: ELŐSZÖR prioritás, AZON BELÜL hossz szerint.
+   *
+   * A prioritás a durva rend (csengetés → üzenet → rádió). Az azonos
+   * prioritásúak közt viszont a RÖVIDEBB megy előre.
+   *
+   * MIÉRT: a csengetési rendbe időzíthető egy hosszabb közlemény is – az
+   * ugyanúgy BELL munka, tehát azonos prioritású egy rövid jelzőcsengővel.
+   * Ha egy percre esnek, a helyes sorrend: előbb a rövid csengetés, utána a
+   * közlemény. Fordítva a csengetés a közlemény VÉGÉIG késne.
+   *
+   * Ismeretlen hosszúságú munkát a leghosszabbnak veszünk (a sor végére kerül
+   * az azonos prioritásúak közt): a MÉRT rövid jelzés így mindig előbb szól,
+   * és egy hossz nélküli munka sem tud egy mért elé ugrani.
+   *
+   * Azonos hossznál az érkezési sorrend marad (a beszúrás csak SZIGORÚAN
+   * nagyobbak elé megy), tehát a viselkedés determinisztikus.
+   */
   private insertByPriority(job: MixerJob): void {
-    const i = this.queue.findIndex((q) => q.priority > job.priority);
+    const lenOf = (j: MixerJob): number =>
+      typeof j.durationSec === "number" && j.durationSec > 0
+        ? j.durationSec
+        : Number.POSITIVE_INFINITY;
+
+    const jobLen = lenOf(job);
+
+    const i = this.queue.findIndex(
+      (q) => q.priority > job.priority ||
+             (q.priority === job.priority && lenOf(q) > jobLen),
+    );
 
     if (i === -1) {
       this.queue.push(job);

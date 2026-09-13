@@ -10,7 +10,7 @@ import { prisma }          from "../../prisma/client";
 import { env }             from "../../config/env";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
-import { execSync }        from "child_process";
+import { execSync, execFile } from "child_process";
 import { randomUUID }      from "crypto";
 import { todayInBudapest, getBellMs, isBudapestWeekend } from "../../utils/budapest-time";
 import { isOwnedByThisNode } from "../cluster/tenant-ownership";
@@ -39,7 +39,37 @@ let _startedAtMs = Date.now();
 const _dispatched      = new Set<string>();
 const _pendingTimeouts = new Map<string, ReturnType<typeof setTimeout>[]>();
 
-// ── Hangfájl hossza ───────────────────────────────────────────────────────────
+// ── Hangfájl hossza – gyorsítótárazva, NEM blokkolva ──────────────────────────
+//
+// MIÉRT NEM execSync: ez az ütemező a backend fő eseményhurkán fut, ugyanott,
+// ahol az audio-mixer a FIFO-t írja. Egy 3 másodperces szinkron ffprobe
+// megállítaná a csendláncot, a snap kliensek pedig kemény újraszinkronba
+// esnének (ld. audio-mixer.ts FIFO-őr kommentje). Ezért async, és fájlonként
+// csak EGYSZER mérünk.
+const _durationCache = new Map<string, number | null>();
+
+function getAudioDurationMsAsync(filePath: string): Promise<number | null> {
+  const cached = _durationCache.get(filePath);
+  if (cached !== undefined) return Promise.resolve(cached);
+
+  return new Promise<number | null>((resolve) => {
+    execFile(
+      "ffprobe",
+      ["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0", filePath],
+      { timeout: 3000 },
+      (err, stdout) => {
+        let v: number | null = null;
+        if (!err) {
+          const sec = parseFloat(String(stdout).trim());
+          if (isFinite(sec) && sec > 0) v = Math.round(sec * 1000);
+        }
+        _durationCache.set(filePath, v);
+        resolve(v);
+      },
+    );
+  });
+}
+
 function getAudioDurationMs(filePath: string): number | null {
   try {
     const out = execSync(
@@ -190,7 +220,19 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
     if (waitMs < MIN_FUTURE_MS) continue;
     if (bellMs > horizon.getTime()) continue;
 
-    const dispatchKey = `${tenantId}:${todayStr}:${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}:${bell.type}`;
+    /*
+     * A dedup-kulcsban a HANGFÁJL is benne van.
+     *
+     * Korábban `tenant:nap:óra:perc:típus` volt. Ez két, UGYANARRA a percre
+     * beállított, AZONOS típusú jelzést (pl. két különböző hangú kicsengetés
+     * 10:00-kor) ugyanannak vett, és a másodikat némán eldobta.
+     *
+     * A hangfájllal kiegészítve két különböző jelzés két külön BELL munkát ad,
+     * amiket a mixer prioritás-sora egymás UTÁN játszik le (ld. audio-mixer.ts
+     * `insertByPriority`). Két teljesen azonos bejegyzés viszont továbbra is
+     * egyszer szól – az tényleg duplikátum.
+     */
+    const dispatchKey = `${tenantId}:${todayStr}:${String(bell.hour).padStart(2,"0")}:${String(bell.minute).padStart(2,"0")}:${bell.type}:${bell.soundFile ?? ""}`;
     if (_dispatched.has(dispatchKey)) continue;
     if (_pendingTimeouts.has(dispatchKey)) continue;
 
@@ -312,11 +354,23 @@ async function scheduleTenantBells(tenantId: string, now: Date, horizon: Date) {
         // klienst (rpcListClients) a saját user-volume-jukon unmute-olja –
         // függetlenül attól, hogy a kliens snap-client-id-je egyezik-e a
         // DB.Device.id-vel.
+        /*
+         * A HOSSZ átadása a sorrendezéshez.
+         *
+         * Ha ugyanarra a percre több jelzés esik (pl. egy rövid csengetés és
+         * egy hosszabb, a csengetési rendbe időzített közlemény), a mixer az
+         * AZONOS prioritásúakat hossz szerint rendezi: előbb a rövidebb.
+         * Így a csengetés megy elsőként, utána a közlemény – nem fordítva.
+         * Ld. audio-mixer.ts `insertByPriority`.
+         */
+        const durMs = await getAudioDurationMsAsync(soundPath);
+
         await SnapcastService.play({
           type:    "BELL",
           source:  { type: "file", path: soundPath },
           tenantId,
           title:   `Csengetés ${bellTimeStr}`,
+          ...(durMs ? { durationSec: durMs / 1000 } : {}),
           // deviceIdsToUnmute: undefined → minden snap-csatlakozott kliens
         });
         console.log(`[BELLS-SCHEDULER] 🔔 Snap PLAY: ${bellTimeStr} (minden csatlakozott kliens)`);
