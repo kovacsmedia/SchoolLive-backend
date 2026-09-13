@@ -287,6 +287,30 @@ export class TenantAudioMixer extends EventEmitter {
 
   private fifoStream: WriteStream | null = null;
 
+  /*
+   * FIFO-ŐR.
+   *
+   * Az invariáns: a FIFO-ra MINDEN pillanatban írnia kell valakinek – vagy egy
+   * job ffmpeg-je, vagy az idle csendlánc. Ha kiürül, a snapserver előretolja
+   * az időbélyeg-alapját, és a kliensek kemény újraszinkronra kényszerülnek.
+   *
+   * Eddig ezt ágankénti javításokkal tartottuk fenn (fade-out vége, megszakított
+   * tail-csend, job-váltás). Egy esetre viszont EGYIK sem vonatkozott: amikor
+   * egy AKTÍV job kevesebbet ad, mint a valós idő – tipikusan egy megakadó élő
+   * rádióadás. Ilyenkor a csendlánc szünetel (job fut), a job viszont nem
+   * szállít: a FIFO kiürül, és a kliens mérése szerint 11 másodperc alatt
+   * 5,6 MÁSODPERCES lemaradás gyűlt össze, végig `RESYNCING HARD 1`-gyel,
+   * üres chunk-sorral. A zene ilyenkor egyszerűen megáll.
+   *
+   * Ezért az invariánst most KÖZPONTILAG tartjuk be: ha a FIFO-ra
+   * FIFO_STALL_MS ideig semmi nem ment, betoldunk egy csenddarabot. Egészséges
+   * jobnál ez sosem tüzel (20-40 ms-onként ír), megakadásnál viszont a stream
+   * folytonos marad – élő adásnál épp ez a helyes: nem késleltetünk tartalmat,
+   * csak kitöltjük a lyukat.
+   */
+  private lastFifoWriteMs = 0;
+  private fifoGuardTimer: ReturnType<typeof setInterval> | null = null;
+
   private active: ActiveSource | null = null;
   private pending: PendingStart | null = null;
   private pausedStack: PausedSource[] = [];
@@ -356,6 +380,7 @@ export class TenantAudioMixer extends EventEmitter {
     // Idle csendlánc – nulla-PCM-et ír a FIFO-ra mindaddig, amíg nincs aktív
     // job. Ütemezés: a FIFO ellennyomása (ld. SILENCE_CHUNK).
     this.startSilenceLoop();
+    this.startFifoGuard();
 
     console.log(`[Mixer:${this.tenantId}] ▶ stream INDUL → ${this.fifoPath}`);
   }
@@ -365,6 +390,7 @@ export class TenantAudioMixer extends EventEmitter {
 
     this.running = false;
 
+    this.stopFifoGuard();
     this.stopSilenceLoop();
 
     if (this.gapTimer) {
@@ -831,6 +857,7 @@ export class TenantAudioMixer extends EventEmitter {
           const ok = stream.write(
             n === SILENCE_CHUNK_BYTES ? SILENCE_CHUNK : SILENCE_CHUNK.subarray(0, n),
           );
+          this.noteFifoWrite();
           if (!ok) { stream.once("drain", step); return; }
         }
         finish();
@@ -852,6 +879,73 @@ export class TenantAudioMixer extends EventEmitter {
    *
    * Idempotens: ha már fut egy lánc, nem indít másodikat.
    */
+  /** A FIFO-ra írás tényének jelzése – az őr ebből tudja, él-e az adatfolyam. */
+  private noteFifoWrite(): void {
+    this.lastFifoWriteMs = Date.now();
+  }
+
+  private startFifoGuard(): void {
+    if (this.fifoGuardTimer) return;
+
+    // 150 ms: egy egészséges forrás 20-40 ms-onként ír, tehát ez nem tüzel rá.
+    // A snap kliens pufferéhez (1000 ms) képest viszont bőven időben avatkozik.
+    const FIFO_STALL_MS = 150;
+
+    this.lastFifoWriteMs = Date.now();
+
+    this.fifoGuardTimer = setInterval(() => {
+      if (!this.running) return;
+
+      const stream = this.fifoStream;
+      if (!stream || stream.destroyed) return;
+
+      // Ha az idle csendlánc amúgy is ír, nincs dolgunk.
+      if (this.silenceLoop) return;
+
+      /*
+       * CSAK VALÓDI ÉHEZÉSNÉL avatkozunk be.
+       *
+       * Ha a stream Node-oldali puffere NEM üres, akkor a forrás él, csak
+       * ellennyomás alatt van (a `drain`-re vár) – ilyenkor betoldani csendet
+       * annyi lenne, mint beleírni a szóló hang közepébe. A `writableLength`
+       * nullája viszont azt jelenti: nincs mit kiírni, tehát a FORRÁS akadt
+       * meg. A cső ilyenkor még tart ~400 ms-ot, van időnk pótolni.
+       */
+      if (stream.writableLength > 0) return;
+
+      const idleMs = Date.now() - this.lastFifoWriteMs;
+      if (idleMs < FIFO_STALL_MS) return;
+
+      try {
+        // Annyi darabot toldunk be, amennyi a kiesett időt fedi – így a
+        // snapserver a valós idővel szinkronban marad.
+        const chunks = Math.min(
+          Math.max(1, Math.round(idleMs / SILENCE_CHUNK_MS)),
+          25,   // max 1 s egy körben, nehogy egy hosszú akadás burstöt adjon
+        );
+        for (let i = 0; i < chunks; i++) {
+          if (!stream.write(SILENCE_CHUNK)) break;
+        }
+        this.noteFifoWrite();
+
+        if (idleMs >= 500) {
+          console.warn(
+            `[Mixer:${this.tenantId}] ⚠️ a forras ${idleMs} ms-ig nem adott adatot ` +
+            `(${this.active?.job.jobType ?? "nincs aktiv job"}) – csenddel toltjuk`
+          );
+        }
+      } catch {
+        // A következő körben újrapróbáljuk.
+      }
+    }, 50);
+  }
+
+  private stopFifoGuard(): void {
+    if (!this.fifoGuardTimer) return;
+    clearInterval(this.fifoGuardTimer);
+    this.fifoGuardTimer = null;
+  }
+
   private startSilenceLoop(): void {
     if (this.silenceLoop) return;
 
@@ -893,11 +987,13 @@ export class TenantAudioMixer extends EventEmitter {
       try {
         // Addig töltjük, amíg a stream be nem jelzi, hogy elég.
         while (stream.write(SILENCE_CHUNK)) {
+          this.noteFifoWrite();
           if (token.cancelled || !this.running) {
             if (this.silenceLoop === token) this.silenceLoop = null;
             return;
           }
         }
+        this.noteFifoWrite();
         stream.once("drain", step);
       } catch (e: any) {
         // A FIFO újranyitás alatt lehet átmenetileg írhatatlan. NEM adhatjuk
@@ -1025,6 +1121,7 @@ export class TenantAudioMixer extends EventEmitter {
 
       const fifoExists = !!this.fifoStream;
       const ok = fifoExists ? this.fifoStream!.write(chunk) : false;
+      if (fifoExists) this.noteFifoWrite();
 
       if (isFirst) {
         console.log(
