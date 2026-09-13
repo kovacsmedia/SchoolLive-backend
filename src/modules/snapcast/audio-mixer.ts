@@ -27,6 +27,9 @@ const BYTES_PER_SEC = SAMPLE_RATE * FRAME_BYTES; // 192000 byte/s
 // ── Fade/gap paraméterek ────────────────────────────────────────────────────
 
 const FADE_OUT_BYTES = Math.round(BYTES_PER_SEC * 1.0); // 1 s fade-out (mindenre)
+// Meddig várjuk a fade-out bájtalapú lefutását, mielőtt kényszerítve zárunk.
+// Ld. ActiveSource.fadeOutTimer.
+const FADE_OUT_TIMEOUT_MS = 2500;
 // Default fade-in értékek source.type szerint:
 //   - "file" / "url" (bell, TTS, lokális rádió fájl) → 0 (azonnal teljes)
 //   - "stream"      (internet rádió)               → 1 sec
@@ -269,6 +272,18 @@ interface ActiveSource {
   // STOP_PLAYBACK (nincs resume, a queue-t a hívó már kiürítette). null,
   // amíg nincs fade-out folyamatban.
   fadeOutReason: SourceEndReason | null;
+  /*
+   * Biztonsági időzítő a fade-outhoz.
+   *
+   * A fade-out befejezését normálisan a KIMENŐ PCM-bájtok vezérlik
+   * (`bytesWritten - fadeOutStart >= FADE_OUT_BYTES`). Ez viszont
+   * feltételezi, hogy a forrás egyáltalán ad ki adatot. Egy beragadt
+   * forrás – élő hangbemenet, aminek elfogyott a táplálása, vagy egy
+   * megnémult hálózati stream – nem ad ki semmit, tehát a leállítás SOHA
+   * nem fejeződne be: az ffmpeg életben maradna, a job „szólóban" ragadna,
+   * és a felületen örökre égve maradna a „most játszik" jelzés.
+   */
+  fadeOutTimer: ReturnType<typeof setTimeout> | null;
   killed: boolean;
 }
 
@@ -314,6 +329,8 @@ export class TenantAudioMixer extends EventEmitter {
    */
   private lastFifoWriteMs = 0;
   private fifoGuardTimer: ReturnType<typeof setInterval> | null = null;
+  /** Mikor érkezett utoljára darab az élő hangbemenetről. Ld. a figyelőt. */
+  private lastLiveChunkMs = 0;
 
   private active: ActiveSource | null = null;
   private pending: PendingStart | null = null;
@@ -755,7 +772,26 @@ export class TenantAudioMixer extends EventEmitter {
     if (!stdin || stdin.destroyed || !stdin.writable) return false;
 
     stdin.write(chunk);
+    this.lastLiveChunkMs = Date.now();
     return true;
+  }
+
+  /**
+   * Van-e egyáltalán élő bemenet a mixerben – aktívan, indulóban, sorban
+   * vagy megszakítva.
+   *
+   * A `/live-input` WS bontásakor ez dönti el, kell-e leállítani a rádiót.
+   * SZÁNDÉKOSAN tágabb, mint az `isLiveInputActive`: ha a felhasználó az
+   * indítás utáni egy másodpercen belül állítja le az adást, a job még csak
+   * `pending` – a szűkebb kérdésre „nem" a válasz, és a forrás egy pillanattal
+   * később aktívvá válna egy már halott WebSocket mögött.
+   */
+  hasLiveSource(): boolean {
+    if (this.active?.job.source.type === "live" && !this.active.killed) return true;
+    if (this.pending?.job.source.type === "live") return true;
+    if (this.queue.some(j => j.source.type === "live")) return true;
+    if (this.pausedStack.some(p => p.job.source.type === "live")) return true;
+    return false;
   }
 
   /** Szól-e éppen élő hangbemenet (aktív forrásként). */
@@ -967,8 +1003,38 @@ export class TenantAudioMixer extends EventEmitter {
 
     this.lastFifoWriteMs = Date.now();
 
+    /*
+     * ÉLŐ BEMENET FIGYELŐ.
+     *
+     * Egy élő forrás ffmpeg-je `-i pipe:0`-n ül: ha a táplálás elnémul
+     * (bezárult böngészőfül, megszakadt hálózat, összeomlott felvevő), az
+     * ffmpeg nem hal meg magától – csak vár. A job ilyenkor „szólóban"
+     * ragadna, a felületen örökre égve maradna a „most játszik" jelzés, és a
+     * következő rádió-lejátszás is egy halott forrásba ütközne.
+     *
+     * A határ bőven a darabolási időköz (200 ms) fölött van: csak tényleg
+     * halott táplálásnál üt be, egy pillanatnyi hálózati akadásnál nem.
+     */
+    const LIVE_FEED_TIMEOUT_MS = 8000;
+
     this.fifoGuardTimer = setInterval(() => {
       if (!this.running) return;
+
+      const live = this.active;
+      if (
+        live &&
+        !live.killed &&
+        live.fadeOutStart === null &&
+        live.job.source.type === "live" &&
+        Date.now() - this.lastLiveChunkMs > LIVE_FEED_TIMEOUT_MS
+      ) {
+        console.warn(
+          `[Mixer:${this.tenantId}] 🎙 élő bemenet elnémult ` +
+          `(${LIVE_FEED_TIMEOUT_MS} ms) → leállítás`
+        );
+        this.stopByType("RADIO");
+        return;
+      }
 
       const stream = this.fifoStream;
       if (!stream || stream.destroyed) return;
@@ -1145,6 +1211,10 @@ export class TenantAudioMixer extends EventEmitter {
       stdio: [isLiveSource ? "pipe" : "ignore", "pipe", "pipe"],
     });
 
+    // Friss indulás/folytatás: a felvevőnek van pár száz ms-e, mire az első
+    // darab megérkezik – a figyelő ne erre tüzeljen.
+    if (isLiveSource) this.lastLiveChunkMs = Date.now();
+
     if (isLiveSource && proc.stdin) {
       /*
        * EPIPE-védelem. Ha az ffmpeg bármiért meghal (rossz konténer, OOM,
@@ -1171,6 +1241,7 @@ export class TenantAudioMixer extends EventEmitter {
       fadeInActive: fadeInBytes > 0,
       fadeInBytes,
       fadeOutStart: null,
+      fadeOutTimer: null,
       fadeOutReason: null,
       killed: false,
     };
@@ -1392,6 +1463,22 @@ export class TenantAudioMixer extends EventEmitter {
     this.active.fadeOutStart  = this.active.bytesWritten;
     this.active.fadeOutReason = reason;
 
+    /*
+     * Ha a fade-out a hangadatból nem tud lefutni (a forrás elnémult vagy
+     * beragadt), akkor is le KELL zárni. A határidő a fade hosszának bő
+     * kétszerese: normál működésnél sosem üt be, mert addigra a bájtalapú
+     * ág már rég lefutott.
+     */
+    const src = this.active;
+    src.fadeOutTimer = setTimeout(() => {
+      if (this.active !== src || src.killed) return;
+      console.warn(
+        `[Mixer:${this.tenantId}] ⏱ fade-out időtúllépés (${reason}): ` +
+        `${src.job.jobType} – a forrás nem ad adatot, kényszerített lezárás`
+      );
+      this.onFadeOutComplete(src);
+    }, FADE_OUT_TIMEOUT_MS);
+
     console.log(`[Mixer:${this.tenantId}] ↘ fade-out (${reason}): ${this.active.job.jobType}`);
   }
 
@@ -1399,6 +1486,7 @@ export class TenantAudioMixer extends EventEmitter {
     if (src.killed) return;
 
     src.killed = true;
+    if (src.fadeOutTimer) { clearTimeout(src.fadeOutTimer); src.fadeOutTimer = null; }
 
     try {
       src.proc.kill("SIGTERM");
@@ -1498,6 +1586,8 @@ export class TenantAudioMixer extends EventEmitter {
     const src = this.active;
 
     src.killed = true;
+    // Ha épp fade-out alatt lőjük ki, a biztonsági időzítő már nem kell.
+    if (src.fadeOutTimer) { clearTimeout(src.fadeOutTimer); src.fadeOutTimer = null; }
 
     // User-initiated stop esetén SIGKILL – azonnali, az ffmpeg nem tudja
     // a buffer-ét még pár száz ms-ig kiírni. Fade-out scenariókban a

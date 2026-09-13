@@ -166,10 +166,18 @@ async function handleLiveInputConnection(ws: WS, req: http.IncomingMessage): Pro
     SnapcastService.unregisterLiveInputClient(tenantId, onControl);
     if (activeByTenant.get(tenantId) === ws) {
       activeByTenant.delete(tenantId);
-      // Csak akkor állítjuk le a rádiót, ha tényleg még a mi élő bemenetünk
-      // szól – közben indulhatott netrádió vagy ütemezett lejátszás, azt nem
-      // szabad elvinnünk.
-      if (SnapcastService.isLiveInputActive(tenantId)) {
+      /*
+       * Csak akkor állítjuk le a rádiót, ha tényleg még élő bemenet van a
+       * mixerben – közben indulhatott netrádió vagy ütemezett lejátszás, azt
+       * nem szabad elvinnünk.
+       *
+       * `hasLiveSource` és NEM `isLiveInputActive`: ha a felhasználó az
+       * indítás utáni egy másodpercen belül állítja le az adást, a forrás még
+       * csak `pending`. A szűkebb kérdésre „nem" a válasz, a job viszont egy
+       * pillanattal később aktívvá válna – egy már halott WebSocket mögött,
+       * örökké élő ffmpeg-gel.
+       */
+      if (SnapcastService.hasLiveSource(tenantId)) {
         await SnapcastService.stopRadio(tenantId);
         SyncEngine.broadcastImmediate(tenantId, { action: "STOP_PLAYBACK" });
       }

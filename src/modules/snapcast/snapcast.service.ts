@@ -314,6 +314,10 @@ class TenantSnapEngine {
     return this.mixer?.isLiveInputActive() ?? false;
   }
 
+  hasLiveSource(): boolean {
+    return this.mixer?.hasLiveSource() ?? false;
+  }
+
   seekRadio(positionSec: number): boolean {
     return this.mixer?.seekRadio(positionSec) ?? false;
   }
@@ -895,6 +899,10 @@ class SnapcastServiceClass {
 
   isLiveInputActive(tenantId: string): boolean {
     return this.engines.get(tenantId)?.isLiveInputActive() ?? false;
+  }
+
+  hasLiveSource(tenantId: string): boolean {
+    return this.engines.get(tenantId)?.hasLiveSource() ?? false;
   }
 
   /*
