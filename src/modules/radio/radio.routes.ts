@@ -27,19 +27,17 @@ const storage = multer.diskStorage({
   },
 });
 
-import { stripAccents } from "../../utils/text";
+import { stripAccents, fixUploadFilename } from "../../utils/text";
 
+/*
+ * A korábbi helyi változat FELTÉTEL NÉLKÜL futtatta a latin1→utf8 átalakítást.
+ * Ez a mojibake-elt neveket megjavította, de a HELYESEN dekódoltakat (amikor a
+ * kliens RFC 5987 `filename*`-ot küld) elrontotta volna: az "ö" (U+00F6) egyetlen
+ * 0xF6 bájttá csonkul, ami érvénytelen UTF-8 → U+FFFD. A közös
+ * `fixUploadFilename()` ezért csak veszteségmentes esetben nyúl hozzá.
+ */
 function fixEncoding(name: string): string {
-  // 1) latin1→utf8 hiba-javítás (multer alapesetben latin1-ben dekódolja
-  //    a multipart filename mezőt, ha a kliens nem ad explicit utf8 jelzést)
-  // 2) ékezet-mentesítés (a SchoolLive admin UI minden fájl-/lista-nevet
-  //    ékezet nélkül tárol, hogy a downstream pipeline-okban ne legyen baj)
-  try {
-    const fixed = Buffer.from(name, "latin1").toString("utf8");
-    return stripAccents(fixed);
-  } catch {
-    return stripAccents(name);
-  }
+  return stripAccents(fixUploadFilename(name));
 }
 
 const upload = multer({

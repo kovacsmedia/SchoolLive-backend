@@ -9,7 +9,7 @@ import prisma from "../../prisma";
 import { authJwt } from "../../middleware/authJwt";
 import { requireTenant } from "../../middleware/tenant";
 import { broadcastSyncBells } from "./bell.scheduler";
-import { stripAccents } from "../../utils/text";
+import { stripAccents, fixUploadFilename } from "../../utils/text";
 import { todayInBudapest } from "../../utils/budapest-time";
 import { findDeviceByKey } from "../devices/device-key";
 import {
@@ -62,7 +62,11 @@ const storage = multer.diskStorage({
   },
   // Ékezetmentes fájlnév – a downstream eszközöknek (ESP / Python kliens /
   // snapclient) így biztosan nem lesz baja a "csengő.mp3" típusú nevekkel.
-  filename: (_req, file, cb) => cb(null, stripAccents(file.originalname)),
+  // A `fixUploadFilename` a multer latin1-dekódolását vonja vissza, MIELŐTT
+  // az ékezet-mentesítés lefutna – enélkül a "rövidített.mp3"-ból
+  // "roI\u0088viditett.mp3" lett (ld. utils/text.ts).
+  filename: (_req, file, cb) =>
+    cb(null, stripAccents(fixUploadFilename(file.originalname))),
 });
 
 const upload = multer({
@@ -463,7 +467,7 @@ bellsRouter.post("/sounds", authJwt, requireTenant, canEdit, upload.single("file
 
   // A multer `filename` setter már ékezet-mentesítette → ugyanazt használjuk
   // a DB-ben, hogy a lookup egyezzen a fájlrendszerrel.
-  const cleanName = stripAccents(file.originalname);
+  const cleanName = stripAccents(fixUploadFilename(file.originalname));
   const sound = await prisma.bellSoundFile.upsert({
     where: { tenantId_filename: { tenantId: tid(req), filename: cleanName } },
     update: { sizeBytes: file.size },
@@ -548,7 +552,8 @@ const introStorage = multer.diskStorage({
   filename:    (_req, file, cb) => {
     // Egyedi prefix-szel, hogy a több tenant ne ütközzön azonos eredeti névnél.
     // Először ékezet-mentesítés, aztán nem alfanumerikus karakter-szűrés.
-    const safe = stripAccents(file.originalname).replace(/[^a-zA-Z0-9._-]/g, "_");
+    const safe = stripAccents(fixUploadFilename(file.originalname))
+                   .replace(/[^a-zA-Z0-9._-]/g, "_");
     cb(null, `${Date.now()}_${safe}`);
   },
 });
