@@ -152,7 +152,7 @@ router.get("/schedules", authJwt, requireTenant, async (req: Request, res: Respo
 // utóbbinál a "YouTube – időzített lejátszás" szakaszt lent.
 async function createSchedule(params: {
   tid: string; uid: string; radioFileId: string;
-  targetType: string; targetId?: string | null; scheduledAt: Date;
+  targetType: string; targetId?: string | null; scheduledAt: Date; endsAt?: Date | null;
 }): Promise<
   | { ok: true; schedule: any }
   | { ok: false; status: number; error: string; conflict?: any }
@@ -193,7 +193,7 @@ async function createSchedule(params: {
     data: {
       tenantId: params.tid, createdById: params.uid, radioFileId: file.id,
       targetType: params.targetType as any, targetId: params.targetId ? String(params.targetId) : null,
-      scheduledAt: params.scheduledAt, status: "PENDING",
+      scheduledAt: params.scheduledAt, endsAt: params.endsAt ?? null, status: "PENDING",
     },
     include: { radioFile: { select: { id: true, originalName: true, durationSec: true, fileUrl: true } } },
   });
@@ -203,14 +203,31 @@ async function createSchedule(params: {
 router.post("/schedules", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
-    const { radioFileId, targetType, targetId, scheduledAt } = req.body ?? {};
+    const { radioFileId, targetType, targetId, scheduledAt, endsAt } = req.body ?? {};
     if (!radioFileId || !targetType || !scheduledAt) return res.status(400).json({ error: "radioFileId, targetType and scheduledAt are required" });
     const scheduledDate = new Date(scheduledAt);
     if (isNaN(scheduledDate.getTime())) return res.status(400).json({ error: "Invalid scheduledAt date" });
     if (scheduledDate < new Date())     return res.status(400).json({ error: "scheduledAt must be in the future" });
+
+    /*
+     * Lejátszás vége – OPCIONÁLIS.
+     *
+     * Ha a hang hosszabb, itt lekeverjük és leállítjuk. Rövidebbnél nincs
+     * hatása. Csak azt követeljük meg, hogy a kezdés UTÁN legyen – egy
+     * elgépelt, korábbi időpont némán elnyelné az egész lejátszást.
+     */
+    let endsAtDate: Date | null = null;
+    if (endsAt) {
+      endsAtDate = new Date(endsAt);
+      if (isNaN(endsAtDate.getTime())) return res.status(400).json({ error: "Invalid endsAt date" });
+      if (endsAtDate <= scheduledDate) {
+        return res.status(400).json({ error: "endsAt must be after scheduledAt" });
+      }
+    }
+
     const result = await createSchedule({
       tid: tid(req), uid: uid(req), radioFileId: String(radioFileId),
-      targetType, targetId, scheduledAt: scheduledDate,
+      targetType, targetId, scheduledAt: scheduledDate, endsAt: endsAtDate,
     });
     if (!result.ok) return res.status(result.status).json({ error: result.error, conflict: (result as any).conflict });
     return res.status(201).json({ ok: true, schedule: result.schedule });

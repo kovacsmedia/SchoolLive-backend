@@ -73,6 +73,7 @@ async function scheduleDispatch(schedule: {
   targetType:  string;
   targetId:    string | null;
   scheduledAt: Date;
+  endsAt:      Date | null;
   radioFile:   { id: string; fileUrl: string; durationSec: number | null; originalName: string };
 }) {
   const now         = Date.now();
@@ -190,6 +191,40 @@ async function scheduleDispatch(schedule: {
 
   }, snapStartDelay);
   timeouts.push(snapTimeout);
+
+  /*
+   * LEJÁTSZÁS VÉGE.
+   *
+   * Ha a felhasználó megadott végidőpontot, ott lekeverünk és leállítunk.
+   * Rövidebb hangnál ennek nincs hatása: addigra a forrás magától véget ér,
+   * a mixer pedig üresjáratba kerül – a leállítás ilyenkor no-op.
+   *
+   * SZÁNDÉKOSAN a mixer `stopRadio`-ját hívjuk (nem a `stopRadioImmediate`-et):
+   * az utóbbi MINDEN függő ütemezést is törölne, tehát egy későbbi, másik
+   * lejátszást is elvinne. Itt csak ezt az egyet zárjuk le.
+   */
+  if (schedule.endsAt) {
+    const endDelay = schedule.endsAt.getTime() - Date.now();
+    if (endDelay > 0) {
+      const endTimeout = setTimeout(async () => {
+        try {
+          await SnapcastService.stopRadio(schedule.tenantId);
+          SyncEngine.broadcastImmediate(schedule.tenantId, { action: "STOP_PLAYBACK" });
+          console.log(
+            `[RADIO-SCHEDULER] ⏹ Lejátszás vége (beállított időpont): ` +
+            `"${schedule.radioFile.originalName}" @ ${new Date().toISOString()}`
+          );
+        } catch (e) {
+          console.error(`[RADIO-SCHEDULER] Leállítás hiba (${schedule.id}):`, e);
+        }
+      }, endDelay);
+      timeouts.push(endTimeout);
+    } else {
+      console.warn(
+        `[RADIO-SCHEDULER] ${schedule.id}: a megadott vége-időpont már elmúlt – kihagyva`
+      );
+    }
+  }
 
   _pendingTimeouts.set(schedule.id, timeouts);
 }

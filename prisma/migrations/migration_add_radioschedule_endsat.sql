@@ -1,0 +1,21 @@
+-- RadioSchedule.endsAt – a lejátszás vége időpontja.
+--
+-- Ha a hang hosszabb, ebben a pillanatban lekeverjük és leállítjuk;
+-- rövidebbnél nincs hatása. Opcionális, a meglévő sorokban NULL marad.
+--
+-- FIGYELEM: a repó `prisma/migrations` mappája nem szabályos Prisma-migráció-
+-- szerkezetű (csak laza .sql fájlok), ezért a deploybeli `prisma migrate
+-- deploy` EZT NEM alkalmazza automatikusan. Kézzel kell lefuttatni a DB-n,
+-- a backend deploy ELŐTT.
+--
+-- A szerveren a `deploy` user a gazda (övé a /opt/schoollive/backend és a
+-- .env, ő indítja a PM2-t), ezért az ő nevében, az ő .env-jéből olvasva:
+--
+--   sudo -u deploy bash -lc 'cd /opt/schoollive/backend \
+--     && set -a && . ./.env && set +a \
+--     && psql "$DATABASE_URL" -c "ALTER TABLE \"RadioSchedule\" ADD COLUMN IF NOT EXISTS \"endsAt\" TIMESTAMP(3);"'
+--
+-- Az `IF NOT EXISTS` miatt többször is lefuttatható. Multi-node telepítésnél
+-- ELÉG EGY node-on: a Postgres közös.
+
+ALTER TABLE "RadioSchedule" ADD COLUMN IF NOT EXISTS "endsAt" TIMESTAMP(3);
