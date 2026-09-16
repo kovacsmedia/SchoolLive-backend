@@ -10,6 +10,16 @@ import { pendingKeyHashes } from "./devices.native.routes";
 
 const router = Router();
 
+/**
+ * A szinkron-kiigazítás felső korlátja (ms).
+ *
+ * A késleltetést a kliensek pufferelik – az ESP-n a snapcast `latency`
+ * a lejátszó gyűrűpufferét terheli (`cDacLat_ms`). A jelenlegi érték
+ * óvatos: a megfigyelt eszközkülönbségek (néhány száz ms) bőven beleférnek.
+ * Emelés előtt hardveren kell kimérni, hol kezd akadozni.
+ */
+const MAX_SYNC_OFFSET_MS = 1000;
+
 type JwtUser = {
   sub?: string;
   role?: string;
@@ -422,11 +432,21 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
     if (typeof volume !== "undefined")    data.volume    = Math.min(10, Math.max(0, Number(volume)));
     if (typeof muted !== "undefined")     data.muted     = Boolean(muted);
     if (hwModel?.trim())                  data.hwModel   = hwModel.trim();
-    // syncOffsetMs: 10ms-os lépések, korlátozzuk -2000..+2000 ms között,
-    // hogy ne lehessen őrülten nagy érték (1 sec-es snap-buffer határa).
+    /*
+     * syncOffsetMs – kliensenkénti KÉSLELTETÉS, 10 ms-os lépésekben.
+     *
+     * CSAK POZITÍV. A hang előrehozása elvileg is korlátos (nem lehet olyat
+     * lejátszani, ami még meg sem érkezett), a gyakorlatban pedig szükségtelen:
+     * az összehangolás a LEGLASSABB eszközhöz történik, az marad 0-n, a
+     * gyorsabbakat ehhez késleltetjük. Így a jitter-pufferből sem fogyasztunk.
+     *
+     * A felső korlátot a kliensek pufferelése szabja meg (az ESP-n a
+     * `cDacLat_ms` a lejátszó gyűrűpufferét terheli), ezért egy helyen
+     * állítható – emelés előtt hardveren kell kimérni.
+     */
     if (typeof syncOffsetMs !== "undefined") {
       const n = Math.round(Number(syncOffsetMs) / 10) * 10;
-      data.syncOffsetMs = Math.max(-2000, Math.min(2000, n));
+      data.syncOffsetMs = Math.max(0, Math.min(MAX_SYNC_OFFSET_MS, n));
     }
     if (typeof channelMode !== "undefined") {
       const cm = String(channelMode).toUpperCase();
@@ -435,17 +455,25 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
 
     const updated = await prisma.device.update({ where: { id }, data, select: DEVICE_SELECT });
 
-    // Ha a syncOffsetMs változott, azonnal pusholjuk a kliensnek WS-en.
+    /*
+     * A változás kiküldése a snapserver KLIENS-KÉSLELTETÉSEKÉNT.
+     *
+     * Ez a snapcast saját mechanizmusa: a szerver kliens-azonosító szerint
+     * tárolja, ServerSettings üzenetben küldi, és minden kliensfajtánk
+     * alkalmazza – az ESP firmware is. Azonnal hat, a stream nem szakad meg,
+     * tehát fülre lehet vele hangolni.
+     *
+     * A korábbi `SET_SYNC_OFFSET` WS-üzenet helyett megy: az csak az Androidra
+     * és a webre jutott el (az ESP-t soha nem érte el), ráadásul Androidon
+     * csak a stream INDULÁSAKOR hatott, weben pedig a 200 ms-os drift-tűrés
+     * elnyelte a 10 ms-es lépéseket. Emiatt tűnt hatástalannak a csúszka.
+     */
     if (typeof syncOffsetMs !== "undefined" && data.syncOffsetMs !== existing.syncOffsetMs) {
       try {
-        const { SyncEngine } = await import("../../sync/SyncEngine");
-        SyncEngine.broadcastImmediate(
-          user.tenantId!,
-          { action: "SET_SYNC_OFFSET", offsetMs: data.syncOffsetMs },
-          [id],
-        );
+        const { SnapcastService } = await import("../snapcast/snapcast.service");
+        await SnapcastService.setClientLatency(user.tenantId!, id, data.syncOffsetMs);
       } catch (e) {
-        console.error(`[device-patch] SET_SYNC_OFFSET WS hiba (${id}):`, e);
+        console.error(`[device-patch] kliens-késleltetés hiba (${id}):`, e);
       }
     }
 

@@ -33,6 +33,7 @@ import {
   rpcUnmuteAll,
   rpcListClients,
   rpcSetClientVolume,
+  rpcSetClientLatency,
 } from "./snapcast-rpc";
 import { randomUUID } from "crypto";
 
@@ -81,6 +82,19 @@ function sliderToLinearGain(slider: number): number {
 class TenantSnapEngine {
   readonly tenantId: string;
   readonly snapPort: number;
+
+  /*
+   * A rádió-hangerő csúszka-értéke (0..10).
+   *
+   * A mixer lineáris gaint tárol; abból visszaszámolni a csúszka-értéket
+   * kerekítési hibás lenne. Itt azt őrizzük, amit a felhasználó ténylegesen
+   * beállított, hogy egy MÁSIK eszközről belépő kezelő pontosan ezt az
+   * állapotot vehesse át – ne a saját, böngészőben őrzött régi értékét
+   * kényszerítse rá a rendszerre.
+   *
+   * A kezdőérték a mixer alapértelmezett 1.0 gainjének felel meg.
+   */
+  private radioVolumeSlider = 10;
   readonly fifoPath: string;
   readonly cfgPath: string;
 
@@ -139,6 +153,21 @@ class TenantSnapEngine {
         }
       })
       .catch(() => {});
+
+    /*
+     * A tárolt szinkron-kiigazítások visszaírása a snapserverre.
+     *
+     * A snapserver kliens-azonosító szerint őrzi a késleltetést, de egy friss
+     * telepítés vagy egy snapserver-újraindítás után nullával indulna. A DB-beli
+     * `Device.syncOffsetMs` az igazság forrása, innen hozzuk szinkronba.
+     *
+     * SZÁNDÉKOSAN itt és nem a lejátszás előtt: a csengetés kritikus útjára
+     * még fire-and-forget hívást sem teszünk. Kliens-változáskor nincs rá
+     * szükség, mert a snapserver megjegyzi az értéket az azonosítóhoz.
+     */
+    setTimeout(() => {
+      void SnapcastService.syncClientLatencies(this.tenantId);
+    }, 5000);
 
     this.inited = true;
   }
@@ -522,6 +551,14 @@ class TenantSnapEngine {
   /** Live radio gain forwarding a TenantAudioMixer-be. */
   setRadioGain(gain: number): void {
     this.mixer?.setRadioGain(gain);
+  }
+
+  setRadioVolumeSlider(slider: number): void {
+    this.radioVolumeSlider = Math.max(0, Math.min(10, Math.round(slider)));
+  }
+
+  getRadioVolumeSlider(): number {
+    return this.radioVolumeSlider;
   }
 
   getRadioGain(): number {
@@ -958,6 +995,69 @@ class SnapcastServiceClass {
   }
 
   /*
+   * ═══ SZINKRON-KIIGAZÍTÁS (kliensenkénti késleltetés) ═══════════════════
+   *
+   * Eltérő hardverek eltérő késleltetéssel szólalnak meg: egy régi Android
+   * több száz ms-mal késhet, egy új pedig siethet az ESP-hez képest. A
+   * snapcast erre saját, kliensenkénti `latency` mezőt ad, amit a szerver
+   * tárol és a ServerSettings üzenetben küld ki – és amit MINDEN
+   * kliensfajtánk alkalmaz, az ESP firmware is.
+   *
+   * A `Device.syncOffsetMs` az igazság forrása az adatbázisban; innen megy
+   * ki a snapserverre. POZITÍV = később szólal meg: a leglassabb eszköz
+   * marad 0-n, a gyorsabbakat ahhoz késleltetjük.
+   */
+
+  /** Egy eszköz késleltetésének kiküldése (azonnal hat, stream-megszakítás nélkül). */
+  async setClientLatency(tenantId: string, deviceId: string, latencyMs: number): Promise<boolean> {
+    const port = await this.getSnapPort(tenantId);
+    if (!port) return false;
+    try {
+      await rpcSetClientLatency(httpPort(port), deviceId, latencyMs);
+      console.log(`[Snap:${port}] ⏱ kliens-késleltetés: ${deviceId} → ${latencyMs}ms`);
+      return true;
+    } catch (e: any) {
+      // Nem végzetes: a kliens lehet, hogy épp nincs fenn. A `syncClientLatencies`
+      // a következő lejátszás előtt újra kiküldi.
+      console.warn(`[Snap:${port}] késleltetés-küldés hiba (${deviceId}): ${e?.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * A teljes tenant összehangolása: minden CSATLAKOZOTT klienshez kiküldi a
+   * DB-ben tárolt értéket.
+   *
+   * MIÉRT KELL: a snapserver a kliens-beállításokat azonosító szerint tárolja,
+   * de egy friss telepítés, egy snapserver-újraindítás vagy egy addig ismeretlen
+   * eszköz nullával indul. Ez hozza szinkronba a valóságot a DB-vel.
+   */
+  async syncClientLatencies(tenantId: string): Promise<void> {
+    const port = await this.getSnapPort(tenantId);
+    if (!port) return;
+    const http = httpPort(port);
+    try {
+      const clients = await rpcListClients(http);
+      if (clients.length === 0) return;
+
+      const ids = clients.map((c: any) => String(c.id)).filter(id => !isMonitorClient(id));
+      if (ids.length === 0) return;
+
+      const { prisma } = await import("../../prisma/client");
+      const devices = await prisma.device.findMany({
+        where:  { tenantId, id: { in: ids } },
+        select: { id: true, syncOffsetMs: true },
+      });
+
+      await Promise.allSettled(
+        devices.map(d => rpcSetClientLatency(http, d.id, d.syncOffsetMs ?? 0))
+      );
+    } catch (e: any) {
+      console.warn(`[Snap:${port}] késleltetés-összehangolás hiba: ${e?.message}`);
+    }
+  }
+
+  /*
    * Egy frissen csatlakozott monitor-kliens némításának feloldása.
    *
    * MIÉRT KELL KÜLÖN: a célzás-kizárás (ld. `applyTargetingToClients`) csak a
@@ -1037,11 +1137,16 @@ class SnapcastServiceClass {
   }
 
   async stop(tenantId: string): Promise<void> {
-    (await this.getEngine(tenantId))?.stopAll();
+    this.engines.get(tenantId)?.stopAll();
   }
 
+  /*
+   * Ugyanaz az elv, mint a `setRadioVolume`-nál: leállítani csak azt lehet,
+   * ami fut. Ha nincs betöltött engine, nincs mit leállítani – a lusta
+   * init `rpcUnmuteAll`-ja viszont itt is szétverné a célzást.
+   */
   async stopRadio(tenantId: string): Promise<void> {
-    (await this.getEngine(tenantId))?.stopByType("RADIO");
+    this.engines.get(tenantId)?.stopByType("RADIO");
   }
 
   async isSnapserverOnline(tenantId: string): Promise<boolean> {
@@ -1081,11 +1186,38 @@ class SnapcastServiceClass {
    * Csak RADIO típusú forrásokra hat – a BELL/TTS bemondások saját
    * max-loud láncon mennek.
    */
+  /*
+   * SZÁNDÉKOSAN `this.engines.get()`, NEM `getEngine()`.
+   *
+   * A `getEngine()` lustán LÉTREHOZZA és INICIALIZÁLJA az engine-t, az
+   * `init()` pedig `rpcUnmuteAll`-lal takarítja a beragadt némításokat –
+   * vagyis MINDEN klienst feloldana. Egy hangerő-állítás sosem indíthat
+   * ilyet: ha nincs betöltött engine, nincs is mit hangosítani.
+   *
+   * Enélkül egy célzott lejátszás közbeni hangerő-csúsztatás feloldotta a
+   * többi eszköz némítását, és a rádió mindenhol megszólalt. Ugyanez az elv,
+   * amiért a seek/pause/resume/state hívások is `engines.get()`-tel mennek.
+   */
   async setRadioVolume(tenantId: string, slider: number): Promise<void> {
-    const eng = await this.getEngine(tenantId);
+    const eng = this.engines.get(tenantId);
     if (!eng) return;
-    const gain = sliderToLinearGain(slider);
-    eng.setRadioGain(gain);
+    eng.setRadioGain(sliderToLinearGain(slider));
+    eng.setRadioVolumeSlider(slider);
+  }
+
+  /**
+   * Az aktuális rádió-hangerő (0..10).
+   *
+   * A kezelői felület belépéskor ezt kéri le, és ezt veszi át – enélkül a
+   * böngészőben őrzött utolsó saját értékét küldte volna ki, és egy másik
+   * gépről beállított hangerőt írt volna felül.
+   *
+   * SZÁNDÉKOSAN nem `getEngine()`: egy állapot-lekérdezés sosem indíthat
+   * lusta engine-inicializálást (az `rpcUnmuteAll`-lal járna). Ha nincs
+   * betöltött engine, a mixer alapértelmezését adjuk vissza.
+   */
+  getRadioVolume(tenantId: string): number {
+    return this.engines.get(tenantId)?.getRadioVolumeSlider() ?? 10;
   }
 
   /**

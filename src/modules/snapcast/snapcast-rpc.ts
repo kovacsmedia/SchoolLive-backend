@@ -134,6 +134,26 @@ export async function rpcSetClientVolume(
   });
 }
 
+/**
+ * Kliensenkénti késleltetés (ms) – a snapcast SAJÁT szinkron-mechanizmusa.
+ *
+ * A szerver kliens-azonosító szerint tárolja, a ServerSettings üzenetben
+ * küldi ki, és minden kliensfajta alkalmazza – az ESP firmware is
+ * (`snap_app.c`: `scSet->cDacLat_ms = server_settings_message->latency`).
+ *
+ * POZITÍV = később szólal meg. Eltérő hardverek összehangolásánál a
+ * LEGLASSABB eszköz marad 0-n, a gyorsabbakat ehhez késleltetjük – így
+ * negatív érték sosem kell, és nem fogyasztunk a jitter-pufferből.
+ */
+export async function rpcSetClientLatency(
+  httpPort: number, clientId: string, latencyMs: number
+): Promise<void> {
+  await rpcCall(httpPort, "Client.SetLatency", {
+    id: clientId,
+    latency: Math.round(latencyMs),
+  });
+}
+
 /** Minden klienst némítunk. */
 export async function rpcMuteAll(httpPort: number, percent = 0): Promise<number> {
   let n = 0;

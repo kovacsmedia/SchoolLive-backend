@@ -864,6 +864,22 @@ router.post("/play-stream", authJwt, requireTenant, async (req: Request, res: Re
 //
 // Body: { value: 0..10 } (0 = mute, 10 = 0 dB max, 1 = -24 dB, lépésenként
 //         ~-2.67 dB decibel-egyenletesen).
+// GET /radio/stream-volume – az AKTUÁLIS rádió-hangerő (0..10).
+//
+// A kezelői felület belépéskor ezt kéri le, és ezt veszi át. Enélkül a
+// böngészőben őrzött utolsó SAJÁT értékét küldte ki induláskor, és felülírta
+// egy másik gépről beállított hangerőt: ha a laptopon 7-re állították, a
+// telefonról belépve azonnal visszaugrott 10-re.
+router.get("/stream-volume", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const { SnapcastService } = await import("../snapcast/snapcast.service");
+    return res.json({ ok: true, value: SnapcastService.getRadioVolume(tid(req)) });
+  } catch (err: any) {
+    console.error("[RADIO/stream-volume GET] error:", err);
+    return res.status(500).json({ error: "Failed to read stream volume" });
+  }
+});
+
 router.put("/stream-volume", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
