@@ -35,6 +35,32 @@ import { SyncEngine } from "../../sync/SyncEngine";
 /** Egy tenanton egyszerre egy élő bemenet lehet. */
 const activeByTenant = new Map<string, WS>();
 
+/** A kliens ebből tudja, hogy nem hiba történt, hanem szándékos leállítás. */
+export const LIVE_INPUT_STOPPED_CODE = 4010;
+
+/**
+ * Az élő hangbemenet MUNKAMENETÉNEK megszüntetése kívülről.
+ *
+ * MIÉRT KELL: a „Rádió stop" a mixerben leállítja a lejátszást, de a
+ * WebSocket ettől még nyitva marad – a küldő gép tovább rögzít, a mikrofonja
+ * nyitva marad, és a felülete továbbra is adásban lévőnek mutatja magát.
+ * Egy másik eszközről (telefonról) leállítva pont az a cél, hogy az
+ * ottfelejtett adás TÉNYLEGESEN véget érjen.
+ *
+ * A bontás a kliensnél a szokásos `onclose` úton fut le, ami leállítja a
+ * felvevőt és elengedi a mikrofont.
+ *
+ * @returns true, ha volt mit leállítani.
+ */
+export function stopLiveInputSession(tenantId: string): boolean {
+  const ws = activeByTenant.get(tenantId);
+  if (!ws) return false;
+  activeByTenant.delete(tenantId);
+  try { ws.close(LIVE_INPUT_STOPPED_CODE, "Stopped by operator"); } catch { /* ignore */ }
+  console.log(`[LIVE-INPUT] ⏹ munkamenet leállítva kívülről: tenant=${tenantId}`);
+  return true;
+}
+
 const CAN_WRITE = ["SUPER_ADMIN", "TENANT_ADMIN", "ORG_ADMIN"];
 
 /**

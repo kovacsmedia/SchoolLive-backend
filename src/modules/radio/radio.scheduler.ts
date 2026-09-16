@@ -270,10 +270,25 @@ export async function stopRadioImmediate(tenantId: string): Promise<void> {
     console.log(`[RADIO-SCHEDULER] Pending timeout törölve: ${scheduleId}`);
   }
 
-  // 2. Snapcast leállítása
+  /*
+   * 2. Élő hangbemenet munkamenetének lezárása.
+   *
+   * A mixer leállítása önmagában nem elég: a küldő gép WebSocketje nyitva
+   * maradna, tovább rögzítene, és a felületén adásban lévőnek látszana.
+   * Egy ottfelejtett adást pont ezért kell tudni MÁSIK eszközről is
+   * ténylegesen befejezni. Ld. live-input.ws.ts.
+   */
+  try {
+    const { stopLiveInputSession } = await import("./live-input.ws");
+    stopLiveInputSession(tenantId);
+  } catch (e: any) {
+    console.warn(`[RADIO-SCHEDULER] élő bemenet leállítása sikertelen: ${e?.message}`);
+  }
+
+  // 3. Snapcast leállítása
   await SnapcastService.stopRadio(tenantId);
 
-  // 3. SyncEngine broadcast: STOP_PLAYBACK minden online eszközre
+  // 4. SyncEngine broadcast: STOP_PLAYBACK minden online eszközre
   SyncEngine.broadcastImmediate(tenantId, {
     action: "STOP_PLAYBACK",
   });
