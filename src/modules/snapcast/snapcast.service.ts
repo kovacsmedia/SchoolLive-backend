@@ -126,6 +126,7 @@ class TenantSnapEngine {
     await this.ensureSnapserver();
 
     this.mixer = new TenantAudioMixer(this.tenantId, this.fifoPath);
+    this.mixer.on("source:pending", (e: any) => void this.onSourcePending(e));
     this.mixer.on("source:start", (e: any) => this.onSourceStart(e));
     this.mixer.on("source:end", (e: any) => this.onSourceEnd(e));
     this.mixer.start();
@@ -407,10 +408,18 @@ class TenantSnapEngine {
           );
         }
 
-        await this.applyTargetingToClients(deviceIdsToUnmute);
-
-        // Rövid stabilizálás, hogy a mute/unmute állapot biztosan átérjen
-        // a snapserveren keresztül, mielőtt a hang elindul.
+        /*
+         * A CÉLZÁS INNEN KIKERÜLT.
+         *
+         * Itt a beütemezéskor futott volna, vagyis MÉG AZELŐTT, hogy a mixer
+         * elkezdte volna az előző forrás lekeverését – egy addig némított
+         * eszköz így meghallotta a rádió lekeverő utolsó másodpercét.
+         * Mostantól a `source:pending` eseménynél állítjuk be, amikor a
+         * FIFO-n csend van (ld. `onSourcePending`).
+         *
+         * Ez a metódus továbbra is a kliens-készenlétre vár: megvárja, hogy a
+         * célzott eszközök megjelenjenek a snapserver kliens-listáján.
+         */
         await sleep(500);
         return;
       } catch {
@@ -421,8 +430,6 @@ class TenantSnapEngine {
     console.warn(
       `[Snap:${this.snapPort}] kliens readiness timeout, lejátszás indul így is`
     );
-
-    await this.applyTargetingToClients(deviceIdsToUnmute).catch(() => {});
   }
 
   private async applyTargetingToClients(
@@ -461,7 +468,7 @@ class TenantSnapEngine {
       // Nincs explicit szűkítés → minden kliens unmute, saját user-volume-on
       await Promise.allSettled(
         clients.map((c: any) =>
-          rpcSetClientVolume(port, c.id, userPercent(c.id), false)
+          rpcSetClientVolume(port, c.id, isMonitorClient(c.id) ? 100 : userPercent(c.id), false)
         )
       );
 
@@ -471,6 +478,24 @@ class TenantSnapEngine {
 
     await Promise.allSettled(
       clients.map((c: any) => {
+        /*
+         * A MONITOR SOHA NEM NÉMÍTHATÓ.
+         *
+         * A kezelői felület monitorozása egy külön snap-kliens
+         * (`monitor-…` azonosítóval), aminek a dolga ÉPP AZ, hogy a teljes
+         * kevert kimenetet hallja – függetlenül attól, melyik eszközökre megy
+         * a lejátszás. Célzott eszköznek sosem számít, tehát enélkül minden
+         * célzás elnémítaná.
+         *
+         * És ez nem csak halkítás: a snapserver a némított kliensnek NEM KÜLD
+         * hangcsomagot. Mérés: némított monitoron 10 másodperc alatt 0 db
+         * WireChunk érkezett a kodek-fejléc után, némítatlanon 500 db.
+         * Ugyanez a magyarázata annak, hogy a nem célzott eszközök is némák –
+         * ott ez a kívánt működés.
+         */
+        if (isMonitorClient(c.id)) {
+          return rpcSetClientVolume(port, c.id, 100, false);
+        }
         const shouldPlay = wanted.has(c.id);
         return rpcSetClientVolume(
           port,
@@ -504,6 +529,24 @@ class TenantSnapEngine {
   }
 
   // ── Eseményekre reagálás ────────────────────────────────────────────────
+
+  /**
+   * A célzás (mute/unmute) beállítása a pre-silence ablak elején.
+   *
+   * Ekkor az előző forrás lekeverése már lefutott, az új forrás pedig még nem
+   * szólal meg – a FIFO-n csend van. Így egy addig némított eszköz nem hallja
+   * bele az előző lejátszás lekeverő végét, egy most némítandó pedig nem
+   * veszíti el a saját lekeverését.
+   */
+  private async onSourcePending(e: { jobId: string; jobType: MixerJobType }): Promise<void> {
+    const targets = this.jobTargets.get(e.jobId);
+    try {
+      await this.applyTargetingToClients(targets);
+    } catch (err: any) {
+      // Nem végzetes: az `onSourceStart` 0/500/1500 ms-nál újracélzza.
+      console.warn(`[Snap:${this.snapPort}] pre-silence célzás hiba: ${err?.message}`);
+    }
+  }
 
   private onSourceStart(e: {
     jobId: string;
@@ -791,6 +834,15 @@ class TenantSnapEngine {
   }
 }
 
+/**
+ * A kezelői felület monitorozó snap-kliense (ld. `MonitorPill.tsx`).
+ * Az azonosítót a böngésző generálja `monitor-` előtaggal; Device.id-vel
+ * nem ütközhet (azok UUID-k).
+ */
+export function isMonitorClient(clientId: string): boolean {
+  return typeof clientId === "string" && clientId.startsWith("monitor-");
+}
+
 function sourceToMixer(s: SnapAudioSource): MixerSource {
   if (s.type === "file")   return { type: "file",   path: s.path, volume: s.volume };
   if (s.type === "url")    return { type: "url",    url:  s.url,  volume: s.volume };
@@ -903,6 +955,41 @@ class SnapcastServiceClass {
 
   hasLiveSource(tenantId: string): boolean {
     return this.engines.get(tenantId)?.hasLiveSource() ?? false;
+  }
+
+  /*
+   * Egy frissen csatlakozott monitor-kliens némításának feloldása.
+   *
+   * MIÉRT KELL KÜLÖN: a célzás-kizárás (ld. `applyTargetingToClients`) csak a
+   * KÖVETKEZŐ lejátszás indulásakor futna le. Ha viszont a monitor egy már
+   * szóló rádió közben csatlakozik, addig a snapserverben tárolt – korábbi
+   * célzásból ottmaradt – néma állapot él, és a szerver egyetlen hangcsomagot
+   * sem küld neki.
+   *
+   * A kliens csak a snap-HELLO feldolgozása után jelenik meg a szerver
+   * listájában, ezért néhányszor újrapróbáljuk.
+   */
+  async unmuteMonitorClient(tenantId: string, clientId: string): Promise<boolean> {
+    if (!isMonitorClient(clientId)) return false;
+    const port = await this.getSnapPort(tenantId);
+    if (!port) return false;
+    const http = httpPort(port);
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const clients = await rpcListClients(http);
+        if (clients.some((c: any) => String(c.id) === clientId)) {
+          await rpcSetClientVolume(http, clientId, 100, false);
+          console.log(`[Snap:${port}] 🎧 monitor feloldva: ${clientId}`);
+          return true;
+        }
+      } catch (e: any) {
+        console.warn(`[Snap:${port}] monitor feloldás hiba: ${e?.message}`);
+      }
+      await new Promise(r => setTimeout(r, 400));
+    }
+    console.warn(`[Snap:${port}] 🎧 a monitor nem jelent meg a kliens-listán: ${clientId}`);
+    return false;
   }
 
   /*

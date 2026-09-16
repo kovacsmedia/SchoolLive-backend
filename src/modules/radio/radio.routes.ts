@@ -1143,3 +1143,32 @@ router.post("/stations/schedule", authJwt, requireTenant, async (req: Request, r
     return res.status(500).json({ error: "Failed to schedule internet radio" });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MONITOROZÁS – a kezelői felület snap-kliensének feloldása
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A monitor (ld. frontend `MonitorPill.tsx`) külön snap-kliensként csatlakozik,
+// hogy a kezelő a saját gépén hallja a TELJES kevert kimenetet. Célzott
+// eszköznek sosem számít, ezért egy korábbi célzás némán ottfelejthette
+// némítva – a snapserver pedig a némított kliensnek egyetlen hangcsomagot sem
+// küld. Ezt oldja fel a kliens csatlakozásakor.
+router.post("/monitor/unmute", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    const { clientId } = req.body ?? {};
+    if (typeof clientId !== "string" || !clientId) {
+      return res.status(400).json({ error: "clientId kötelező" });
+    }
+    const { SnapcastService, isMonitorClient } = await import("../snapcast/snapcast.service");
+    // Csak monitor-klienst enged feloldani: egy valódi eszköz némítása a
+    // célzás dolga, azt innen felülírni targeting-kerülő út lenne.
+    if (!isMonitorClient(clientId)) {
+      return res.status(400).json({ error: "csak monitor-kliens oldható fel" });
+    }
+    const ok = await SnapcastService.unmuteMonitorClient(tid(req), clientId);
+    return res.json({ ok });
+  } catch (err: any) {
+    console.error("[monitor/unmute]", err?.message);
+    return res.status(500).json({ error: "Failed to unmute monitor client" });
+  }
+});

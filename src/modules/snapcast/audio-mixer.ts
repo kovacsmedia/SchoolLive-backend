@@ -573,6 +573,25 @@ export class TenantAudioMixer extends EventEmitter {
       `[Mixer:${this.tenantId}] ⏳ pre-silence ${PRE_SILENCE_MS}ms: ${job.jobType} | ${this.desc(job)}`
     );
 
+    /*
+     * A CÉLZÁS (mute/unmute) VÁLTÁSÁNAK PONTJA.
+     *
+     * Ide azért kell esemény, mert ez az EGYETLEN pillanat, amikor a FIFO-n
+     * garantáltan csend van: az előző forrás lekeverése már befejeződött
+     * (a `beginPendingStart` az `advance()`-ből jön, ami a fade-out után fut),
+     * az új forrás pedig csak PRE_SILENCE_MS múlva szólal meg.
+     *
+     * Korábban a célzás a beütemezéskor futott – jóval a lekeverés ELŐTT.
+     * Emiatt egy addig némított eszköz a csengetés előtt feloldódott, és
+     * meghallotta a rádió utolsó másodpercét, pont a lekeverő részt.
+     *
+     * A PRE_SILENCE_MS egyben biztonsági ráhagyás is: a némítás-feloldás
+     * ennyivel az első hangminta előtt megy ki, tehát a snapserver időben
+     * elkezdi küldeni a hangot az újonnan feloldott kliensnek (a némított
+     * kliens NEM kap hangcsomagot), és a csengetés eleje nem csorbul.
+     */
+    this.emit("source:pending", { jobId: job.id, jobType: job.jobType });
+
     const timer = setTimeout(() => {
       // Védelem: ha közben leálltunk vagy a pending kicserélődött, ne indítsunk.
       if (!this.running) return;
