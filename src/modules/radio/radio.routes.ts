@@ -535,7 +535,20 @@ router.get("/snap-playing", authJwt, requireTenant, async (req: Request, res: Re
   try {
     const { SnapcastService } = await import("../snapcast/snapcast.service");
     const playing = SnapcastService.getRadioPlaying(tid(req));
-    return res.json({ ok: true, playing });
+    /*
+     * `liveInput`: megy-e ÉPPEN élő hangbemenet a tenanton.
+     *
+     * A kezelői felület monitorozás-gombja ebből tudja, hogy figyelmeztetnie
+     * kell-e gerjedésre (a mikrofon és a monitorozott hangszóró tipikusan
+     * ugyanazon a gépen van). SZÁNDÉKOSAN külön mező, nem a `playing.name`
+     * szövegére illesztünk: az a felhasználó által is átírható cím, és
+     * nyelvfüggő lenne.
+     */
+    return res.json({
+      ok: true,
+      playing,
+      liveInput: SnapcastService.isLiveInputActive(tid(req)),
+    });
   } catch (err) {
     console.error(err);
     return res.status(500).json({ error: "Failed to fetch snap-playing state" });
