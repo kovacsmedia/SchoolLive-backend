@@ -42,7 +42,18 @@ function fixEncoding(name: string): string {
 
 const upload = multer({
   storage,
-  limits: { fileSize: 200 * 1024 * 1024 },
+  /*
+   * 500 MB.
+   *
+   * Az élő adás felvétele Opus 192 kbps-en ≈ 1,4 MB/perc, tehát ez
+   * nagyjából 6 óra összefüggő felvételnek felel meg. A korábbi 200 MB
+   * (~2 óra) egy hosszabb rendezvény közvetítésénél kevés lett volna.
+   *
+   * FIGYELEM: a fordított proxy (nginx) `client_max_body_size` értékének is
+   * legalább ekkorának kell lennie, különben a kérés MÁR IDE SEM JUT EL,
+   * és a kliens 413-at kap.
+   */
+  limits: { fileSize: 500 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     // .opus KÜLÖN felvéve: a Snapcast-sugárzás maga is Opus-kódekkel megy
     // (ld. snapcast.service.ts pipe-forrás `codec=opus`), ezért natívan

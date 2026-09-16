@@ -39,7 +39,11 @@ const corsOptions: cors.CorsOptions = {
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 app.use(express.json());
-app.use(express.urlencoded({ extended: true, limit: "200mb" }));
+// A rádió-feltöltés korlátja 500 MB (ld. radio.routes.ts) – a body-parser
+// korlátja nem lehet kisebb nála. A fájlfeltöltés ugyan multipart, amit a
+// multer kezel, de az urlencoded korlát együtt mozogjon vele, hogy ne
+// maradjon egy rejtett, kisebb plafon a láncban.
+app.use(express.urlencoded({ extended: true, limit: "500mb" }));
 app.use("/devices/native", nativeRoutes);
 
 // ── Alap health + időszinkron ─────────────────────────────────────────────────
