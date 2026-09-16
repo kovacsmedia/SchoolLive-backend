@@ -1550,6 +1550,24 @@ export class TenantAudioMixer extends EventEmitter {
       });
 
       console.log(`[Mixer:${this.tenantId}] ⏹ fade-out kész (stopped): ${src.job.jobType}`);
+
+      /*
+       * … DE HA KÖZBEN ÚJ JOB ÉRKEZETT, AZT EL KELL INDÍTANI.
+       *
+       * A fenti feltevés – „a queue üres, mert a stopByType kiürítette" –
+       * csak a leállítás PILLANATÁBAN igaz. Az állomásváltás viszont pont
+       * így néz ki: a `/radio/play-stream` előbb `stopRadio`-t hív, majd
+       * azonnal beteszi az új állomást – az tehát a MÉG FUTÓ lekeverés
+       * alatt kerül a sorba. Enélkül ott ragadt örökre: a régi adás
+       * elhallgatott, az új sosem indult el, a felület viszont sikeres
+       * indításnak látta (a HTTP-válasz rendben volt).
+       *
+       * A valódi leállításnál a sor üres, tehát ez az ág nem fut le.
+       */
+      if (this.queue.length > 0 && !this.pending && !this.active) {
+        console.log(`[Mixer:${this.tenantId}] ↪ leállítás közben érkezett job – indítás`);
+        this.advance();
+      }
       return;
     }
 

@@ -553,10 +553,29 @@ bellsRouter.get("/sounds", authJwt, requireTenant, canEdit, async (req: Request,
    * tárhely-kijelzésébe is – pedig azok nem kerülnek ki az eszközökre,
    * tehát nem fogyasztják az ESP32 LittleFS-ét (ld. MAX_TOTAL_BYTES).
    */
-  const sounds = await prisma.bellSoundFile.findMany({
+  const rows = await prisma.bellSoundFile.findMany({
     where: { tenantId: tid(req), kind: "SCHEDULE" },
     orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
   });
+
+  /*
+   * A LEJÁTSZÁSI URL A SZERVERTŐL JÖN.
+   *
+   * A feltöltések tenant-szeparált könyvtárba kerülnek
+   * (`audio/bells/<tenantId>/…`), a régebbi hangok viszont még a közös,
+   * lapos `audio/bells/` alatt vannak. Melyik hol van, azt csak a szerver
+   * tudja – a `bellSoundUrlPath` mindkettőt kezeli.
+   *
+   * A felület korábban kézzel, mindig laposan rakta össze az URL-t, ezért egy
+   * FRISSEN feltöltött hang belehallgatása 404-et kapott: a lejátszó 0:00-t
+   * mutatott és néma maradt. A régiek működtek, ezért nem tűnt fel hamarabb.
+   * Ugyanezt az útvonalat kapják az eszközök is a `/bells/sync`-ben.
+   */
+  const sounds = rows.map((s: any) => ({
+    ...s,
+    url: bellSoundUrlPath(tid(req), s.filename),
+  }));
+
   res.json({ ok: true, sounds });
 });
 
