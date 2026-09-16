@@ -444,9 +444,16 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
      * `cDacLat_ms` a lejátszó gyűrűpufferét terheli), ezért egy helyen
      * állítható – emelés előtt hardveren kell kimérni.
      */
+    // Tipizált helyi változó: a `data` értékei `unknown`-ok, abból
+    // visszaolvasva nem adható át számot váró hívásnak.
+    let nextSyncOffsetMs: number | null = null;
     if (typeof syncOffsetMs !== "undefined") {
-      const n = Math.round(Number(syncOffsetMs) / 10) * 10;
-      data.syncOffsetMs = Math.max(0, Math.min(MAX_SYNC_OFFSET_MS, n));
+      const raw = Number(syncOffsetMs);
+      if (Number.isFinite(raw)) {
+        const n = Math.round(raw / 10) * 10;
+        nextSyncOffsetMs = Math.max(0, Math.min(MAX_SYNC_OFFSET_MS, n));
+        data.syncOffsetMs = nextSyncOffsetMs;
+      }
     }
     if (typeof channelMode !== "undefined") {
       const cm = String(channelMode).toUpperCase();
@@ -468,10 +475,10 @@ router.patch("/:id", authJwt, requireTenant, async (req, res) => {
      * csak a stream INDULÁSAKOR hatott, weben pedig a 200 ms-os drift-tűrés
      * elnyelte a 10 ms-es lépéseket. Emiatt tűnt hatástalannak a csúszka.
      */
-    if (typeof syncOffsetMs !== "undefined" && data.syncOffsetMs !== existing.syncOffsetMs) {
+    if (nextSyncOffsetMs !== null && nextSyncOffsetMs !== existing.syncOffsetMs) {
       try {
         const { SnapcastService } = await import("../snapcast/snapcast.service");
-        await SnapcastService.setClientLatency(user.tenantId!, id, data.syncOffsetMs);
+        await SnapcastService.setClientLatency(user.tenantId!, id, nextSyncOffsetMs);
       } catch (e) {
         console.error(`[device-patch] kliens-késleltetés hiba (${id}):`, e);
       }
