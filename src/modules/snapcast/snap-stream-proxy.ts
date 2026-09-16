@@ -60,8 +60,26 @@ async function handleSnapStreamConnection(
     return;
   }
 
-  const tenantId: string | undefined = payload.tenantId ?? payload.tid;
   const userId: string | undefined = payload.sub;
+  const role:   string              = payload.role ?? "";
+
+  /*
+   * A tenant feloldása.
+   *
+   * A lejátszó-felhasználók (PLAYER) tokenjében benne van a tenantId – náluk
+   * ez dönt, és a kliens által küldött paramétert FIGYELMEN KÍVÜL hagyjuk:
+   * senki nem hallgathatja bele egy másik intézmény hangját azzal, hogy
+   * átírja az URL-t.
+   *
+   * A SUPER_ADMIN viszont tenant nélküli tokennel dolgozik, az aktív
+   * intézményt a felületen választja ki (ld. `resolveTenantId` a frontenden,
+   * ami az `x-tenant-id` fejlécet is ebből tölti). WebSocketre fejlécet nem
+   * tudunk tenni, ezért nála – és CSAK nála – a query-paraméter érvényes.
+   */
+  const claimTenant: string | undefined = payload.tenantId ?? payload.tid;
+  const queryTenant = url.searchParams.get("tenantId") ?? "";
+  const tenantId: string | undefined =
+    claimTenant ?? (role === "SUPER_ADMIN" && queryTenant ? queryTenant : undefined);
 
   if (!tenantId) {
     ws.close(4003, "Missing tenantId");
