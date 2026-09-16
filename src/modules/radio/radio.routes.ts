@@ -366,6 +366,69 @@ function runCmd(bin: string, args: string[]): Promise<string> {
   });
 }
 
+/**
+ * Mint a `runCmd`, de menet közben jelenti a haladást.
+ *
+ * A yt-dlp `--newline` mellett minden haladás-frissítést KÜLÖN SORBA ír
+ * (`[download]  12.3% of ...`), enélkül `\r`-rel írná felül ugyanazt a sort,
+ * és soralapú feldolgozással nem lehetne kiolvasni.
+ */
+function runCmdProgress(
+  bin: string,
+  args: string[],
+  onPercent: (pct: number) => void,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = _spawn(bin, args);
+    let out = ""; let err = ""; let buf = "";
+
+    const consume = (chunk: string) => {
+      buf += chunk;
+      const lines = buf.split(/\r?\n/);
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        const m = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%/);
+        if (m) onPercent(Math.max(0, Math.min(100, parseFloat(m[1]))));
+      }
+    };
+
+    proc.stdout.on("data", (d: Buffer) => { const t = d.toString(); out += t; consume(t); });
+    proc.stderr.on("data", (d: Buffer) => { err += d.toString(); });
+    proc.on("close", (code: number) => {
+      if (code !== 0) return reject(new Error(`${bin} exited ${code}: ${err.slice(-300)}`));
+      resolve(out.trim());
+    });
+    proc.on("error", (e: Error) => reject(new Error(`spawn error: ${e.message}`)));
+  });
+}
+
+/*
+ * YouTube-letöltés háttérfeladatként.
+ *
+ * Egy több órás videó letöltése és átkódolása PERCEKIG tart – egyetlen
+ * HTTP-kérésben kivárni törékeny (kliens-időkorlát, proxy-timeout), és a
+ * felhasználó sem lát belőle semmit. Ezért a POST azonnal visszatér egy
+ * azonosítóval, a munka a háttérben fut, a felület pedig lekérdezi az
+ * állapotot. Ugyanaz a minta, mint a lejátszási lista építésénél.
+ */
+type YtDownloadJob = {
+  tenantId: string;
+  status:   "RUNNING" | "DONE" | "ERROR";
+  percent:  number;
+  error?:   string;
+  radioFile?: any;
+  startedAt: number;
+};
+const ytDownloadJobs = new Map<string, YtDownloadJob>();
+
+/** Egy órásnál régebbi bejegyzések eldobása – ne nőjön a memória. */
+function pruneYtDownloadJobs(): void {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [id, job] of ytDownloadJobs.entries()) {
+    if (job.startedAt < cutoff) ytDownloadJobs.delete(id);
+  }
+}
+
 function isYoutubeUrl(url: string): boolean {
   return /^https?:\/\/(www\.)?(youtube\.com\/(watch|shorts)|youtu\.be\/)/.test(url.trim());
 }
@@ -1216,46 +1279,92 @@ router.post("/youtube/download", authJwt, requireTenant, async (req: Request, re
       return res.status(400).json({ error: "Érvényes YouTube URL szükséges" });
     }
 
-    // Indulási pozíció – ld. a `/youtube/schedule` bővebb indoklását.
     const startAt = Number(startSec);
     const startOffsetSec = Number.isFinite(startAt) && startAt > 0 ? Math.floor(startAt) : 0;
 
-    const hash    = crypto.randomBytes(12).toString("hex");
-    const outTmpl = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}.%(ext)s`);
-    await runCmd(YT_DLP_BIN, ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
-                              "--no-playlist", "--output", outTmpl, "--no-warnings", url.trim()]);
+    pruneYtDownloadJobs();
+    const jobId    = crypto.randomBytes(9).toString("hex");
+    const tenantId = tid(req);
+    const userId   = uid(req);
+    ytDownloadJobs.set(jobId, { tenantId, status: "RUNNING", percent: 0, startedAt: Date.now() });
 
-    const filename   = `radio_yt_${hash}.mp3`;
-    const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
-    if (!fs.existsSync(outputPath)) return res.status(422).json({ error: "A videó letöltése sikertelen" });
+    // A választ AZONNAL elküldjük; a munka a háttérben fut tovább.
+    res.status(202).json({ ok: true, jobId });
 
-    if (startOffsetSec > 0) {
-      const trimmedPath = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}_from.mp3`);
-      await runCmd("ffmpeg", ["-y", "-ss", String(startOffsetSec), "-i", outputPath,
-                              "-codec:a", "libmp3lame", "-b:a", "128k", trimmedPath]);
-      if (!fs.existsSync(trimmedPath) || fs.statSync(trimmedPath).size === 0) {
-        console.warn(`[youtube/download] a startpozíció-vágás nem sikerült (${startOffsetSec}s) – marad az eleje`);
-        try { fs.unlinkSync(trimmedPath); } catch {}
-      } else {
-        fs.renameSync(trimmedPath, outputPath);
+    void (async () => {
+      const setJob = (patch: Partial<YtDownloadJob>) => {
+        const cur = ytDownloadJobs.get(jobId);
+        if (cur) ytDownloadJobs.set(jobId, { ...cur, ...patch });
+      };
+      try {
+        const hash    = crypto.randomBytes(12).toString("hex");
+        const outTmpl = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}.%(ext)s`);
+
+        /*
+         * A letöltés a 0–90%-os sávot kapja, a maradékot az átkódolás és a
+         * vágás. Így a csík nem áll 100%-on percekig, amíg az ffmpeg dolgozik.
+         */
+        await runCmdProgress(
+          YT_DLP_BIN,
+          ["--newline", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+           "--no-playlist", "--output", outTmpl, "--no-warnings", url.trim()],
+          (pct) => setJob({ percent: Math.round(pct * 0.9) }),
+        );
+
+        const filename   = `radio_yt_${hash}.mp3`;
+        const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
+        if (!fs.existsSync(outputPath)) throw new Error("A videó letöltése sikertelen");
+
+        setJob({ percent: 92 });
+
+        if (startOffsetSec > 0) {
+          const trimmedPath = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}_from.mp3`);
+          await runCmd("ffmpeg", ["-y", "-ss", String(startOffsetSec), "-i", outputPath,
+                                  "-codec:a", "libmp3lame", "-b:a", "128k", trimmedPath]);
+          if (!fs.existsSync(trimmedPath) || fs.statSync(trimmedPath).size === 0) {
+            console.warn(`[youtube/download] a startpozíció-vágás nem sikerült (${startOffsetSec}s) – marad az eleje`);
+            try { fs.unlinkSync(trimmedPath); } catch {}
+          } else {
+            fs.renameSync(trimmedPath, outputPath);
+          }
+        }
+
+        setJob({ percent: 97 });
+
+        const sizeBytes   = fs.statSync(outputPath).size;
+        const durationSec = await getAudioDurationSec(outputPath);
+        const fileUrl     = `${baseUrl()}/uploads/radio/${filename}`;
+        const radioFile   = await prisma.radioFile.create({
+          data: {
+            tenantId, filename,
+            originalName: `${(typeof title === "string" && title.trim()) || "YouTube videó"}` +
+                          `${startOffsetSec > 0 ? ` (${fmtHms(startOffsetSec)}-tól)` : ""}.mp3`,
+            sizeBytes, durationSec, fileUrl, createdById: userId,
+          },
+        });
+
+        setJob({ status: "DONE", percent: 100, radioFile });
+        console.log(`[youtube/download] kész: ${radioFile.originalName} (${sizeBytes} B)`);
+      } catch (err: any) {
+        console.error("[youtube/download]", err?.message);
+        setJob({ status: "ERROR", error: err?.message ?? "Letöltés sikertelen" });
       }
-    }
-
-    const sizeBytes   = fs.statSync(outputPath).size;
-    const durationSec = await getAudioDurationSec(outputPath);
-    const fileUrl     = `${baseUrl()}/uploads/radio/${filename}`;
-    const radioFile   = await prisma.radioFile.create({
-      data: {
-        tenantId: tid(req), filename,
-        originalName: `${(typeof title === "string" && title.trim()) || "YouTube videó"}` +
-                      `${startOffsetSec > 0 ? ` (${fmtHms(startOffsetSec)}-tól)` : ""}.mp3`,
-        sizeBytes, durationSec, fileUrl, createdById: uid(req),
-      },
-    });
-
-    return res.status(201).json({ ok: true, radioFile });
+    })();
   } catch (err: any) {
-    console.error("[youtube/download]", err?.message);
-    return res.status(500).json({ error: "Failed to download YouTube audio" });
+    console.error("[youtube/download start]", err?.message);
+    if (!res.headersSent) return res.status(500).json({ error: "Failed to start download" });
   }
+});
+
+// GET /radio/youtube/download-status/:jobId – a háttérletöltés állapota.
+router.get("/youtube/download-status/:jobId", authJwt, requireTenant, async (req: Request, res: Response) => {
+  const job = ytDownloadJobs.get(String(req.params.jobId));
+  if (!job) return res.status(404).json({ error: "Ismeretlen letöltés" });
+  // Más intézmény feladatának állapota nem szivároghat ki.
+  if (job.tenantId !== tid(req)) return res.status(404).json({ error: "Ismeretlen letöltés" });
+  return res.json({
+    ok: true, status: job.status, percent: job.percent,
+    ...(job.error ? { error: job.error } : {}),
+    ...(job.radioFile ? { radioFile: job.radioFile } : {}),
+  });
 });
