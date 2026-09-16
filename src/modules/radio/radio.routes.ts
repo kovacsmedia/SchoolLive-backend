@@ -1199,3 +1199,63 @@ router.post("/monitor/unmute", authJwt, requireTenant, async (req: Request, res:
     return res.status(500).json({ error: "Failed to unmute monitor client" });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// YOUTUBE → HANGFÁJL KÖNYVTÁR
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// A videó hangját letölti és RadioFile-ként eltárolja – ütemezés NÉLKÜL.
+// A `/youtube/schedule` ugyanezt csinálja, de utána időzítést is létrehoz;
+// a YouTube fül „Letöltés a hangtárba" gombjának viszont csak a fájl kell,
+// hogy onnantól bármikor lejátszható és ütemezhető legyen.
+router.post("/youtube/download", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const { url, title, startSec } = req.body ?? {};
+    if (!url || typeof url !== "string" || !isYoutubeUrl(url)) {
+      return res.status(400).json({ error: "Érvényes YouTube URL szükséges" });
+    }
+
+    // Indulási pozíció – ld. a `/youtube/schedule` bővebb indoklását.
+    const startAt = Number(startSec);
+    const startOffsetSec = Number.isFinite(startAt) && startAt > 0 ? Math.floor(startAt) : 0;
+
+    const hash    = crypto.randomBytes(12).toString("hex");
+    const outTmpl = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}.%(ext)s`);
+    await runCmd(YT_DLP_BIN, ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+                              "--no-playlist", "--output", outTmpl, "--no-warnings", url.trim()]);
+
+    const filename   = `radio_yt_${hash}.mp3`;
+    const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
+    if (!fs.existsSync(outputPath)) return res.status(422).json({ error: "A videó letöltése sikertelen" });
+
+    if (startOffsetSec > 0) {
+      const trimmedPath = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}_from.mp3`);
+      await runCmd("ffmpeg", ["-y", "-ss", String(startOffsetSec), "-i", outputPath,
+                              "-codec:a", "libmp3lame", "-b:a", "128k", trimmedPath]);
+      if (!fs.existsSync(trimmedPath) || fs.statSync(trimmedPath).size === 0) {
+        console.warn(`[youtube/download] a startpozíció-vágás nem sikerült (${startOffsetSec}s) – marad az eleje`);
+        try { fs.unlinkSync(trimmedPath); } catch {}
+      } else {
+        fs.renameSync(trimmedPath, outputPath);
+      }
+    }
+
+    const sizeBytes   = fs.statSync(outputPath).size;
+    const durationSec = await getAudioDurationSec(outputPath);
+    const fileUrl     = `${baseUrl()}/uploads/radio/${filename}`;
+    const radioFile   = await prisma.radioFile.create({
+      data: {
+        tenantId: tid(req), filename,
+        originalName: `${(typeof title === "string" && title.trim()) || "YouTube videó"}` +
+                      `${startOffsetSec > 0 ? ` (${fmtHms(startOffsetSec)}-tól)` : ""}.mp3`,
+        sizeBytes, durationSec, fileUrl, createdById: uid(req),
+      },
+    });
+
+    return res.status(201).json({ ok: true, radioFile });
+  } catch (err: any) {
+    console.error("[youtube/download]", err?.message);
+    return res.status(500).json({ error: "Failed to download YouTube audio" });
+  }
+});
