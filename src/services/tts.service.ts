@@ -97,8 +97,15 @@ function getFileDurationMs(filePath: string): number | null {
   return null;
 }
 
-// Dingdong WAV biztosítása
-async function ensureDingdongWav(): Promise<void> {
+/**
+ * Dingdong WAV biztosítása.
+ *
+ * EXPORTÁLT, mert az üzenet-intro választója is ezt a fájlt kínálja
+ * belehallgatásra: a felületen pontosan az szóljon, ami az üzenet elé
+ * ténylegesen bekeveredik. Származtatott fájl – ha hiányzik, az első
+ * hívás újraépíti a DINGDONG_SOURCES-ból.
+ */
+export async function ensureDingdongWav(): Promise<void> {
   if (fs.existsSync(DINGDONG_WAV)) return;
   const src = DINGDONG_SOURCES.find(p => fs.existsSync(p));
   if (!src) { console.warn("[TTS] nincs dingdong forrás – üzenet-előtti hang kimarad"); return; }

@@ -12,6 +12,7 @@ import { broadcastSyncBells } from "./bell.scheduler";
 import { stripAccents, fixUploadFilename } from "../../utils/text";
 import { todayInBudapest } from "../../utils/budapest-time";
 import { AUDIO_BITRATE_KBPS, AUDIO_EXT, normalizeToStoredFormat } from "../../utils/audio-format";
+import { ensureDingdongWav } from "../../services/tts.service";
 import { findDeviceByKey } from "../devices/device-key";
 import { compareFirmwareVersions } from "../firmware/firmware-version";
 import {
@@ -790,12 +791,52 @@ const introUpload = multer({
   },
 });
 
+/** Az intro hang lejátszási útvonala. A `/audio` statikus mount szolgálja ki. */
+function introSoundUrlPath(filename: string): string {
+  return `/audio/intros/${encodeURIComponent(filename)}`;
+}
+
 bellsRouter.get("/intro-sounds", authJwt, requireTenant, canUseMessaging, async (req: Request, res: Response) => {
-  const sounds = await prisma.bellSoundFile.findMany({
+  const rows = await prisma.bellSoundFile.findMany({
     where:   { tenantId: tid(req), kind: "MESSAGE_INTRO" },
     orderBy: [{ createdAt: "asc" }],
   });
-  res.json({ ok: true, sounds });
+
+  /*
+   * A MÉRET A LEMEZRŐL JÖN, nem a nyilvántartásból – ugyanaz az elv, mint a
+   * csengetőhangoknál (ld. buildSoundsList). Az átkódolás vagy egy kézi
+   * fájlcsere után a tárolt érték elavulhat, a felület pedig hazudna.
+   */
+  const sounds = rows.map((r: any) => {
+    let sizeBytes = r.sizeBytes;
+    try { sizeBytes = fs.statSync(path.join(INTRO_AUDIO_DIR, r.filename)).size; } catch { /* marad a tárolt */ }
+    return { ...r, sizeBytes, url: introSoundUrlPath(r.filename) };
+  });
+
+  /*
+   * A GYÁRI DINGDONG.
+   *
+   * Nincs BellSoundFile sora – ez a fallback, amit a tts.service kever az
+   * üzenet elé, ha a felhasználó nem választott mást. A felületen mégis
+   * meg kell jelennie, hogy bele lehessen hallgatni, és hogy látszódjon:
+   * VÉDETT, tehát nem törölhető és nem nevezhető át.
+   *
+   * Származtatott fájl (`audio/dingdong.wav`), ezért itt biztosítjuk a
+   * létezését. Ha az előállítás nem megy (nincs ffmpeg vagy forrás), `url`
+   * nélkül megy ki – a felület ilyenkor letiltja a belehallgatást, de a
+   * választó működik tovább.
+   */
+  let defaultUrl: string | null = null;
+  try {
+    await ensureDingdongWav();
+    if (fs.existsSync(path.join(process.cwd(), "audio", "dingdong.wav"))) {
+      defaultUrl = "/audio/dingdong.wav";
+    }
+  } catch (e: any) {
+    console.warn("[INTRO] dingdong előállítás hiba:", e?.message ?? e);
+  }
+
+  res.json({ ok: true, sounds, defaultSound: { url: defaultUrl, isProtected: true } });
 });
 
 bellsRouter.post("/intro-sounds", authJwt, requireTenant, canUseMessaging, introUpload.single("file"), async (req: Request, res: Response) => {
@@ -815,18 +856,87 @@ bellsRouter.post("/intro-sounds", authJwt, requireTenant, canUseMessaging, intro
     });
   }
 
+  /*
+   * EGYSÉGES TÁROLÁSI FORMÁTUM.
+   *
+   * Az intro hangok eddig NYERSEN, a feltöltött formátumban maradtak – a
+   * rendszer minden más hangja Opus. A kevert kimenet miatt a bemondás elé
+   * bekeverés forrásonként újra dekódolt, és a felület is vegyes
+   * kiterjesztéseket mutatott. A hangolás ("voip") szándékos: az intro
+   * rövid, beszéd elé kerül, és ugyanazon a láncon megy, mint a felvételek.
+   */
+  const stored = await normalizeToStoredFormat(file.path, file.originalname, "voip");
+  if (!stored) {
+    try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+    return res.status(500).json({ error: "Audio conversion failed" });
+  }
+
   const sound = await prisma.bellSoundFile.create({
     data: {
       tenantId:   tid(req),
-      filename:   file.filename,
-      sizeBytes:  file.size,
+      filename:   path.basename(stored.path),
+      sizeBytes:  stored.size,
       isDefault:  false,
       kind:       "MESSAGE_INTRO",
       durationMs,
     },
   });
 
-  res.status(201).json({ ok: true, sound });
+  res.status(201).json({ ok: true, sound: { ...sound, url: introSoundUrlPath(sound.filename) } });
+});
+
+/*
+ * ÁTNEVEZÉS.
+ *
+ * Ugyanaz a szerződés, mint a csengetőhangoknál (`/sounds/:id/rename`): a
+ * kliens CSAK az alapnevet küldi, a kiterjesztés a meglévő fájlé marad.
+ * A gyári dingdongnak nincs sora, ezért ide el sem juthat – a védelmet a
+ * felület és a `kind` szűrő együtt adja.
+ */
+bellsRouter.patch("/intro-sounds/:id/rename", authJwt, requireTenant, canUseMessaging, async (req: Request, res: Response) => {
+  const soundId = req.params.id as string;
+  const raw     = String((req.body ?? {}).name ?? "").trim();
+
+  const sound = await prisma.bellSoundFile.findFirst({
+    where: { id: soundId, tenantId: tid(req), kind: "MESSAGE_INTRO" },
+  });
+  if (!sound) return res.status(404).json({ error: "Not found" });
+
+  const ext      = path.extname(sound.filename);
+  const baseName = stripAccents(raw).replace(/\.[^.]+$/, "").trim();
+  const safeBase = baseName.replace(/[^A-Za-z0-9._ -]/g, "").replace(/\s+/g, " ").trim();
+  if (!safeBase) return res.status(400).json({ error: "Invalid name" });
+  const newName = safeBase.slice(0, Math.max(1, 60 - ext.length)) + ext;
+
+  if (newName === sound.filename) {
+    return res.json({ ok: true, sound: { ...sound, url: introSoundUrlPath(sound.filename) } });
+  }
+
+  const clash = await prisma.bellSoundFile.findFirst({
+    where: { tenantId: tid(req), filename: newName, NOT: { id: sound.id } },
+  });
+  if (clash) return res.status(409).json({ error: "A sound with this name already exists" });
+
+  /*
+   * ELŐBB A LEMEZ, UTÁNA AZ ADATBÁZIS.
+   *
+   * Ha a sorrend fordított lenne és az átnevezés elbukna, a nyilvántartás egy
+   * nem létező fájlra mutatna – az intro némán elmaradna a következő üzenet
+   * elől.
+   */
+  const from = path.join(INTRO_AUDIO_DIR, sound.filename);
+  const to   = path.join(INTRO_AUDIO_DIR, newName);
+  if (fs.existsSync(from)) {
+    try { fs.renameSync(from, to); }
+    catch (e: any) { return res.status(500).json({ error: `Rename failed: ${e.message}` }); }
+  }
+
+  const updated = await prisma.bellSoundFile.update({
+    where: { id: sound.id },
+    data:  { filename: newName },
+  });
+
+  res.json({ ok: true, sound: { ...updated, url: introSoundUrlPath(updated.filename) } });
 });
 
 bellsRouter.delete("/intro-sounds/:id", authJwt, requireTenant, canUseMessaging, async (req: Request, res: Response) => {
