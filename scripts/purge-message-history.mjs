@@ -71,16 +71,35 @@ const PROTECTED_BASENAMES = new Set(["dingdong"]);
 const isProtected = (name) =>
   PROTECTED_BASENAMES.has(name.replace(/\.[^.]+$/, "").toLowerCase());
 
-let delFiles = 0, keptFiles = 0, bytes = 0, protectedFiles = 0;
+let delFiles = 0, keptFiles = 0, bytes = 0, protectedFiles = 0, failed = 0;
 for (const e of entries) {
   if (!e.isFile()) continue;                    // alkönyvtárak érintetlenül
   if (!AUDIO_EXT_RE.test(e.name)) continue;
   if (isProtected(e.name)) { protectedFiles++; continue; }
   if (keepFiles.has(e.name)) { keptFiles++; continue; }
   const p = path.join(AUDIO_DIR, e.name);
-  try { bytes += fs.statSync(p).size; } catch {}
-  delFiles++;
-  if (APPLY) { try { fs.unlinkSync(p); } catch (err) { console.warn(`  ⚠ ${e.name}: ${err.message}`); } }
+  let size = 0;
+  try { size = fs.statSync(p).size; } catch {}
+  /*
+   * CSAK A TÉNYLEGESEN TÖRÖLT FÁJLT SZÁMOLJUK.
+   *
+   * A számláló korábban az unlink ELŐTT nőtt, a hibát pedig csak egy warning
+   * jelezte – az összegzés így 112 törölt fájlt jelentett, miközben EGY SEM
+   * törlődött (a scriptet `balazs` futtatta, a fájlok `deploy` tulajdonában
+   * vannak → EACCES). A DB-sorok viszont eltűntek, tehát a kimenet pont
+   * abban a helyzetben hazudott, ahol árva fájlok maradtak hátra.
+   */
+  if (APPLY) {
+    try {
+      fs.unlinkSync(p);
+      delFiles++; bytes += size;
+    } catch (err) {
+      failed++;
+      console.warn(`  ⚠ ${e.name}: ${err.message}`);
+    }
+  } else {
+    delFiles++; bytes += size;
+  }
 }
 
 // ── DB-sorok ────────────────────────────────────────────────────────────────
@@ -96,6 +115,7 @@ console.log(`\n═══ ÖSSZEGZÉS ═══`);
 console.log(`  törölt hangfájl:   ${delFiles}  (${(bytes / 1048576).toFixed(1)} MB)`);
 console.log(`  megtartott fájl:   ${keptFiles}`);
 console.log(`  védett rendszerhang: ${protectedFiles}`);
+if (failed > 0) console.log(`  ⚠ NEM törölhető:    ${failed}  (jogosultság? futtasd: sudo -u deploy …)`);
 console.log(`  törölt Message:    ${delRows}`);
 console.log(`  megtartott Message:${keep.length}`);
 if (!APPLY) console.log(`\n  Semmi nem változott. Éles: --apply`);
