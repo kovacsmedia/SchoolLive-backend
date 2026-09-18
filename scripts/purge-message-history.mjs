@@ -54,10 +54,28 @@ for (const m of keep) console.log(`   ↳ marad: ${m.id.slice(0, 8)}… (${m.sch
 let entries = [];
 try { entries = fs.readdirSync(AUDIO_DIR, { withFileTypes: true }); } catch {}
 
-let delFiles = 0, keptFiles = 0, bytes = 0;
+/*
+ * RENDSZER-HANGOK, AMIK NEM ÜZENET-ELŐZMÉNYEK.
+ *
+ * Az `audio/` gyökérben nem csak üzenet-hangok vannak: a `dingdong.wav` az
+ * üzenetek elé kevert figyelemfelkeltő hang, amit a tts.service.ts állít elő
+ * (és a `.opus`/`.mp3` forrása is itt állhat). Egyetlen Message sem hivatkozik
+ * rá, tehát a "nincs rá hivatkozás → törlöm" szabály kidobná.
+ *
+ * Helyreállna magától a következő TTS-nél az assets/bells/dingdong.opus-ból,
+ * de ha az a forrás valaha hiányzik, az intro NÉMÁN maradna el
+ * ("nincs dingdong forrás – üzenet-előtti hang kimarad"). Nem hagyatkozunk
+ * a tartalék-láncra ott, ahol egy névlista is elég.
+ */
+const PROTECTED_BASENAMES = new Set(["dingdong"]);
+const isProtected = (name) =>
+  PROTECTED_BASENAMES.has(name.replace(/\.[^.]+$/, "").toLowerCase());
+
+let delFiles = 0, keptFiles = 0, bytes = 0, protectedFiles = 0;
 for (const e of entries) {
   if (!e.isFile()) continue;                    // alkönyvtárak érintetlenül
   if (!AUDIO_EXT_RE.test(e.name)) continue;
+  if (isProtected(e.name)) { protectedFiles++; continue; }
   if (keepFiles.has(e.name)) { keptFiles++; continue; }
   const p = path.join(AUDIO_DIR, e.name);
   try { bytes += fs.statSync(p).size; } catch {}
@@ -77,6 +95,7 @@ if (APPLY) {
 console.log(`\n═══ ÖSSZEGZÉS ═══`);
 console.log(`  törölt hangfájl:   ${delFiles}  (${(bytes / 1048576).toFixed(1)} MB)`);
 console.log(`  megtartott fájl:   ${keptFiles}`);
+console.log(`  védett rendszerhang: ${protectedFiles}`);
 console.log(`  törölt Message:    ${delRows}`);
 console.log(`  megtartott Message:${keep.length}`);
 if (!APPLY) console.log(`\n  Semmi nem változott. Éles: --apply`);
