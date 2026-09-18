@@ -38,6 +38,15 @@ export type ResolvedDevice = {
   id: string;
   tenantId: string;
   deviceKeyHash: string | null;
+  /**
+   * Az eszköz által legutóbb jelentett firmware-verzió (pl. "S6.0"), vagy null,
+   * ha még sosem jelentkezett be OTA-ellenőrzéssel.
+   *
+   * A hangformátum-átállás failsafe-je ezen dől el: a régi firmware nem tud
+   * Opus fájlt dekódolni, ezért annak MP3-at kell kiszolgálni (ld.
+   * bells.routes.ts LEGACY_MP3_FALLBACK).
+   */
+  firmwareVersion: string | null;
 };
 
 // MULTIZONE eszközöknél NÉGY Device sor osztozik UGYANAZON a deviceKey-en
@@ -71,7 +80,7 @@ export async function findDeviceByKey(
   // ── Gyors út: indexelt találat, pontosan egy bcrypt ellenőrzéssel ────────
   const candidates = await prisma.device.findMany({
     where:  { deviceKeyLookup: lookup, ...authFilter },
-    select: { id: true, tenantId: true, deviceKeyHash: true, parentDeviceId: true },
+    select: { id: true, tenantId: true, deviceKeyHash: true, parentDeviceId: true, firmwareVersion: true },
   });
   for (const d of masterFirst(candidates)) {
     if (!d.deviceKeyHash) continue;
@@ -83,7 +92,7 @@ export async function findDeviceByKey(
   // migráció magától lefut, külön szkript nélkül.
   const legacy = await prisma.device.findMany({
     where:  { deviceKeyLookup: null, deviceKeyHash: { not: null }, ...authFilter },
-    select: { id: true, tenantId: true, deviceKeyHash: true, parentDeviceId: true },
+    select: { id: true, tenantId: true, deviceKeyHash: true, parentDeviceId: true, firmwareVersion: true },
   });
   for (const d of masterFirst(legacy)) {
     if (!d.deviceKeyHash) continue;

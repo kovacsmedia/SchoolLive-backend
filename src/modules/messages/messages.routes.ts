@@ -4,9 +4,9 @@ import { Router, Request, Response } from "express";
 import { prisma }          from "../../prisma/client";
 import { authJwt }         from "../../middleware/authJwt";
 import { requireTenant }   from "../../middleware/tenant";
-import { generateTTS, NORMALIZE_COMPRESS_FILTER } from "../../services/tts.service";
+import { generateTTS, NORMALIZE_COMPRESS_FILTER, measureLoudnorm } from "../../services/tts.service";
 import { translateText }   from "../../services/translate.service";
-import { SUPPORTED_LOCALES } from "../../config/env";
+import { env, SUPPORTED_LOCALES } from "../../config/env";
 import { resolveIntroSoundPath } from "../bells/bells.routes";
 import { stripAccents }    from "../../utils/text";
 import { SyncEngine }      from "../../sync/SyncEngine";
@@ -21,6 +21,7 @@ import { execFileSync }    from "child_process";
 import multer              from "multer";
 import path                from "path";
 import fs                  from "fs";
+import { opusOutputArgs } from "../../utils/audio-format";
 
 const router = Router();
 
@@ -53,7 +54,7 @@ async function processRecording(
   //    kompresszor-pipeline elé). A böngésző MediaRecorder általában 48 kHz
   //    stereo Opus-t küld, így a downsample-t kihagyjuk – a beszéd tisztább
   //    marad (sziszegő mássalhangzók, "s", "sz", "c" élesebbek), és a végső
-  //    libopus encode (48 kbps voip) is 48 kHz-en megy → nincs felesleges
+  //    libopus encode is 48 kHz-en megy → nincs felesleges
   //    re-sample. A TTS-ág a `tts.service.ts`-ben Piper natív 22050 Hz-en
   //    marad, mert a Piper modell amúgy sem produkál többet.
   const rawWav = path.join(AUDIO_DIR, `rec_raw_${hash}.wav`);
@@ -92,13 +93,14 @@ async function processRecording(
       preFilterWav = rawWav;
     }
 
-    // 3. Normalize + compressor + brick-wall limiter filter chain →
-    //    libopus encode (48 kbps voip)
+    // 3. Normalize + compressor + brick-wall limiter filter chain → a rendszer
+    //    egységes tárolási formátuma (Opus 96k, ld. utils/audio-format.ts).
     execFileSync("ffmpeg", [
       "-y", "-i", preFilterWav,
-      "-af", NORMALIZE_COMPRESS_FILTER,
-      "-c:a", "libopus", "-b:a", "48k", "-application", "voip",
-      "-ar", "48000", "-ac", "1",
+      // KÉTMENETES normalizálás: a felvett üzenetek szintje is nyelvtől és
+      // hossztól függetlenül egyforma legyen (ld. tts.service.ts).
+      "-af", (await measureLoudnorm(preFilterWav)) ?? NORMALIZE_COMPRESS_FILTER,
+      ...opusOutputArgs("voip"),
       finalOpus,
     ]);
     try { fs.unlinkSync(preFilterWav); } catch {}
@@ -243,7 +245,7 @@ router.post("/tts-preview", authJwt, requireTenant, async (req: Request, res: Re
       : null;
 
     const { filename, durationMs } = await generateTTS(text.trim(), voice, introPath);
-    const fileUrl = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${filename}`;
+    const fileUrl = `${env.BASE_URL}/audio/${filename}`;
 
     return res.json({ ok: true, fileUrl, filename, durationMs });
   } catch (err) {
@@ -269,7 +271,7 @@ router.post("/", authJwt, requireTenant, async (req: Request, res: Response) => 
       : null;
 
     const { filename, durationMs } = await generateTTS(text.trim(), voice, introPath);
-    const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${filename}`;
+    const fileUrl       = `${env.BASE_URL}/audio/${filename}`;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
     const isImmediate   = !scheduledTime || scheduledTime <= new Date();
     // Title: a TTS forrásszöveg első 200 karaktere, ÉKEZETESEN.
@@ -360,7 +362,7 @@ router.post("/audio", authJwt, requireTenant, audioUpload.single("audio"), async
     } catch (procErr) {
       console.error("[MESSAGES] Feldolgozás hiba (eredeti fájl használva):", procErr);
     }
-    const fileUrl       = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/audio/${processedFilename}`;
+    const fileUrl       = `${env.BASE_URL}/audio/${processedFilename}`;
     const scheduledTime = scheduledAt ? new Date(scheduledAt) : null;
     const isImmediate   = !scheduledTime || scheduledTime <= new Date();
     const title         = stripAccents("Hangfelvétel");

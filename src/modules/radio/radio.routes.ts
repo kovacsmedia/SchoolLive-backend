@@ -1,5 +1,6 @@
 // src/modules/radio/radio.routes.ts
 
+import { env, rehostUrl } from "../../config/env";
 import { Router, Request, Response } from "express";
 import { spawn as _spawn } from "child_process";
 import { prisma } from "../../prisma/client";
@@ -21,13 +22,15 @@ if (!fs.existsSync(RADIO_UPLOAD_DIR)) {
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, RADIO_UPLOAD_DIR),
   filename: (_req, file, cb) => {
-    const ext  = path.extname(file.originalname).toLowerCase() || ".mp3";
+    const ext  = path.extname(file.originalname).toLowerCase() || AUDIO_EXT;
     const hash = crypto.randomBytes(12).toString("hex");
     cb(null, `radio_${hash}${ext}`);
   },
 });
 
 import { stripAccents, fixUploadFilename } from "../../utils/text";
+import { AUDIO_EXT, opusOutputArgs, ytDlpAudioArgs, normalizeToStoredFormat, withAudioExt } from "../../utils/audio-format";
+import { resolveYtDlp } from "../../utils/binaries";
 
 /*
  * A korábbi helyi változat FELTÉTEL NÉLKÜL futtatta a latin1→utf8 átalakítást.
@@ -71,7 +74,7 @@ function tid(req: Request): string { return (req as any).tenantId as string; }
 function uid(req: Request): string { return (req as any).user?.sub as string; }
 function role(req: Request): string { return (req as any).user?.role ?? ""; }
 function canWrite(r: string): boolean { return ["SUPER_ADMIN", "TENANT_ADMIN", "ORG_ADMIN"].includes(r); }
-function baseUrl(): string { return process.env.BASE_URL ?? "https://api.schoollive.hu"; }
+function baseUrl(): string { return env.BASE_URL; }
 function paramId(req: Request): string { return String(req.params.id); }
 
 /** Másodperc → h:mm:ss / m:ss – a könyvtárban látszó fájlnévhez. */
@@ -117,11 +120,26 @@ router.post("/files", authJwt, requireTenant, upload.single("file"), async (req:
   try {
     if (!canWrite(role(req))) { if (req.file) fs.unlinkSync(req.file.path); return res.status(403).json({ error: "Forbidden" }); }
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const durationSec = await getAudioDurationSec(req.file.path);
-    const fileUrl     = `${baseUrl()}/uploads/radio/${req.file.filename}`;
+
+    /*
+     * A HANGTÁR IS CSAK OPUS 96k-T TÁROL.
+     *
+     * A felület bármilyen kodekű feltöltést elfogad (ld. a fenti allowlistet),
+     * de a tárolt alak mindig egységes – így a lejátszási láncban sehol nem
+     * kell formátumot találgatni, és a lemezen sem gyűlnek vegyes fájlok.
+     */
+    const norm = await normalizeToStoredFormat(req.file.path, req.file.filename);
+    if (!norm) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+      return res.status(400).json({ error: "A hangfájlt nem sikerült átkódolni." });
+    }
+
+    const storedFilename = path.basename(norm.path);
+    const durationSec = await getAudioDurationSec(norm.path);
+    const fileUrl     = `${baseUrl()}/uploads/radio/${storedFilename}`;
     const radioFile = await prisma.radioFile.create({
-      data: { tenantId: tid(req), createdById: uid(req), filename: req.file.filename,
-              originalName: fixEncoding(req.file.originalname), sizeBytes: req.file.size, durationSec, fileUrl },
+      data: { tenantId: tid(req), createdById: uid(req), filename: storedFilename,
+              originalName: fixEncoding(withAudioExt(req.file.originalname)), sizeBytes: norm.size, durationSec, fileUrl },
       include: { createdBy: { select: { id: true, displayName: true, email: true } } },
     });
     return res.status(201).json({ ok: true, file: { ...radioFile, _count: { schedules: 0 } } });
@@ -129,6 +147,39 @@ router.post("/files", authJwt, requireTenant, upload.single("file"), async (req:
     if (req.file) { try { fs.unlinkSync(req.file.path); } catch {} }
     if (err?.code === "P2002") return res.status(409).json({ error: "File already exists" });
     console.error(err); return res.status(500).json({ error: "Upload failed" });
+  }
+});
+
+/**
+ * Hangtár-fájl átnevezése.
+ *
+ * Csak a MEGJELENÍTETT nevet (`originalName`) írja át – a lemezen lévő
+ * `filename` érintetlen marad. Ez szándékos: arra a `RadioSchedule` és a
+ * `YoutubePlaylist` is hivatkozik, és a `fileUrl` is abból épül. Egy
+ * felhasználói átnevezés nem érhet el odáig, hogy egy ütemezett lejátszás
+ * fájlja eltűnjön alóla.
+ */
+router.patch("/files/:id/rename", authJwt, requireTenant, async (req: Request, res: Response) => {
+  try {
+    if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
+    const id  = String(req.params.id);
+    const raw = String((req.body ?? {}).name ?? "").trim();
+
+    const file = await prisma.radioFile.findFirst({ where: { id, tenantId: tid(req) } });
+    if (!file) return res.status(404).json({ error: "Not found" });
+
+    // A kiterjesztést a szerver tartja meg; a felület nem is mutatja.
+    const ext  = path.extname(file.originalName) || path.extname(file.filename) || AUDIO_EXT;
+    const base = raw.replace(/\.[^.]+$/, "").replace(/[\\/:*?"<>|]/g, "").trim();
+    if (!base) return res.status(400).json({ error: "Invalid name" });
+
+    const newName = base.slice(0, 120) + ext;
+    await prisma.radioFile.update({ where: { id: file.id }, data: { originalName: fixEncoding(newName) } });
+
+    return res.json({ ok: true, originalName: newName });
+  } catch (err) {
+    console.error("[radio] rename", err);
+    return res.status(500).json({ error: "Rename failed" });
   }
 });
 
@@ -179,6 +230,8 @@ async function createSchedule(params: {
   streamUrl?: string | null;
   streamTitle?: string | null;
   targetType: string; targetId?: string | null; scheduledAt: Date; endsAt?: Date | null;
+  /** Indulási pozíció mp-ben; 0/undefined = a hang elejétől. */
+  startSec?: number | null;
 }): Promise<
   | { ok: true; schedule: any }
   | { ok: false; status: number; error: string; conflict?: any }
@@ -248,6 +301,10 @@ async function createSchedule(params: {
 
   const schedule = await prisma.radioSchedule.create({
     data: {
+      // Csak pozitív, véges értéket tárolunk; minden más az elejét jelenti.
+      startSec: Number.isFinite(Number(params.startSec)) && Number(params.startSec) > 0
+        ? Math.round(Number(params.startSec))
+        : null,
       tenantId: params.tid, createdById: params.uid, radioFileId: fileId,
       streamUrl:   isStream ? String(params.streamUrl) : null,
       streamTitle: isStream ? (params.streamTitle?.trim() || "Internetrádió") : null,
@@ -262,7 +319,7 @@ async function createSchedule(params: {
 router.post("/schedules", authJwt, requireTenant, async (req: Request, res: Response) => {
   try {
     if (!canWrite(role(req))) return res.status(403).json({ error: "Forbidden" });
-    const { radioFileId, targetType, targetId, scheduledAt, endsAt } = req.body ?? {};
+    const { radioFileId, targetType, targetId, scheduledAt, endsAt, startSec } = req.body ?? {};
     if (!radioFileId || !targetType || !scheduledAt) return res.status(400).json({ error: "radioFileId, targetType and scheduledAt are required" });
     const scheduledDate = new Date(scheduledAt);
     if (isNaN(scheduledDate.getTime())) return res.status(400).json({ error: "Invalid scheduledAt date" });
@@ -285,6 +342,7 @@ router.post("/schedules", authJwt, requireTenant, async (req: Request, res: Resp
     }
 
     const result = await createSchedule({
+      startSec,
       tid: tid(req), uid: uid(req), radioFileId: String(radioFileId),
       targetType, targetId, scheduledAt: scheduledDate, endsAt: endsAtDate,
     });
@@ -348,12 +406,7 @@ export default router;
 // YOUTUBE LEJÁTSZÁSI LISTÁK
 // ═══════════════════════════════════════════════════════════════════════════
 
-const YT_DLP_BIN = process.env.YT_DLP_BIN
-  ?? (() => {
-    const candidates = ["/home/deploy/.local/bin/yt-dlp", "/home/balazs/.local/bin/yt-dlp", "/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp"];
-    const { existsSync } = require("fs");
-    return candidates.find((p: string) => existsSync(p)) ?? "yt-dlp";
-  })();
+const YT_DLP_BIN = resolveYtDlp();
 
 function runCmd(bin: string, args: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -519,21 +572,21 @@ async function buildYoutubePlaylist(playlistId: string, playlist: any, tenantId:
     for (let i = 0; i < playlist.items.length; i++) {
       const item    = playlist.items[i];
       const outTmpl = path.join(tmpDir, `track_${String(i).padStart(3,"0")}.%(ext)s`);
-      await runCmd(YT_DLP_BIN, ["--extract-audio","--audio-format","mp3","--audio-quality","128K","--no-playlist","--output",outTmpl,"--no-warnings",item.youtubeUrl]);
+      await runCmd(YT_DLP_BIN, [...ytDlpAudioArgs(),"--no-playlist","--output",outTmpl,"--no-warnings",item.youtubeUrl]);
       const files = fs.readdirSync(tmpDir).filter(f => f.startsWith(`track_${String(i).padStart(3,"0")}`));
       if (files.length === 0) throw new Error(`yt-dlp: letöltés sikertelen: ${item.youtubeUrl}`);
       downloadedFiles.push(path.join(tmpDir, files[0]));
     }
     fs.writeFileSync(concatFile, downloadedFiles.map(f => `file '${f}'`).join("\n"));
     const hash       = crypto.randomBytes(12).toString("hex");
-    const filename   = `radio_yt_${hash}.mp3`;
+    const filename   = `radio_yt_${hash}${AUDIO_EXT}`;
     const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
-    await runCmd("ffmpeg", ["-y","-f","concat","-safe","0","-i",concatFile,"-codec:a","libmp3lame","-b:a","128k","-id3v2_version","3",outputPath]);
+    await runCmd("ffmpeg", ["-y","-f","concat","-safe","0","-i",concatFile,...opusOutputArgs(),outputPath]);
     if (!fs.existsSync(outputPath)) throw new Error("ffmpeg: kimeneti MP3 nem jött létre");
     const sizeBytes   = fs.statSync(outputPath).size;
     const durationSec = await getAudioDurationSec(outputPath);
     const fileUrl     = `${baseUrl()}/uploads/radio/${filename}`;
-    const radioFile   = await prisma.radioFile.create({ data: { tenantId, filename, originalName: `${playlist.name}.mp3`, sizeBytes, durationSec, fileUrl, createdById } });
+    const radioFile   = await prisma.radioFile.create({ data: { tenantId, filename, originalName: `${playlist.name}${AUDIO_EXT}`, sizeBytes, durationSec, fileUrl, createdById } });
     await (prisma as any).youtubePlaylist.update({ where: { id: playlistId }, data: { status: "DONE", radioFileId: radioFile.id, updatedAt: new Date() } });
     console.log(`[YT-BUILD] ✅ Done! ${filename}`);
   } finally {
@@ -753,15 +806,15 @@ router.post("/files/trim", authJwt, requireTenant, async (req: Request, res: Res
     const inputPath = path.join(RADIO_UPLOAD_DIR, radioFile.filename);
     if (!fs.existsSync(inputPath)) return res.status(404).json({ error: "Fájl nem található a szerveren" });
     const hash       = crypto.randomBytes(12).toString("hex");
-    const filename   = `radio_${hash}_edited.mp3`;
+    const filename   = `radio_${hash}_edited${AUDIO_EXT}`;
     const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
     const fadeStart  = Math.max(0, trimSec - fadeOut);
-    await runCmd("ffmpeg", ["-y","-i",inputPath,"-t",String(trimSec),"-af",`afade=t=out:st=${fadeStart}:d=${fadeOut}`,"-codec:a","libmp3lame","-b:a","128k",outputPath]);
+    await runCmd("ffmpeg", ["-y","-i",inputPath,"-t",String(trimSec),"-af",`afade=t=out:st=${fadeStart}:d=${fadeOut}`,...opusOutputArgs(),outputPath]);
     const sizeBytes   = fs.statSync(outputPath).size;
     const durationSec = await getAudioDurationSec(outputPath);
     const fileUrl     = `${baseUrl()}/uploads/radio/${filename}`;
-    const baseName    = radioFile.originalName.replace(/\.mp3$/i, "");
-    const editedName  = fixEncoding(`${baseName}-edited.mp3`);
+    const baseName    = radioFile.originalName.replace(/\.[^.]+$/, "");
+    const editedName  = fixEncoding(`${baseName}-edited${AUDIO_EXT}`);
     const newFile = await prisma.radioFile.create({ data: { tenantId: tid(req), createdById: uid(req), filename, originalName: editedName, sizeBytes, durationSec, fileUrl } });
     return res.json({ ok: true, fileId: newFile.id, filename: editedName, fileUrl, durationSec });
   } catch (err: any) { console.error("[trim]", err?.message); return res.status(500).json({ error: "Vágás sikertelen: " + (err?.message ?? "") }); }
@@ -782,22 +835,40 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
       for (let i = 0; i < items.length; i++) {
         const item = items[i]; const outBase = path.join(tmpDir, `track_${String(i).padStart(3,"0")}`);
         if (item.source === "youtube" || item.source === "gdrive") {
-          await runCmd(YT_DLP_BIN, ["--extract-audio","--audio-format","mp3","--audio-quality","128K","--no-playlist","--output",`${outBase}.%(ext)s`,"--no-warnings",item.url]);
+          await runCmd(YT_DLP_BIN, [...ytDlpAudioArgs(),"--no-playlist","--output",`${outBase}.%(ext)s`,"--no-warnings",item.url]);
           const found = fs.readdirSync(tmpDir).find(f => f.startsWith(`track_${String(i).padStart(3,"0")}`));
           if (!found) throw new Error(`letöltés sikertelen: ${item.url}`);
           downloadedFiles.push(path.join(tmpDir, found));
         } else {
           const localFilename = item.url.split("/").pop()?.split("?")[0];
           const localPath = localFilename ? path.join(RADIO_UPLOAD_DIR, localFilename) : null;
-          if (localPath && fs.existsSync(localPath)) { const dest = `${outBase}.mp3`; fs.copyFileSync(localPath, dest); downloadedFiles.push(dest); }
+          if (localPath && fs.existsSync(localPath)) { const dest = `${outBase}${path.extname(localPath) || ".bin"}`; fs.copyFileSync(localPath, dest); downloadedFiles.push(dest); }
           else if (item.url.startsWith("http")) {
             const https = await import("https"); const http = await import("http");
-            const dest = `${outBase}.mp3`;
+            const dest = `${outBase}.bin`;
             await new Promise<void>((resolve, reject) => { const mod = item.url.startsWith("https") ? https.default : http.default; const file = fs.createWriteStream(dest); mod.get(item.url, resp => { resp.pipe(file); file.on("finish", () => { file.close(); resolve(); }); }).on("error", reject); });
             downloadedFiles.push(dest);
           } else throw new Error(`Ismeretlen forrás: ${item.url}`);
         }
       }
+      /*
+       * A CONCAT DEMUXER AZONOS KODEKET KÖVETEL.
+       *
+       * A források vegyesek: a yt-dlp már Opus 96k-t ad, egy helyi hangtár-fájl
+       * viszont lehet még régi MP3, egy HTTP-forrás pedig bármi. Kodek- vagy
+       * csatornaszám-eltérésnél a demuxer NÉMÁN eldobhat sávokat – pontosan ez
+       * a hibaosztály okozta a TTS-ben a "csak az intro szól" hibát.
+       *
+       * Ezért minden elemet a rendszer egységes formátumára hozunk. Ami már
+       * Opus 96k, azt a normalizáló változatlanul hagyja, tehát a yt-dlp-vel
+       * letöltött sávok NEM kapnak felesleges második generációt.
+       */
+      for (let i = 0; i < downloadedFiles.length; i++) {
+        const norm = await normalizeToStoredFormat(downloadedFiles[i], path.basename(downloadedFiles[i]));
+        if (!norm) throw new Error(`Nem sikerult egyseges formatumra hozni: ${downloadedFiles[i]}`);
+        downloadedFiles[i] = norm.path;
+      }
+
       const concatFile = path.join(tmpDir, "concat.txt");
       fs.writeFileSync(concatFile, downloadedFiles.map(f => `file '${f}'`).join("\n"));
       // Opus output – a snap stream natívan opus codec-kel megy a klienseknek,
@@ -807,8 +878,7 @@ router.post("/ytplaylists/build-custom", authJwt, requireTenant, async (req: Req
       const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
       await runCmd("ffmpeg", [
         "-y", "-f", "concat", "-safe", "0", "-i", concatFile,
-        "-c:a", "libopus", "-b:a", "96k", "-application", "audio",
-        "-ar", "48000",
+        ...opusOutputArgs(),
         outputPath,
       ]);
       const sizeBytes = fs.statSync(outputPath).size; const durationSec = await getAudioDurationSec(outputPath); const fileUrl = `${baseUrl()}/uploads/radio/${filename}`;
@@ -1020,7 +1090,7 @@ router.post("/files/:id/play-now", authJwt, requireTenant, async (req: Request, 
       await SnapcastService.stopRadio(tid(req));
       await SnapcastService.play({
         type:              "RADIO",
-        source:            { type: "url", url: file.fileUrl },
+        source:            { type: "url", url: rehostUrl(file.fileUrl) },
         tenantId:          tid(req),
         title:             file.originalName,
         durationSec:       file.durationSec ?? undefined,
@@ -1138,23 +1208,23 @@ router.post("/youtube/schedule", authJwt, requireTenant, async (req: Request, re
      * ffmpeg-gel. Szándékosan újrakódolunk (nem `-c copy`): a másolás csak
      * frame-határra tud vágni, tehát a megadott másodperctől néhány tized
      * eltérés lenne, és egyes lejátszók az így keletkező csonka első frame-en
-     * kattannak. 128k libmp3lame – ugyanaz, amivel a letöltés is készül.
+     * kattannak. A kimenet a rendszer egységes formátuma (Opus 96k).
      */
     const startAt = Number(startSec);
     const startOffsetSec = Number.isFinite(startAt) && startAt > 0 ? Math.floor(startAt) : 0;
 
     const hash    = crypto.randomBytes(12).toString("hex");
     const outTmpl = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}.%(ext)s`);
-    await runCmd(YT_DLP_BIN, ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K", "--no-playlist", "--output", outTmpl, "--no-warnings", url.trim()]);
+    await runCmd(YT_DLP_BIN, [...ytDlpAudioArgs(), "--no-playlist", "--output", outTmpl, "--no-warnings", url.trim()]);
 
-    const filename   = `radio_yt_${hash}.mp3`;
+    const filename   = `radio_yt_${hash}${AUDIO_EXT}`;
     const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
     if (!fs.existsSync(outputPath)) return res.status(422).json({ error: "A videó letöltése sikertelen" });
 
     if (startOffsetSec > 0) {
-      const trimmedPath = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}_from.mp3`);
+      const trimmedPath = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}_from${AUDIO_EXT}`);
       await runCmd("ffmpeg", ["-y", "-ss", String(startOffsetSec), "-i", outputPath,
-                              "-codec:a", "libmp3lame", "-b:a", "128k", trimmedPath]);
+                              ...opusOutputArgs(), trimmedPath]);
       if (!fs.existsSync(trimmedPath) || fs.statSync(trimmedPath).size === 0) {
         // Ha a vágás nem sikerült, NEM buktatjuk el az ütemezést: a videó
         // elejéről induló változat még mindig jobb, mint a néma semmi.
@@ -1172,7 +1242,7 @@ router.post("/youtube/schedule", authJwt, requireTenant, async (req: Request, re
       data: {
         tenantId: tid(req), filename,
         originalName: `${(typeof title === "string" && title.trim()) || "YouTube videó"}` +
-                      `${startOffsetSec > 0 ? ` (${fmtHms(startOffsetSec)}-tól)` : ""}.mp3`,
+                      `${startOffsetSec > 0 ? ` (${fmtHms(startOffsetSec)}-tól)` : ""}${AUDIO_EXT}`,
         sizeBytes, durationSec, fileUrl, createdById: uid(req),
       },
     });
@@ -1306,21 +1376,21 @@ router.post("/youtube/download", authJwt, requireTenant, async (req: Request, re
          */
         await runCmdProgress(
           YT_DLP_BIN,
-          ["--newline", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "128K",
+          ["--newline", ...ytDlpAudioArgs(),
            "--no-playlist", "--output", outTmpl, "--no-warnings", url.trim()],
           (pct) => setJob({ percent: Math.round(pct * 0.9) }),
         );
 
-        const filename   = `radio_yt_${hash}.mp3`;
+        const filename   = `radio_yt_${hash}${AUDIO_EXT}`;
         const outputPath = path.join(RADIO_UPLOAD_DIR, filename);
         if (!fs.existsSync(outputPath)) throw new Error("A videó letöltése sikertelen");
 
         setJob({ percent: 92 });
 
         if (startOffsetSec > 0) {
-          const trimmedPath = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}_from.mp3`);
+          const trimmedPath = path.join(RADIO_UPLOAD_DIR, `radio_yt_${hash}_from${AUDIO_EXT}`);
           await runCmd("ffmpeg", ["-y", "-ss", String(startOffsetSec), "-i", outputPath,
-                                  "-codec:a", "libmp3lame", "-b:a", "128k", trimmedPath]);
+                                  ...opusOutputArgs(), trimmedPath]);
           if (!fs.existsSync(trimmedPath) || fs.statSync(trimmedPath).size === 0) {
             console.warn(`[youtube/download] a startpozíció-vágás nem sikerült (${startOffsetSec}s) – marad az eleje`);
             try { fs.unlinkSync(trimmedPath); } catch {}
@@ -1338,7 +1408,7 @@ router.post("/youtube/download", authJwt, requireTenant, async (req: Request, re
           data: {
             tenantId, filename,
             originalName: `${(typeof title === "string" && title.trim()) || "YouTube videó"}` +
-                          `${startOffsetSec > 0 ? ` (${fmtHms(startOffsetSec)}-tól)` : ""}.mp3`,
+                          `${startOffsetSec > 0 ? ` (${fmtHms(startOffsetSec)}-tól)` : ""}${AUDIO_EXT}`,
             sizeBytes, durationSec, fileUrl, createdById: userId,
           },
         });

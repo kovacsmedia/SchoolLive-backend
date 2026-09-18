@@ -242,6 +242,34 @@ class SyncEngineClass {
           resolvedSnapDeviceId = deviceId;
           snapHost = env.NODE_HOSTNAME; // multi-node: mindig EZ a node a snap-cél, sosem egy globális fix host (ld. terv Fázis 7)
           snapPort = tenant?.snapPort ?? null;
+
+          /*
+           * A SNAPSERVERNEK ÁLLNIA KELL, MIRE AZ ESZKÖZ ODAÉR.
+           *
+           * Az engine-ek LUSTÁN indulnak: csak az első tényleges lejátszáskor
+           * (`SnapcastService.play` → `getEngine`). Egy olyan tenantnál, ahol
+           * aznap még nem szólt semmi, a most csatlakozó eszköz üres portot
+           * talál, és MÁSODPERCENKÉNT újrapróbálkozik a végtelenségig
+           * (`can't connect to remote …:1802, err -14`).
+           *
+           * Ennél rosszabb, hogy a legelső csengetéskor az eszköznek nulláról
+           * kellene felépítenie a kapcsolatot és a puffert – pont abban a
+           * pillanatban, amikor szólnia kellene. Ha viszont a bejelentkezéskor
+           * felhúzzuk, a csengetés idejére már szinkronban van.
+           *
+           * SZÁNDÉKOSAN NEM VÁRJUK MEG: a snapserver indítása másodperces
+           * művelet, a WS-kézfogást nem tartjuk fel vele. Hibát is elnyelünk –
+           * ez kényelmi lépés, nem lehet oka annak, hogy egy eszköz ne tudjon
+           * bejelentkezni.
+           */
+          void (async () => {
+            try {
+              const { SnapcastService } = await import("../modules/snapcast/snapcast.service");
+              await SnapcastService.isSnapserverOnline(tenantId);
+            } catch (e: any) {
+              console.warn(`[SyncEngine] snapserver előkészítés hiba (${tenantId}):`, e?.message ?? e);
+            }
+          })();
         } else if (token) {
           // Browser: a JWT-ben benne van a userId (payload.sub). EGY PLAYER-
           // fiókot TÖBB böngésző/terem is használhat egyszerre (ld.
@@ -459,6 +487,59 @@ class SyncEngineClass {
     console.log(`[SyncEngine] 📡 Broadcast → ${targets.length} eszköz`);
   }
 
+  /**
+   * Menetrend-szinkron broadcast, ESZKÖZÖNKÉNT helyes hangformátummal.
+   *
+   * MIÉRT NEM EGYSZERŰ `broadcastImmediate`: a hangformátum-átállás alatt a
+   * régi firmware-ű eszközöknek MP3 neveket kell kapniuk, az újaknak Opusat
+   * (ld. bells.routes.ts LEGACY_MP3_FALLBACK). Egy közös payload az egyik
+   * csoportnak biztosan rossz nevet adna: a hang ott lenne a lemezen, csak
+   * más néven – a csengetés pedig a gyári defaultra esne vissza.
+   *
+   * Legfeljebb KÉT payload készül (régi és új), nem eszközönként egy.
+   */
+  async broadcastScheduleSync(tenantId: string, extra: object = {}): Promise<void> {
+    const targets = this.getOnlineClients(tenantId);
+    if (targets.length === 0) {
+      console.log(`[SyncEngine] ⚠️ Nincs online eszköz: tenant=${tenantId}`);
+      return;
+    }
+
+    const { buildScheduleSyncPayload, needsLegacyAudio } =
+      await import("../modules/bells/bells.routes");
+    const { prisma } = await import("../prisma/client");
+
+    const espIds = targets.filter(c => c.type === "esp32").map(c => c.dbDeviceId);
+    const rows = espIds.length > 0
+      ? await prisma.device.findMany({
+          where:  { id: { in: espIds } },
+          select: { id: true, firmwareVersion: true },
+        })
+      : [];
+    const fwById = new Map(rows.map(r => [r.id, r.firmwareVersion]));
+
+    const cache = new Map<boolean, object>();
+    const payloadFor = async (legacy: boolean): Promise<object> => {
+      if (!cache.has(legacy)) {
+        cache.set(legacy, { ...(await buildScheduleSyncPayload(tenantId, legacy)), ...extra });
+      }
+      return cache.get(legacy)!;
+    };
+
+    let legacyCount = 0;
+    for (const client of targets) {
+      const legacy = client.type === "esp32"
+        ? needsLegacyAudio(fwById.get(client.dbDeviceId))
+        : false;
+      if (legacy) legacyCount++;
+      this.send(client.ws, await payloadFor(legacy));
+    }
+    console.log(
+      `[SyncEngine] 📡 SCHEDULE_SYNC → ${targets.length} eszköz` +
+      (legacyCount > 0 ? ` (ebből ${legacyCount} régi firmware, MP3)` : "")
+    );
+  }
+
   // Tenant-független broadcast – kizárólag a FirmwareRelease-hez kell, mivel
   // az globális (nincs tenantId mezője), minden bejelentkezett eszköznek
   // szól. A device-osztály/verzió szerinti tényleges szűrést a kliens saját
@@ -599,8 +680,22 @@ class SyncEngineClass {
     // hogy bármelyik platform el tudja tárolni/hasznosítani, ne csak a
     // "ma" nézetet lássa.
     try {
-      const { buildScheduleSyncPayload } = await import("../modules/bells/bells.routes");
-      const payload = await buildScheduleSyncPayload(tenantId);
+      const { buildScheduleSyncPayload, needsLegacyAudio } =
+        await import("../modules/bells/bells.routes");
+      /*
+       * Böngésző-kliens natívan dekódol Opust; csak az ESP32 helyi lejátszója
+       * korlátozott. A firmware-verziót ezért csak ott kérdezzük le.
+       */
+      let legacy = false;
+      if (clientType === "esp32") {
+        const { prisma } = await import("../prisma/client");
+        const dev = await prisma.device.findUnique({
+          where:  { id: client.dbDeviceId },
+          select: { firmwareVersion: true },
+        });
+        legacy = needsLegacyAudio(dev?.firmwareVersion);
+      }
+      const payload = await buildScheduleSyncPayload(tenantId, legacy);
       this.send(client.ws, payload);
       console.log(`[SyncEngine] 📅 SCHEDULE_SYNC → ${deviceId}`);
     } catch (e) {

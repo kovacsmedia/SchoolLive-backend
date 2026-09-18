@@ -30,6 +30,32 @@
 import fs from "fs";
 import path from "path";
 
+import { execFileSync } from "child_process";
+
+import { AUDIO_EXT, opusOutputArgs } from "../../utils/audio-format";
+
+/**
+ * EGY NÉV, TÖBB LEHETSÉGES KITERJESZTÉS.
+ *
+ * Az Opus-ra állás során a lemezen `csengo.opus` van, az adatbázisban viszont
+ * még `csengo.mp3` állhat (vagy fordítva, ha egy régi eszköz listája nem
+ * frissült). A kettő szétcsúszása néma csengetés lenne, ezért a feloldó a
+ * kért néven kívül MINDIG megnézi az azonos alapnevű társat is.
+ *
+ * Ez szándékosan itt van és nem a migrációban: a migráció egyszer fut le és
+ * hibázhat, ez viszont minden egyes feloldásnál véd. A migráció után is
+ * ártalmatlan – ha a kért fájl megvan, az első találat nyer.
+ */
+function soundNameVariants(filename: string): string[] {
+  if (!filename) return [];
+  const ext = path.extname(filename).toLowerCase();
+  if (ext === AUDIO_EXT) {
+    const base = path.basename(filename, ext);
+    return [filename, `${base}.mp3`];
+  }
+  return [filename, path.basename(filename, path.extname(filename)) + AUDIO_EXT];
+}
+
 export const BELL_AUDIO_DIR = path.join(process.cwd(), "audio", "bells");
 
 // A repóval együtt deployolt (rsync-elt) default hangok. Az `audio/` könyvtár
@@ -39,8 +65,8 @@ export const BELL_AUDIO_DIR = path.join(process.cwd(), "audio", "bells");
 // sem szólalna meg, amíg a node-ok közti tükrözés utol nem éri.
 export const BELL_ASSET_DIR = path.join(process.cwd(), "assets", "bells");
 
-export const DEFAULT_SIGNAL_SOUND = "jelzocsengo.mp3";
-export const DEFAULT_MAIN_SOUND   = "kibecsengo.mp3";
+export const DEFAULT_SIGNAL_SOUND = "assembly-signal-bell.opus";
+export const DEFAULT_MAIN_SOUND   = "lesson-signal-bell.opus";
 export const DEFAULT_BELL_SOUNDS  = [DEFAULT_SIGNAL_SOUND, DEFAULT_MAIN_SOUND] as const;
 
 /** Az adott csengetés-típushoz tartozó default fájlnév. */
@@ -69,16 +95,61 @@ export function ensureDefaultBellSounds(): void {
     const target = path.join(BELL_AUDIO_DIR, name);
     if (fs.existsSync(target)) continue;
 
-    const source = path.join(BELL_ASSET_DIR, name);
+    /*
+     * Az Opus-ra állás közben az assets/bells/ még tartalmazhat MP3-at. Egy
+     * hiányzó .opus miatt NEM maradhatunk default hang nélkül, ezért a régi
+     * kiterjesztést is elfogadjuk.
+     */
+    const source = soundNameVariants(name)
+      .map(n => path.join(BELL_ASSET_DIR, n))
+      .find(p => fs.existsSync(p)) ?? path.join(BELL_ASSET_DIR, name);
     if (!fs.existsSync(source)) {
       console.error(`[BELL-SOUNDS] ⚠️ HIÁNYZÓ DEFAULT HANG: ${source} – ellenőrizd, hogy az assets/bells/ kiment-e a deploy során!`);
       continue;
     }
+
+    /*
+     * ÁTKÓDOLUNK, NEM MÁSOLUNK.
+     *
+     * A cél neve `.opus`, és a lejátszók KITERJESZTÉSBŐL ismerik fel a
+     * kodeket. Ha ide egy MP3 tartalmát másolnánk be `.opus` néven, a fájl
+     * lejátszhatatlan lenne – néma csengetés, pont a legvédettebb ponton.
+     * (Ez a hiba egyszer már benne volt: a teszt-szerver első indulásakor
+     * a gyári default MP3-at tartalmazott.)
+     */
+    const sourceIsTarget = path.extname(source).toLowerCase() === AUDIO_EXT;
+
+    if (sourceIsTarget) {
+      try {
+        fs.copyFileSync(source, target);
+        console.log(`[BELL-SOUNDS] Default hang telepítve: ${target}`);
+      } catch (e) {
+        console.error(`[BELL-SOUNDS] Default hang másolás hiba (${name}):`, e);
+      }
+      continue;
+    }
+
+    const tmp = `${target}.converting`;
     try {
-      fs.copyFileSync(source, target);
-      console.log(`[BELL-SOUNDS] Default hang telepítve: ${target}`);
-    } catch (e) {
-      console.error(`[BELL-SOUNDS] Default hang másolás hiba (${name}):`, e);
+      execFileSync("ffmpeg", ["-y", "-i", source, ...opusOutputArgs("audio"), "-f", "opus", tmp],
+                   { timeout: 60_000, stdio: "ignore" });
+      if (fs.statSync(tmp).size === 0) throw new Error("üres kimenet");
+      fs.renameSync(tmp, target);
+      console.log(`[BELL-SOUNDS] Default hang átkódolva: ${source} → ${target}`);
+    } catch (e: any) {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      /*
+       * Ha az átkódolás nem megy (nincs ffmpeg?), a forrást a SAJÁT nevén
+       * tesszük ki. Így a tartalom és a név egyezik, a variáns-feloldó pedig
+       * megtalálja – rosszabb formátum, de hallható csengetés.
+       */
+      const honest = path.join(BELL_AUDIO_DIR, path.basename(source));
+      try {
+        if (!fs.existsSync(honest)) fs.copyFileSync(source, honest);
+        console.error(`[BELL-SOUNDS] ⚠️ Átkódolás sikertelen (${name}): ${e.message} – eredeti formátumban telepítve: ${honest}`);
+      } catch (e2) {
+        console.error(`[BELL-SOUNDS] Default hang telepítés hiba (${name}):`, e2);
+      }
     }
   }
 }
@@ -108,24 +179,30 @@ export function bellSoundDiskPath(
    * rögtön a fallback-ágra megyünk.
    */
   if (filename) {
-    const direct = [
-      path.join(bellSoundTenantDir(tenantId), filename),
-      path.join(BELL_AUDIO_DIR, filename),
-    ];
+    const direct: string[] = [];
+    for (const name of soundNameVariants(filename)) {
+      direct.push(path.join(bellSoundTenantDir(tenantId), name));
+      direct.push(path.join(BELL_AUDIO_DIR, name));
+    }
     for (const p of direct) {
       if (fs.existsSync(p)) return { path: p, isFallback: false };
     }
   }
 
   // A kért fájl nincs meg – NEM maradhat el a csengetés, jön a default.
-  const fallbackName = defaultSoundFor(bellType);
-  const fallbacks = [
-    path.join(BELL_AUDIO_DIR, fallbackName),
-    path.join(BELL_ASSET_DIR, fallbackName),
-    // Végső esély: a másik default, hátha csak az egyik hiányzik.
-    path.join(BELL_AUDIO_DIR, defaultSoundFor(fallbackName === DEFAULT_SIGNAL_SOUND ? "MAIN" : "SIGNAL")),
-    path.join(BELL_ASSET_DIR, defaultSoundFor(fallbackName === DEFAULT_SIGNAL_SOUND ? "MAIN" : "SIGNAL")),
-  ];
+  //
+  // A variánsokat ITT IS végig kell nézni: ez a legvégső védővonal, és az
+  // Opus-ra állás közben épp az fordulhat elő, hogy a default még MP3-ként
+  // van a lemezen. Pontos névre szűkítve ez az ág némán elbukna.
+  const fallbackName  = defaultSoundFor(bellType);
+  const otherDefault  = defaultSoundFor(fallbackName === DEFAULT_SIGNAL_SOUND ? "MAIN" : "SIGNAL");
+  const fallbacks: string[] = [];
+  for (const base of [fallbackName, otherDefault]) {
+    for (const name of soundNameVariants(base)) {
+      fallbacks.push(path.join(BELL_AUDIO_DIR, name));
+      fallbacks.push(path.join(BELL_ASSET_DIR, name));
+    }
+  }
   for (const p of fallbacks) {
     if (fs.existsSync(p)) return { path: p, isFallback: true };
   }
@@ -133,13 +210,44 @@ export function bellSoundDiskPath(
   return null;   // ide csak sérült telepítésnél juthatunk
 }
 
+/**
+ * A lemezen TÉNYLEGESEN meglévő fájlnév (nem az útvonal), vagy null.
+ *
+ * MIÉRT KELL: a klienseknek küldött hanglistában a `filename` és az `url`
+ * NEM csúszhat szét. Az eszköz az `url`-ről tölt, de a `filename` néven
+ * menti a saját fájlrendszerére, a lejátszó pedig KITERJESZTÉSBŐL ismeri fel
+ * a kodeket. Ha tehát a név `.mp3`, a tartalom viszont Opus, a fájl
+ * lejátszhatatlan – néma csengetés, pontosan az, amit tilos.
+ */
+export function resolveSoundName(tenantId: string, filename: string): string | null {
+  for (const name of soundNameVariants(filename)) {
+    if (fs.existsSync(path.join(bellSoundTenantDir(tenantId), name))) return name;
+    if (fs.existsSync(path.join(BELL_AUDIO_DIR, name))) return name;
+  }
+  return null;
+}
+
 /** A hangfájl publikus URL-útja (`/audio/...`), a tényleges helye szerint.
  *  Ha egyik helyen sincs meg, a tenant-szeparált alakot adjuk vissza – az a
  *  helyes cél egy most feltöltendő fájlnak. */
 export function bellSoundUrlPath(tenantId: string, filename: string): string {
-  const scoped = path.join(bellSoundTenantDir(tenantId), filename);
-  if (!fs.existsSync(scoped) && fs.existsSync(path.join(BELL_AUDIO_DIR, filename))) {
-    return `/audio/bells/${encodeURIComponent(filename)}`;
+  /*
+   * A LÉTEZŐ változat URL-jét adjuk vissza, ne a kértét.
+   *
+   * Az eszköz ezt az URL-t tölti le, és ezen a néven menti a saját
+   * fájlrendszerére. Ha itt olyan nevet adnánk, ami a lemezen nincs meg, az
+   * eszköz 404-et kapna – vagyis pont az a hang hiányozna, amit csengetni
+   * kellene.
+   */
+  for (const name of soundNameVariants(filename)) {
+    if (fs.existsSync(path.join(bellSoundTenantDir(tenantId), name))) {
+      return `/audio/bells/${encodeURIComponent(tenantId)}/${encodeURIComponent(name)}`;
+    }
+  }
+  for (const name of soundNameVariants(filename)) {
+    if (fs.existsSync(path.join(BELL_AUDIO_DIR, name))) {
+      return `/audio/bells/${encodeURIComponent(name)}`;
+    }
   }
   return `/audio/bells/${encodeURIComponent(tenantId)}/${encodeURIComponent(filename)}`;
 }

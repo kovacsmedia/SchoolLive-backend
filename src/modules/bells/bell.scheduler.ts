@@ -113,14 +113,15 @@ export async function broadcastSyncBells(tenantId: string): Promise<void> {
   try {
     // Dinamikus import: a bells.routes.ts innen importálja a
     // `broadcastSyncBells`-t, tehát a statikus import körkörös lenne.
-    const { buildScheduleSyncPayload } = await import("./bells.routes");
-    const payload = await buildScheduleSyncPayload(tenantId);
-
+    /*
+     * ESZKÖZÖNKÉNTI broadcast, nem közös payload.
+     *
+     * A hangformátum-átállás alatt a régi firmware-ű eszközök MP3 neveket
+     * kapnak, az újak Opusat. Egy közös payload az egyik csoportnak biztosan
+     * rossz nevet adna (ld. SyncEngine.broadcastScheduleSync).
+     */
     console.log(`[BELLS-SCHEDULER] 📡 SCHEDULE_SYNC broadcast → tenant=${tenantId}`);
-    SyncEngine.broadcastImmediate(tenantId, {
-      ...(payload as object),
-      action: "SYNC_BELLS",
-    });
+    await SyncEngine.broadcastScheduleSync(tenantId, { action: "SYNC_BELLS" });
   } catch (e) {
     // Ha a teljes tartalom összeállítása elbukik, legalább a régi jelzés
     // menjen ki: a HTTP-n újratöltő kliensek (Python, webplayer) így is

@@ -9,13 +9,45 @@ import fs                  from "fs";
 import crypto              from "crypto";
 import { stripAccents }    from "../utils/text";
 import { budapestDateTimeParts } from "../utils/budapest-time";
+import { opusOutputArgs } from "../utils/audio-format";
 
-const PIPER_BIN  = "/opt/schoollive/piper/piper";
-const MODELS_DIR = "/opt/schoollive/piper/models";
-const AUDIO_DIR  = "/opt/schoollive/backend/audio";
+/*
+ * A PIPER TELEPÍTÉSI HELYE külső, a repón kívüli – ezért abszolút út, de
+ * KÖRNYEZETI VÁLTOZÓVAL FELÜLÍRHATÓ, ahogy a szomszédos FFMPEG_BIN és
+ * YT_DLP_BIN is. Enélkül minden eltérő telepítés kódmódosítást igényelne.
+ */
+const PIPER_BIN  = process.env.PIPER_BIN  ?? "/opt/schoollive/piper/piper";
+const MODELS_DIR = process.env.PIPER_MODELS_DIR ?? "/opt/schoollive/piper/models";
+
+/*
+ * AZ AUDIO KÖNYVTÁR A MUNKAKÖNYVTÁRBÓL JÖN, mint mindenhol máshol.
+ *
+ * Itt korábban a bedrótozott `/opt/schoollive/backend/audio` állt. Az éles
+ * node-on véletlenül stimmelt, de bárhol máshol (teszt-példány, másik
+ * telepítési útvonal, fejlesztői futtatás) a Piper a saját WAV-ját olyan
+ * könyvtárba írta, amit az ffmpeg utána nem talált:
+ *
+ *   Error opening input file …/audio/tts_speech_<hash>.wav
+ *
+ * A tünet: a TTS-üzenet létrehozása HTTP 500-zal bukott. Ugyanez a hiba volt
+ * az app.ts statikus `/audio` kiszolgálásában is.
+ */
+const AUDIO_DIR  = path.join(process.cwd(), "audio");
 
 const DINGDONG_WAV = path.join(AUDIO_DIR, "dingdong.wav");
-const DINGDONG_MP3 = path.join(AUDIO_DIR, "dingdong.mp3");
+/*
+ * A dingdong forrása. Az Opus-ra állás után a gyári hang `.opus`, de a régi
+ * `.mp3` is előfordulhat egy még nem migrált telepítésen – és a
+ * `assets/bells/` az egyetlen hely, ahol a repóval EGYÜTT érkezik. Az első
+ * létező nyer; enélkül a WAV nem készült el, és az üzenet-előtti hang némán
+ * elmaradt.
+ */
+const DINGDONG_SOURCES = [
+  path.join(AUDIO_DIR, "dingdong.opus"),
+  path.join(AUDIO_DIR, "dingdong.mp3"),
+  path.join(process.cwd(), "assets", "bells", "dingdong.opus"),
+  path.join(process.cwd(), "assets", "bells", "dingdong.mp3"),
+];
 
 const VOICES: Record<string, string> = {
   // Magyar (eredeti, hangszín-választás)
@@ -68,9 +100,10 @@ function getFileDurationMs(filePath: string): number | null {
 // Dingdong WAV biztosítása
 async function ensureDingdongWav(): Promise<void> {
   if (fs.existsSync(DINGDONG_WAV)) return;
-  if (!fs.existsSync(DINGDONG_MP3)) return;
+  const src = DINGDONG_SOURCES.find(p => fs.existsSync(p));
+  if (!src) { console.warn("[TTS] nincs dingdong forrás – üzenet-előtti hang kimarad"); return; }
   await runProcess("ffmpeg", [
-    "-y", "-i", DINGDONG_MP3,
+    "-y", "-i", src,
     "-ar", "22050", "-ac", "1",
     DINGDONG_WAV,
   ]);
@@ -99,11 +132,75 @@ async function ensureDingdongWav(): Promise<void> {
 //
 // Megjegyzés: az újrajátszandó üzeneteknél (replay) ezt NEM alkalmazzuk,
 // mert a tárolt fájl már egyszer átment ezen a filteren.
-export const NORMALIZE_COMPRESS_FILTER =
-  "acompressor=threshold=-22dB:ratio=4:attack=10:release=180:makeup=6," +
-  "loudnorm=I=-12:TP=-1.0:LRA=7," +
-  "alimiter=limit=0.97:attack=5:release=50";
+/** A célzott hangosság (LUFS), csúcshatár és dinamikatartomány. */
+const LOUDNORM_I   = -12;
+const LOUDNORM_TP  = -1.0;
+const LOUDNORM_LRA = 7;
 
+const COMPRESS_STAGE = "acompressor=threshold=-22dB:ratio=4:attack=10:release=180:makeup=2";
+const LIMITER_STAGE  = "alimiter=limit=0.97:attack=5:release=50";
+
+/**
+ * Tartalék lánc, ha a mérés nem sikerül (ld. measureLoudnorm).
+ * Egy kissé egyenetlen szint sokkal jobb, mint a néma hiba.
+ */
+export const NORMALIZE_COMPRESS_FILTER =
+  `${COMPRESS_STAGE},loudnorm=I=${LOUDNORM_I}:TP=${LOUDNORM_TP}:LRA=${LOUDNORM_LRA},${LIMITER_STAGE}`;
+
+/**
+ * HANGERŐ-KIEGYENLÍTÉS – kétmenetes, de NEM `loudnorm`-mal.
+ *
+ * A PROBLÉMA: az egyes Piper-hangok érezhetően eltérő szinten szólnak, és ez
+ * végigment a láncon – „egyes nyelvek halkabbak". Mérve, ugyanarra a mondatra:
+ *
+ *     nyers:  anna -15.0 | berta -17.7 | imre -21.2 LUFS
+ *
+ * MIÉRT NEM A `loudnorm` OLDJA MEG: az EBU R128 integrált hangosság KAPUZOTT
+ * mérés (400 ms-os blokkok, abszolút és relatív kapu). Egy 3-5 másodperces
+ * bemondáson a kapuk a blokkok nagy részét kizárják, így a mérés – és vele a
+ * korrekció – megbízhatatlan. Kétmenetes módban sem javult: a kimenet
+ * -11.9 és -18.2 LUFS között szóródott, tehát 6.3 dB-en belül SEMMIT nem
+ * garantált.
+ *
+ * AMI MŰKÖDIK: a `volumedetect` egyszerű, kapuzás NÉLKÜLI RMS-t és csúcsot ad,
+ * ami rövid hangon is determinisztikus. Ebből egyetlen fix erősítést
+ * számolunk. Mérve ugyanazokon a hangokon: -14.5 … -17.0 LUFS, azaz 2.5 dB
+ * szóráson belül, és a három magyar hang fél dB-en belül egymáshoz képest.
+ *
+ * A csúcsot szándékosan engedjük PEAK_HEADROOM_DB-ig menni: a rá következő
+ * limiter pont erre való. Az erősítés visszavágása helyette újra szétszórná
+ * a szinteket (a halk, de csúcsos hangok alulmaradnának).
+ */
+const TARGET_MEAN_DBFS = -15.0;
+const PEAK_HEADROOM_DB = 2.0;
+
+export async function measureLoudnorm(inputPath: string): Promise<string | null> {
+  try {
+    const out = await new Promise<string>((resolve, reject) => {
+      const proc = spawn("ffmpeg", [
+        "-hide_banner", "-i", inputPath,
+        "-af", `${COMPRESS_STAGE},volumedetect`,
+        "-f", "null", "-",
+      ]);
+      let err = "";
+      proc.stderr.on("data", d => { err += d.toString(); });
+      proc.on("close", () => resolve(err));
+      proc.on("error", reject);
+    });
+
+    const mean = Number(/mean_volume:\s*(-?[\d.]+)/.exec(out)?.[1]);
+    const peak = Number(/max_volume:\s*(-?[\d.]+)/.exec(out)?.[1]);
+    if (!isFinite(mean) || !isFinite(peak)) return null;
+
+    let gain = TARGET_MEAN_DBFS - mean;
+    // A limiter a maradékot elkapja; ennél többet ne engedjünk rá.
+    if (peak + gain > PEAK_HEADROOM_DB) gain = PEAK_HEADROOM_DB - peak;
+
+    return `${COMPRESS_STAGE},volume=${gain.toFixed(2)}dB,${LIMITER_STAGE}`;
+  } catch {
+    return null;
+  }
+}
 // ── Fájlnév-képzés az üzenet szövegéből ───────────────────────────────────────
 // Cél: "<üzenet első 2 szava, ékezet nélkül>_<YYYY-MM-DD>_<óraperc>.opus" –
 // ember-olvasható fájlnév letöltéskor/listázáskor, ahelyett hogy csak egy
@@ -184,15 +281,10 @@ export async function generateTTS(
   //    a) ha van intro → concat (intro + speech) majd normalize+compress → opus
   //    b) ha nincs intro → csak normalize+compress a speech-en → opus
   //
-  // A végső kódolás: libopus, 48 kbps voip preset – elég kiváló érthető
-  // beszédhez, ugyanakkor kis fájlméret a snapserver fogadásához.
-  const OPUS_ARGS = [
-    "-c:a", "libopus",
-    "-b:a", "48k",
-    "-application", "voip",
-    "-ar", "48000",   // libopus 48k input ajánlott
-    "-ac", "1",
-  ];
+  // A végső kódolás a rendszer EGYETLEN tárolási formátuma (ld.
+  // utils/audio-format.ts): Opus 96 kbit/s, 48 kHz, sztereó. A "voip" preset
+  // marad – az nem a formátumot állítja, hanem a kódolót hangolja beszédre.
+  const OPUS_ARGS = opusOutputArgs("voip");
 
   if (introPath) {
     const concatWav  = path.join(AUDIO_DIR, `concat_${hash}.wav`);
@@ -224,7 +316,7 @@ export async function generateTTS(
     // 3.a/2: normalize + compressor + libopus encode a concat-ra
     await runProcess("ffmpeg", [
       "-y", "-i", concatWav,
-      "-af", NORMALIZE_COMPRESS_FILTER,
+      "-af", (await measureLoudnorm(concatWav)) ?? NORMALIZE_COMPRESS_FILTER,
       ...OPUS_ARGS,
       finalFile,
     ]);
@@ -233,7 +325,7 @@ export async function generateTTS(
     // 3.b: csak normalize+compress + libopus encode
     await runProcess("ffmpeg", [
       "-y", "-i", speechFile,
-      "-af", NORMALIZE_COMPRESS_FILTER,
+      "-af", (await measureLoudnorm(speechFile)) ?? NORMALIZE_COMPRESS_FILTER,
       ...OPUS_ARGS,
       finalFile,
     ]);

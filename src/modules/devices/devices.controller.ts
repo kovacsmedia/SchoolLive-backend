@@ -1,3 +1,4 @@
+import { env } from "../../config/env";
 import { Request, Response } from "express";
 import { prisma } from "../../prisma/client";
 import crypto from "crypto";
@@ -115,7 +116,7 @@ export async function deviceBeacon(req: Request, res: Response) {
     },
   });
 
-  const baseUrl = process.env.BASE_URL ?? "https://api.schoollive.hu";
+  const baseUrl = env.BASE_URL;
   const snapHost =
     process.env.SNAP_HOST ??
     (() => {

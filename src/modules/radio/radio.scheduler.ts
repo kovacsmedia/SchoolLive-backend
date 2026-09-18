@@ -6,6 +6,7 @@
 //   • Stale check: ha a scheduledAt > STALE_THRESHOLD_MS múltban van → skip
 //   • SyncEngine dispatch is setTimeout-tal időzítve
 
+import { rehostUrl } from "../../config/env";
 import { prisma }          from "../../prisma/client";
 import { SyncEngine }      from "../../sync/SyncEngine";
 import { SnapcastService } from "../snapcast/snapcast.service";
@@ -93,7 +94,7 @@ async function scheduleDispatch(schedule: {
    * nem térhet el tőle, különben más hangzana ütemezve, mint kézzel indítva.
    */
   const isStream    = !schedule.radioFile;
-  const sourceUrl   = schedule.radioFile?.fileUrl     ?? schedule.streamUrl  ?? "";
+  const sourceUrl   = schedule.radioFile ? rehostUrl(schedule.radioFile.fileUrl) : (schedule.streamUrl ?? "");
   const sourceTitle = schedule.radioFile?.originalName ?? schedule.streamTitle ?? "Internetrádió";
   const sourceDur   = schedule.radioFile?.durationSec ?? null;
 
@@ -205,6 +206,20 @@ async function scheduleDispatch(schedule: {
         deviceIdsToUnmute:  targetIds,
         persistent:         isStream,
       });
+      /*
+       * INDULÁSI POZÍCIÓ.
+       *
+       * A `play()` mindig a hang elejéről indít. A kért pozícióra a
+       * `seekRadio`-val ugrunk – ugyanaz a bevált minta, mint a YouTube
+       * "élő adásba küldés"-nél és a hangtár azonnali lejátszásánál. A mixer
+       * a pending ablakban is elfogadja, tehát nincs fölösleges
+       * kill+újraindítás, és a hang nem a legelejéről csuklik be.
+       */
+      const startSec = (schedule as any).startSec as number | null | undefined;
+      if (typeof startSec === "number" && startSec > 0) {
+        const ok = SnapcastService.seekRadio(schedule.tenantId, startSec);
+        console.log(`[RADIO-SCHEDULER] ⏩ indulási pozíció: ${startSec}s (${ok ? "ok" : "nem alkalmazható"})`);
+      }
       console.log(`[RADIO-SCHEDULER] 📻 Snapcast START: "${sourceTitle}"${isStream ? " (stream)" : ""} @ ${new Date().toISOString()}`);
     } else {
       console.warn(`[RADIO-SCHEDULER] ⚠️ Snapserver offline: ${schedule.tenantId}`);
@@ -313,14 +328,10 @@ async function resolveDeviceIds(tenantId: string, targetType: string, targetId: 
 // ── yt-dlp napi frissítés ─────────────────────────────────────────────────────
 async function updateYtDlp() {
   const { spawn } = await import("child_process");
-  const { existsSync } = await import("fs");
-  const candidates = [
-    "/home/deploy/.local/bin/yt-dlp",
-    "/home/balazs/.local/bin/yt-dlp",
-    "/usr/local/bin/yt-dlp",
-    "/usr/bin/yt-dlp",
-  ];
-  const bin = candidates.find(p => existsSync(p)) ?? "yt-dlp";
+  // UGYANAZ a feloldás, mint a lejátszásnál – különben más binárist
+  // frissítenénk, mint amit használunk (ld. utils/binaries.ts).
+  const { resolveYtDlp } = await import("../../utils/binaries");
+  const bin = resolveYtDlp();
   console.log(`[YT-UPDATE] yt-dlp frissítés: ${bin}`);
   return new Promise<void>((resolve) => {
     const proc = spawn(bin, ["--update"], { stdio: "pipe" });

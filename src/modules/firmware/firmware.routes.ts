@@ -7,6 +7,7 @@
 //   POST /firmware/ota-status      – ESP32: frissítési állapot visszajelzés
 //   DELETE /firmware/releases/:id  – Admin: verzió törlése
 // ─────────────────────────────────────────────────────────────────────────────
+import { env } from "../../config/env";
 import { Router, Request, Response } from "express";
 import multer from "multer";
 import path   from "path";
@@ -62,7 +63,7 @@ router.post("/upload", authJwt, requireTenant, upload.single("file"),
       // SHA-256 hash kiszámítása
       const fileBuffer = fs.readFileSync(req.file.path);
       const sha256 = crypto.createHash("sha256").update(fileBuffer).digest("hex");
-      const fileUrl = `${process.env.BASE_URL ?? "https://api.schoollive.hu"}/firmware/files/${req.file.filename}`;
+      const fileUrl = `${env.BASE_URL}/firmware/files/${req.file.filename}`;
 
       const release = await prisma.firmwareRelease.create({
         data: {

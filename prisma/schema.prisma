@@ -591,6 +591,10 @@ model RadioSchedule {
   // és leállítjuk. Rövidebb hangnál nincs hatása – addigra magától véget ér.
   // Opcionális: a régi ütemezéseknél és ahol nincs megadva, null.
   endsAt       DateTime?
+  // Indulási pozíció másodpercben. NULL vagy 0 = a hang elejétől.
+  // A felületen a kezelő választhat: "az elejétől" vagy "az aktuális
+  // pozíciótól" – az utóbbi a hangtár idővonalán beállított helyről indít.
+  startSec     Int?
   status       RadioScheduleStatus @default(PENDING)
   dispatchedAt DateTime?
   createdById  String

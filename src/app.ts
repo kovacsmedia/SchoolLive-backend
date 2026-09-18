@@ -23,13 +23,34 @@ import { SyncEngine }           from "./sync/SyncEngine";
 import nativeRoutes from "./modules/devices/devices.native.routes";
 export const app = express();
 
-const allowedOrigins = ["https://schoollive.hu", "http://localhost:5173"];
+/*
+ * Engedélyezett origók.
+ *
+ * A lista KÖRNYEZETI VÁLTOZÓBÓL BŐVÍTHETŐ (`CORS_ORIGINS`, vesszővel
+ * elválasztva) – enélkül minden új telepítés (teszt-példány, másik port,
+ * másik domain) kódmódosítást igényelne.
+ *
+ * FIGYELEM, KÖNNYŰ FÉLREÉRTENI: a böngésző POST/PUT/DELETE kérésnél AKKOR IS
+ * küld `Origin` fejlécet, ha a kérés AZONOS ORIGÓRA megy. Tehát hiába szolgálja
+ * ki ugyanaz a host és port a felületet és az API-t, az origót akkor is fel
+ * kell venni ide – különben a bejelentkezés HTTP 500-zal bukik, miközben a
+ * GET-kérések (pl. /health) hibátlanul mennek.
+ */
+const allowedOrigins = [
+  "https://schoollive.hu",
+  "http://localhost:5173",
+  ...String(process.env.CORS_ORIGINS ?? "")
+    .split(",")
+    .map(o => o.trim())
+    .filter(Boolean),
+];
 
 const corsOptions: cors.CorsOptions = {
   origin(origin, callback) {
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error(`CORS blocked for origin: ${origin}`));
+    return callback(new Error(
+      `CORS blocked for origin: ${origin} – vedd fel a CORS_ORIGINS env-változóba, ha ez jogos.`));
   },
   methods:        ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "x-tenant-id"],
@@ -96,7 +117,15 @@ app.use("/admin/cluster",  clusterAdminRoutes);
 
 // Statikus fájlok
 app.use("/audio/bells",  express.static(path.join(process.cwd(), "audio", "bells")));
-app.use("/audio",        express.static("/opt/schoollive/backend/audio"));
+/*
+ * A TÖBBIVEL AZONOS MÓDON, `process.cwd()`-ből.
+ *
+ * Itt korábban a bedrótozott `/opt/schoollive/backend/audio` állt. Az éles
+ * node-on véletlenül stimmelt, de bárhol máshol (teszt-példány, másik
+ * telepítési útvonal, fejlesztői futtatás) az üzenet-hangok és a TTS-kimenet
+ * NÉMÁN 404-et adott – a felület lejátszója 0:00-t mutatott.
+ */
+app.use("/audio",        express.static(path.join(process.cwd(), "audio")));
 app.use("/uploads/radio", express.static(path.join(process.cwd(), "uploads", "radio")));
 app.use("/firmware/files", express.static(path.join(process.cwd(), "uploads", "firmware")));
 

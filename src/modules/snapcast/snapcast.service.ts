@@ -36,13 +36,22 @@ import {
   rpcSetClientLatency,
 } from "./snapcast-rpc";
 import { randomUUID } from "crypto";
+import { AUDIO_BITRATE_KBPS } from "../../utils/audio-format";
 
 const SNAPSERVER_BIN = process.env.SNAPSERVER_BIN ?? "/usr/bin/snapserver";
 
-const SNAP_BASE_DIR = "/opt/schoollive/snapcast";
+// A snapserver configok és FIFO-k helye. Környezeti változóval felülírható,
+// mint a szomszédos SNAPSERVER_BIN – enélkül egy eltérő telepítés
+// kódmódosítást igényelne.
+const SNAP_BASE_DIR = process.env.SNAP_BASE_DIR ?? "/opt/schoollive/snapcast";
 const FIFO_DIR = `${SNAP_BASE_DIR}/fifos`;
 const CONFIG_DIR = `${SNAP_BASE_DIR}/configs`;
 
+// A sugárzott bitráta ugyanaz, mint a tárolt fájloké – egy helyen definiálva
+// (ld. utils/audio-format.ts). A 192 → 96 csökkentés szándékos: gyenge WiFi-n
+// a felezett sávszélesség érdemben növeli az adás túlélési esélyét, és mivel
+// a tárolt hangok is 96k Opusok, a magasabb átviteli bitráta úgysem hordozna
+// több információt – csak a rádiót fogná vissza.
 const SAMPLE_RATE = 48000;
 const CHANNELS = 2;
 
@@ -195,7 +204,7 @@ class TenantSnapEngine {
       ``,
       `[stream]`,
       `port = ${this.snapPort}`,
-      `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=opus&bitrate=192&chunk_ms=20`,
+      `source = pipe://${this.fifoPath}?name=SL-${this.snapPort}&sampleformat=${SAMPLE_RATE}:16:${CHANNELS}&codec=opus&bitrate=${AUDIO_BITRATE_KBPS}&chunk_ms=20`,
       ``,
       `[http]`,
       `enabled = true`,

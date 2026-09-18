@@ -11,13 +11,14 @@ import { requireTenant } from "../../middleware/tenant";
 import { broadcastSyncBells } from "./bell.scheduler";
 import { stripAccents, fixUploadFilename } from "../../utils/text";
 import { todayInBudapest } from "../../utils/budapest-time";
+import { AUDIO_BITRATE_KBPS, AUDIO_EXT, normalizeToStoredFormat } from "../../utils/audio-format";
 import { findDeviceByKey } from "../devices/device-key";
+import { compareFirmwareVersions } from "../firmware/firmware-version";
 import {
   bellSoundTenantDir,
   bellSoundDiskPath,
   bellSoundUrlPath,
-  DEFAULT_BELL_SOUNDS,
-} from "./bell-sound-paths";
+  BELL_AUDIO_DIR, DEFAULT_BELL_SOUNDS, defaultSoundFor, resolveSoundName } from "./bell-sound-paths";
 
 /** ffprobe alapú hossz-mérés ms-ben. Hiba/elérhetetlenség esetén null. */
 function probeDurationMs(filePath: string): number | null {
@@ -43,7 +44,7 @@ const AUDIO_DIR = path.join(process.cwd(), "audio", "bells");
  * csengetéshez). A LittleFS partíció 0x7F0000 = 8 323 072 bájt, és ebből nem
  * minden a keret:
  *
- *   gyári default hangok (jelzocsengo+kibecsengo)   236 600 B
+ *   gyári default hangok (assembly+lesson-signal-bell)  182 558 B
  *   tanévnyi rend cache (MAX_FY_JSON_BYTES)          65 536 B
  *   wifi.txt, bellfy.ver, superblock, dir-metaadat   ~12 000 B
  *   blokk-kerekítés (4 kB-os blokkok, ~60 fájl)     ~123 000 B
@@ -59,7 +60,7 @@ const AUDIO_DIR = path.join(process.cwd(), "audio", "bells");
  * fogyaszthatják az eszköz tárhelyét.
  */
 const MAX_TOTAL_BYTES = 6 * 1024 * 1024;
-const DEFAULT_SOUNDS = ["jelzocsengo.mp3", "kibecsengo.mp3"];
+const DEFAULT_SOUNDS: readonly string[] = DEFAULT_BELL_SOUNDS;
 
 if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
 
@@ -287,7 +288,7 @@ bellsRouter.post("/templates", authJwt, requireTenant, canEdit, async (req: Requ
           hour: b.hour,
           minute: b.minute,
           type: b.type,
-          soundFile: b.soundFile || (b.type === "SIGNAL" ? "jelzocsengo.mp3" : "kibecsengo.mp3"),
+          soundFile: b.soundFile || defaultSoundFor(b.type),
         })),
       },
     },
@@ -318,7 +319,7 @@ bellsRouter.put("/templates/:id", authJwt, requireTenant, canEdit, async (req: R
           hour: b.hour,
           minute: b.minute,
           type: b.type,
-          soundFile: b.soundFile || (b.type === "SIGNAL" ? "jelzocsengo.mp3" : "kibecsengo.mp3"),
+          soundFile: b.soundFile || defaultSoundFor(b.type),
         })),
       },
     },
@@ -463,85 +464,24 @@ bellsRouter.put("/calendar/:date", authJwt, requireTenant, canEdit, async (req: 
 // ── Hangfájlok ────────────────────────────────────────────────────────────
 
 /*
- * MINDEN CSENGETÉSHANG MP3-KÉNT TÁROLÓDIK.
+ * MINDEN CSENGETÉSHANG OPUS 96k-KÉNT TÁROLÓDIK.
  *
- * MIÉRT: a hangot az eszköz OFFLINE a saját másolatából játssza le, és a
- * lejátszók nem mindent tudnak. Az ESP32-n az ESP32-audioI2S kodekjei közül
- * CSAK az MP3 él – az AAC/FLAC/OPUS/VORBIS ki van csonkolva (flash- és
- * RAM-takarékosság, ld. audio_codecs_stubs.cpp). Egy feltöltött `.opus`
- * csengetéshang tehát ONLINE szólna (a backend ffmpeg-gel streameli), OFFLINE
- * viszont NÉMA maradna – pontosan az a hiba, amit a rendszer nem engedhet meg.
+ * A tárolt és a sugárzott formátum ugyanaz (ld. utils/audio-format.ts), így a
+ * láncból eltűnik a köztes MP3-generáció, és az eszközöknek sem kell
+ * formátumot találgatniuk. Bármit fel lehet tölteni – MP3-at, WAV-ot, FLAC-et
+ * –, a tárolt alak mindig Opus lesz.
  *
- * A feltöltés-szűrő elfogadja az .opus-t (a Snapcast-stream maga is Opus), így
- * a csapda adott volt. Ezért nem tiltunk, hanem KONVERTÁLUNK: bármit fel lehet
- * tölteni, a tárolt alak mindig MP3 lesz. Mellékhaszon, hogy egy WAV nem
- * eszi meg a 6 MiB-os keretet.
+ * ⚠️ FIRMWARE-FÜGGŐSÉG. A hangot az eszköz OFFLINE a saját másolatából
+ * játssza le. Az ESP32-audioI2S-ben az Opus dekóder sokáig ki volt csonkolva
+ * (audio_codecs_stubs.cpp, flash-takarékosság), tehát egy Opus csengetéshang
+ * ONLINE szólt volna, OFFLINE viszont NÉMÁN elmaradt. Ezért az Opus-ra állás
+ * KÖTELEZŐEN együtt jár a firmware-frissítéssel, amiben a dekóder vissza van
+ * kapcsolva.
+ *
+ * Amíg nem minden eszköz frissült, a `/bells/sync` a régi firmware-ű
+ * eszközöknek a megtartott MP3-változatot kínálja (ld. LEGACY_MP3_FALLBACK).
+ * Ez a védőháló szándékosan ideiglenes: ha minden eszköz friss, ki kell venni.
  */
-/*
- * KÓDOLÁSI SZABÁLY: jó minőség, de helytakarékos.
- *
- * VBR 5-ös minőség ≈ 130 kbps – iskolai hangosításon (kis hangszóró, zajos
- * folyosó) ez hallhatóan nem különbözik a 192-320 kbps-től, viszont jóval
- * kevesebb helyet foglal a 6 MiB-os keretből.
- *
- * Egy MÁR tömör MP3-at viszont NEM kódolunk újra: az generációs veszteség
- * lenne érdemi nyereség nélkül. Csak akkor nyúlunk hozzá, ha a forrás nem
- * MP3, vagy pazarlóan nagy bitrátájú.
- */
-const MP3_VBR_QUALITY   = "5";   // ffmpeg -q:a, ~130 kbps VBR
-const MP3_KEEP_MAX_KBPS = 160;   // e fölött újrakódolunk
-
-/** A forrás kodekje és átlagos bitrátája. Hiba esetén null. */
-function probeAudio(filePath: string): Promise<{ codec: string; kbps: number } | null> {
-  return new Promise((resolve) => {
-    execFile(
-      "ffprobe",
-      ["-v", "quiet", "-select_streams", "a:0",
-       "-show_entries", "stream=codec_name:format=bit_rate",
-       "-of", "default=noprint_wrappers=1:nokey=1", filePath],
-      { timeout: 10_000 },
-      (err, stdout) => {
-        if (err) return resolve(null);
-        const lines = String(stdout).trim().split(/\r?\n/);
-        const codec = (lines[0] ?? "").trim().toLowerCase();
-        const bits  = parseInt((lines[1] ?? "").trim(), 10);
-        if (!codec) return resolve(null);
-        resolve({ codec, kbps: isFinite(bits) && bits > 0 ? Math.round(bits / 1000) : 0 });
-      },
-    );
-  });
-}
-
-function transcodeToMp3(srcPath: string): Promise<{ path: string; size: number } | null> {
-  const dir  = path.dirname(srcPath);
-  const base = path.basename(srcPath, path.extname(srcPath));
-  const out  = path.join(dir, `${base}.mp3`);
-  const tmp  = path.join(dir, `${base}.converting.mp3`);
-
-  return new Promise((resolve) => {
-    execFile(
-      "ffmpeg",
-      ["-y", "-i", srcPath, "-vn", "-codec:a", "libmp3lame", "-q:a", MP3_VBR_QUALITY, tmp],
-      { timeout: 60_000 },
-      (err) => {
-        if (err) {
-          try { fs.unlinkSync(tmp); } catch { /* nincs mit takarítani */ }
-          console.error(`[BELLS] MP3 konverzió sikertelen (${srcPath}):`, err.message);
-          return resolve(null);
-        }
-        try {
-          // A forrást csak a SIKERES konverzió után dobjuk el.
-          if (out !== srcPath) fs.unlinkSync(srcPath);
-          fs.renameSync(tmp, out);
-          resolve({ path: out, size: fs.statSync(out).size });
-        } catch (e: any) {
-          console.error(`[BELLS] MP3 konverzió utómunka hiba:`, e.message);
-          resolve(null);
-        }
-      },
-    );
-  });
-}
 
 bellsRouter.get("/sounds", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
   /*
@@ -591,39 +531,33 @@ bellsRouter.post("/sounds", authJwt, requireTenant, canEdit, upload.single("file
   let storedSize = file.size;
   let storedName = stripAccents(fixUploadFilename(file.originalname));
 
-  const probe = await probeAudio(file.path);
-
   /*
-   * Ha a mérés nem sikerült (ffprobe hiba), egy .mp3 kiterjesztésű fájlt
-   * MEGTARTUNK. Enélkül egy átmeneti hiba egy tökéletes MP3 feltöltését is
-   * elutasítaná – vagyis rosszabb lenne, mint a korábbi viselkedés.
+   * EGYETLEN TÁROLT FORMÁTUM: Opus 96k (ld. utils/audio-format.ts).
+   *
+   * Bármit tölthet fel a felhasználó – MP3-at, WAV-ot, FLAC-et –, a tárolt
+   * változat mindig ugyanaz. Így az eszközöknek sosem kell formátumot
+   * találgatniuk, és a lejátszási láncból eltűnik a köztes MP3-generáció.
    */
-  const probeFailedOnMp3 =
-    probe === null && path.extname(storedName).toLowerCase() === ".mp3";
+  const normalized = await normalizeToStoredFormat(file.path, storedName, "audio");
 
-  const isMp3     = probe?.codec === "mp3";
-  const isCompact =
-    probeFailedOnMp3 ||
-    (isMp3 && probe!.kbps > 0 && probe!.kbps <= MP3_KEEP_MAX_KBPS);
+  if (!normalized) {
+    try { fs.unlinkSync(file.path); } catch { /* ignore */ }
+    return res.status(400).json({
+      error: "A hangfájlt nem sikerült átkódolni. Kérjük, próbálja másik fájllal.",
+    });
+  }
 
-  if (isCompact) {
-    console.log(`[BELLS] Megtartva: ${storedName} (mp3, ${probe!.kbps} kbps)`);
-  } else {
-    const conv = await transcodeToMp3(file.path);
-    if (!conv) {
-      try { fs.unlinkSync(file.path); } catch { /* ignore */ }
-      return res.status(400).json({
-        error: "A hangfájlt nem sikerült MP3-ra alakítani. Kérjük, töltsön fel MP3-at.",
-      });
-    }
-    storedPath = conv.path;
-    storedSize = conv.size;
-    storedName = path.basename(storedName, path.extname(storedName)) + ".mp3";
+  storedPath = normalized.path;
+  storedSize = normalized.size;
+  storedName = normalized.name;
+
+  if (normalized.converted) {
     console.log(
-      `[BELLS] Átkódolva: ${file.originalname} ` +
-      `(${probe?.codec ?? "?"}${probe?.kbps ? `, ${probe.kbps} kbps` : ""}, ${file.size} B) ` +
-      `→ ${storedName} (${storedSize} B)`
+      `[BELLS] Átkódolva: ${file.originalname} (${file.size} B) ` +
+      `→ ${storedName} (${storedSize} B, Opus ${AUDIO_BITRATE_KBPS}k)`
     );
+  } else {
+    console.log(`[BELLS] Megtartva: ${storedName} (már Opus ${AUDIO_BITRATE_KBPS}k)`);
   }
 
   /*
@@ -651,13 +585,23 @@ bellsRouter.post("/sounds", authJwt, requireTenant, canEdit, upload.single("file
   // A multer `filename` setter már ékezet-mentesítette; konverzió esetén a
   // kiterjesztés is .mp3-ra változott (ld. fent).
   const cleanName = storedName;
+  /*
+   * A HOSSZT MINDEN HANGNÁL MEGMÉRJÜK, nem csak az introknál.
+   *
+   * A felület kiírja a lista sorában (a méret elé), hogy a kezelő lejátszás
+   * nélkül is lássa, mennyi ideig fog szólni egy csengetés. Az `?? null`
+   * azért kell, mert egy ffprobe-hiba nem buktathatja el a feltöltést.
+   */
+  const measuredMs = probeDurationMs(storedPath);
+
   const sound = await prisma.bellSoundFile.upsert({
     where: { tenantId_filename: { tenantId: tid(req), filename: cleanName } },
-    update: { sizeBytes: storedSize },
+    update: { sizeBytes: storedSize, durationMs: measuredMs ?? undefined },
     create: {
       tenantId:  tid(req),
       filename:  cleanName,
       sizeBytes: storedSize,
+      durationMs: measuredMs,
       isDefault: DEFAULT_SOUNDS.includes(cleanName),
     },
   });
@@ -665,6 +609,102 @@ bellsRouter.post("/sounds", authJwt, requireTenant, canEdit, upload.single("file
   notifyAllClients(tid(req));
 
   res.status(201).json({ ok: true, sound });
+});
+
+/**
+ * Csengetőhang átnevezése.
+ *
+ * A KITERJESZTÉST a szerver tartja meg – a felhasználó csak az alapnevet adja
+ * meg, és a felület sem mutat kiterjesztést. Így nem lehet véletlenül olyan
+ * nevet menteni, ami hazudik a tartalomról (pl. Opus fájl `.mp3` néven, amit
+ * a lejátszók kiterjesztésből ismernek fel → néma csengetés).
+ *
+ * A GYÁRI HANGOK NEM NEVEZHETŐK ÁT. Rájuk a backend konstansai NÉV SZERINT
+ * hivatkoznak (bell-sound-paths.ts DEFAULT_SIGNAL_SOUND / DEFAULT_MAIN_SOUND),
+ * és a kliensek beépített másolatai is ezen a néven vannak – az átnevezés
+ * elvágná a fallback-láncot. Ezért ugyanaz a védelem, mint a törlésnél.
+ */
+bellsRouter.patch("/sounds/:id/rename", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
+  const soundId = req.params.id as string;
+  const raw     = String((req.body ?? {}).name ?? "").trim();
+
+  const sound = await prisma.bellSoundFile.findFirst({
+    where: { id: soundId, tenantId: tid(req) },
+  });
+  if (!sound) return res.status(404).json({ error: "Not found" });
+  if (sound.isDefault) return res.status(403).json({ error: "Cannot rename default sound" });
+
+  // Csak az alapnév jön a klienstől; a kiterjesztés a MEGLÉVŐ fájlé marad.
+  const ext      = path.extname(sound.filename);
+  const baseName = stripAccents(raw).replace(/\.[^.]+$/, "").trim();
+
+  /*
+   * Fájlnév-tisztítás. Az eszközök fájlrendszerére (LittleFS) és URL-be is
+   * kerül, ezért csak a biztosan ártalmatlan karaktereket engedjük át.
+   * A LittleFS névhossz-korlátja 64 karakter, a kiterjesztést is beleértve.
+   */
+  const safeBase = baseName.replace(/[^A-Za-z0-9._ -]/g, "").replace(/\s+/g, " ").trim();
+  if (!safeBase) return res.status(400).json({ error: "Invalid name" });
+  const maxBase = 60 - ext.length;
+  const newName = safeBase.slice(0, Math.max(1, maxBase)) + ext;
+
+  if (newName === sound.filename) return res.json({ ok: true, sound });
+
+  const clash = await prisma.bellSoundFile.findFirst({
+    where: { tenantId: tid(req), filename: newName, NOT: { id: sound.id } },
+  });
+  if (clash) return res.status(409).json({ error: "A sound with this name already exists" });
+
+  /*
+   * A LEMEZEN MINDEN VÁLTOZATOT ÁT KELL NEVEZNI.
+   *
+   * Az Opus-átállás alatt a hang mellett ott van a régi MP3 példány is, amit
+   * a failsafe szolgál ki a még nem frissített eszközöknek. Ha csak az egyiket
+   * neveznénk át, a régi firmware-ű eszköz a régi néven keresné – és nem
+   * találná meg.
+   */
+  const dir      = bellSoundTenantDir(tid(req));
+  const variants = [sound.filename, path.basename(sound.filename, ext) + (ext === AUDIO_EXT ? ".mp3" : AUDIO_EXT)];
+  let movedAny = false;
+
+  for (const from of variants) {
+    const fromExt  = path.extname(from);
+    const toName   = path.basename(newName, ext) + fromExt;
+    for (const baseDir of [dir, BELL_AUDIO_DIR]) {
+      const src = path.join(baseDir, from);
+      if (!fs.existsSync(src)) continue;
+      try {
+        fs.renameSync(src, path.join(baseDir, toName));
+        movedAny = true;
+      } catch (e) {
+        console.error(`[BELLS] átnevezés hiba (${src}):`, e);
+      }
+      break;   // tenant-könyvtár nyer, ha mindkettőben megvan
+    }
+  }
+
+  if (!movedAny) {
+    // Nincs mit átnevezni a lemezen – a DB-t sem írjuk át, különben egy
+    // létező sor mutatna nem létező fájlra.
+    return res.status(409).json({ error: "Sound file not found on disk" });
+  }
+
+  await prisma.bellSoundFile.update({ where: { id: sound.id }, data: { filename: newName } });
+
+  // A csengetési rend hivatkozásai is kövessék – enélkül a bejegyzések a régi
+  // névre mutatnának, és a gyári default szólna helyettük.
+  const templates = await prisma.bellScheduleTemplate.findMany({
+    where: { tenantId: tid(req) }, select: { id: true },
+  });
+  const updated = await prisma.bellEntry.updateMany({
+    where: { templateId: { in: templates.map(t => t.id) }, soundFile: sound.filename },
+    data:  { soundFile: newName },
+  });
+
+  console.log(`[BELLS] Átnevezve: ${sound.filename} → ${newName} (${updated.count} hivatkozás frissítve)`);
+  notifyAllClients(tid(req));
+
+  return res.json({ ok: true, filename: newName, referencesUpdated: updated.count });
 });
 
 bellsRouter.delete("/sounds/:id", authJwt, requireTenant, canEdit, async (req: Request, res: Response) => {
@@ -993,6 +1033,13 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
 
   const fullYear = await buildFullYearCalendar(device.tenantId);
 
+  /*
+   * Opus-képes-e ez a konkrét eszköz? Ha nem, a régi (MP3) neveket kapja –
+   * hivatkozásban ÉS hanglistában egyaránt. Ld. LEGACY_MP3_FALLBACK.
+   */
+  const legacy = needsLegacyAudio(device.firmwareVersion);
+  const sf = (name: string) => (legacy ? toLegacyName(name) : name);
+
   res.json({
     ok: true,
     isHoliday,
@@ -1002,13 +1049,13 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
       hour:      b.hour,
       minute:    b.minute,
       type:      b.type,
-      soundFile: b.soundFile,
+      soundFile: sf(b.soundFile),
     })),
     defaultBells: defaultBells.map((b: any) => ({
       hour:      b.hour,
       minute:    b.minute,
       type:      b.type,
-      soundFile: b.soundFile,
+      soundFile: sf(b.soundFile),
     })),
     // A default hangokat és minden ténylegesen hivatkozott fájlnevet MINDIG
     // tartalmaz – az eszköz ebből takarít, ld. buildSoundsList().
@@ -1017,20 +1064,95 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
       ...defaultBells.map((b: any) => b.soundFile),
       ...((fullYear.templates as any[]) ?? []).flatMap((t: any) =>
         (t?.bells ?? []).map((b: any) => b.soundFile)),
-    ].filter(Boolean)),
+    ].filter(Boolean), legacy),
     updatedAt: new Date().toISOString(),
     // Új, additív mezők: a teljes tanévnyi naptár. A régi kliensek ezeket
     // egyszerűen figyelmen kívül hagyják (bells/defaultBells/sounds
     // változatlan formában megmarad "ma" nézetnek).
     schoolYear:        fullYear.schoolYear,
     defaultTemplateId: fullYear.defaultTemplateId,
-    templates:         fullYear.templates,
+    templates:         legacy
+      ? ((fullYear.templates as any[]) ?? []).map((t: any) => ({
+          ...t,
+          bells: (t?.bells ?? []).map((b: any) => ({ ...b, soundFile: sf(b.soundFile) })),
+        }))
+      : fullYear.templates,
     calendar:          fullYear.calendar,
     fullYearVersion:   fullYear.fullYearVersion,
   });
 });
 
 // ── Shared helper – SyncEngine is hívja WS SCHEDULE_SYNC push-hoz ─────────────
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ÁTMENETI VÉDŐHÁLÓ: MP3 A RÉGI FIRMWARE-EKNEK
+//
+// A rendszer egységes hangformátuma Opus 96k, DE az azt dekódolni képes ESP32
+// firmware csak az OPUS_MIN_FIRMWARE verziótól létezik (korábban az
+// ESP32-audioI2S Opus dekódere ki volt csonkolva, ld. audio_codecs_stubs.cpp).
+// Egy frissítetlen eszköznek Opus fájlt küldeni néma csengetést jelentene.
+//
+// Amíg ez be van kapcsolva, az ilyen eszközök a MEGTARTOTT MP3-változatot
+// kapják – a migráció szándékosan nem törli a régi fájlokat.
+//
+// ⚠️ EZT KI KELL VENNI, ha minden eszköz frissült. Addig minden sync-nél egy
+// extra elágazás fut, és a lemezen duplán állnak a hangok.
+//
+// Kikapcsolás: LEGACY_MP3_FALLBACK = false (majd a régi .mp3-ak törlése).
+// ═══════════════════════════════════════════════════════════════════════════
+const LEGACY_MP3_FALLBACK = true;
+
+/** Ettől a firmware-verziótól tud az eszköz Opus fájlt lejátszani. */
+const OPUS_MIN_FIRMWARE = "S6.00";
+
+/**
+ * Régi-e az eszköz firmware-je az Opus-képes minimumhoz képest?
+ *
+ * ISMERETLEN VERZIÓ = RÉGINEK SZÁMÍT. Egy eszköz, ami még sosem jelentett
+ * verziót, lehet régi is – és ilyenkor az MP3 a biztonságos tipp: azt MINDEN
+ * firmware le tudja játszani, az Opust nem.
+ */
+export function needsLegacyAudio(firmwareVersion: string | null | undefined): boolean {
+  if (!LEGACY_MP3_FALLBACK) return false;
+
+  /*
+   * A KORLÁT KIZÁRÓLAG AZ ESP32-É.
+   *
+   * Az Opus-dekóder hiánya az ESP32-audioI2S könyvtár sajátja. A böngésző
+   * (webplayer) és az Android natívan dekódol Opust – nekik MP3-at küldeni
+   * fölösleges, és a régi fájlok törlése után egyenesen hibás lenne.
+   *
+   * A verzió-sztring alakja árulja el, ki jelentkezik:
+   *   "S6.00"                → ESP32 firmware      → verzió-összehasonlítás
+   *   "android/Android 9"    → Android kliens      → tud Opust
+   *   "WP"                   → webplayer           → tud Opust
+   *
+   * Enélkül a `WP` értelmezhetetlen verzióként RÉGINEK számított (MP3-at
+   * kapott), az Android pedig csak VÉLETLENÜL ment át: az "Android 9" a
+   * parserben [9]-cé vált, ami nagyobb, mint a [6,0]. Egy Android 5.1
+   * ugyanitt MP3-ra esett volna.
+   */
+  const raw = String(firmwareVersion ?? "").trim();
+  const isEspFirmware = /^S\d/i.test(raw);
+  if (raw && !isEspFirmware) return false;
+
+  /*
+   * A MEGLÉVŐ összehasonlítót használjuk (firmware-version.ts), nem sajátot.
+   * Az OTA-döntés és ez a kapu ugyanazt a verzió-rendezést KELL lássa –
+   * két külön implementáció előbb-utóbb szétcsúszik, és akkor egy eszköz
+   * frissítést kapna, de a hangformátumot mégis réginek hinnénk (vagy
+   * fordítva, ami néma csengetés).
+   */
+  const cmp = compareFirmwareVersions(firmwareVersion ?? "", OPUS_MIN_FIRMWARE);
+  if (cmp === null) return true;   // értelmezhetetlen verzió → MP3 a biztonságos
+  return cmp < 0;
+}
+
+/** Fájlnév átírása a régi formátumra (csak a failsafe ágon). */
+function toLegacyName(name: string): string {
+  if (!name) return name;
+  return name.replace(/\.[^.]+$/, "") + ".mp3";
+}
 
 // ── Hanglista összeállítása a klienseknek ──────────────────────────────────
 //
@@ -1041,7 +1163,7 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
 //
 // Ezért a lista MINDIG tartalmazza:
 //   1. a tenant saját feltöltött hangjait (BellSoundFile),
-//   2. a default hangokat (jelzocsengo/kibecsengo) – ezek a firmware LittleFS
+//   2. a default hangokat (assembly-/lesson-signal-bell) – ezek a firmware LittleFS
 //      képében is benne vannak, és minden `soundFile` nélküli bejegyzés
 //      ezekre hivatkozik,
 //   3. minden olyan fájlnevet, amire a csengetési rend TÉNYLEGESEN hivatkozik,
@@ -1049,6 +1171,7 @@ bellsRouter.get("/sync", async (req: Request, res: Response) => {
 async function buildSoundsList(
   tenantId: string,
   referencedFilenames: string[] = [],
+  legacy = false,
 ): Promise<Array<{ filename: string; url: string; sizeBytes: number }>> {
   const rows = await prisma.bellSoundFile.findMany({
     where: { tenantId, kind: "SCHEDULE" },
@@ -1056,8 +1179,19 @@ async function buildSoundsList(
 
   const out = new Map<string, { filename: string; url: string; sizeBytes: number }>();
 
-  const add = (filename: string, sizeBytes?: number) => {
-    if (!filename || out.has(filename)) return;
+  const add = (requested: string, sizeBytes?: number) => {
+    if (!requested) return;
+    /*
+     * A LEMEZEN LÉVŐ névvel dolgozunk tovább, nem a kérttel.
+     *
+     * Az Opus-ra állás közben a DB még `csengo.mp3`-at mondhat, miközben a
+     * lemezen már `csengo.opus` van. Az eszköz az `url`-ről tölt, de a
+     * `filename` néven menti, és a lejátszója kiterjesztésből ismeri fel a
+     * kodeket – a kettő szétcsúszása lejátszhatatlan fájlt adna.
+     */
+    const wanted   = legacy ? toLegacyName(requested) : requested;
+    const filename = resolveSoundName(tenantId, wanted) ?? wanted;
+    if (out.has(filename)) return;
     const resolved = bellSoundDiskPath(tenantId, filename);
     // Csak a TÉNYLEGESEN létező fájl kerülhet a listába. A default-fallback
     // (`isFallback`) itt NEM jó: az URL a hiányzó fájlra mutatna, amit az
@@ -1066,10 +1200,21 @@ async function buildSoundsList(
     // resolveLocalSound), a szerver pedig a snap-ágon szintén defaulttal
     // csenget – csend egyik esetben sem lesz.
     if (!resolved || resolved.isFallback) return;
-    let size = sizeBytes ?? 0;
-    if (!size) {
-      try { size = fs.statSync(resolved.path).size; } catch { size = 0; }
-    }
+    /*
+     * A MÉRET A LEMEZRŐL JÖN, NEM AZ ADATBÁZISBÓL.
+     *
+     * Az eszköz ezt a számot ellenőrzi a letöltés után, és eltérésnél
+     * újratölt. Ha a nyilvántartás elavul (pl. egy fájl kívülről cserélődik,
+     * vagy egy migráció "már jó" alapon átugorja a méret frissítését), a
+     * kliens VÉGTELEN újratöltésbe kerül – a régi firmware pedig el is
+     * dobta a hibátlanul letöltött fájlt, és gyári hang nélkül maradt.
+     *
+     * A lemezen lévő fájl az egyetlen igazság: azt fogja letölteni.
+     * A `sizeBytes` csak tartalék, ha a stat valamiért nem megy.
+     */
+    let size = 0;
+    try { size = fs.statSync(resolved.path).size; } catch { size = 0; }
+    if (!size) size = sizeBytes ?? 0;
     out.set(filename, {
       filename,
       url: bellSoundUrlPath(tenantId, filename),
@@ -1084,7 +1229,12 @@ async function buildSoundsList(
   return [...out.values()];
 }
 
-export async function buildScheduleSyncPayload(tenantId: string): Promise<object> {
+/**
+ * @param legacy ha igaz, a hivatkozott fájlnevek és a hanglista is a régi
+ *        (MP3) alakban megy ki – a még nem Opus-képes firmware-eknek.
+ *        Ld. LEGACY_MP3_FALLBACK.
+ */
+export async function buildScheduleSyncPayload(tenantId: string, legacy = false): Promise<object> {
   const today = todayInBudapest();
   const { bells, defaultBells, isHoliday, todayVersion, defaultVersion } =
     await resolveTodayBells(tenantId, today);
@@ -1101,21 +1251,32 @@ export async function buildScheduleSyncPayload(tenantId: string): Promise<object
     for (const b of (t?.bells ?? [])) if (b?.soundFile) referenced.add(b.soundFile);
   }
 
-  const sounds = await buildSoundsList(tenantId, [...referenced]);
+  const sounds = await buildSoundsList(tenantId, [...referenced], legacy);
+
+  // A hivatkozásoknak EGYEZNIÜK KELL a hanglistával: az eszköz a `sounds[]`
+  // alapján tölt és takarít, a `soundFile` alapján pedig keres lejátszáskor.
+  // Ha a kettő szétcsúszik, a hang megvan a lemezen, de más néven – és a
+  // csengetés a gyári defaultra esik vissza.
+  const sf = (name: string) => (legacy ? toLegacyName(name) : name);
 
   return {
     type:           "SCHEDULE_SYNC",
     isHoliday,
     todayVersion,
     defaultVersion,
-    bells:          bells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
-    defaultBells:   defaultBells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: b.soundFile })),
+    bells:          bells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: sf(b.soundFile) })),
+    defaultBells:   defaultBells.map((b: any) => ({ hour: b.hour, minute: b.minute, type: b.type, soundFile: sf(b.soundFile) })),
     sounds,
     updatedAt:      new Date().toISOString(),
     // Additív mezők – teljes tanévnyi naptár (ld. buildFullYearCalendar).
     schoolYear:        fullYear.schoolYear,
     defaultTemplateId: fullYear.defaultTemplateId,
-    templates:         fullYear.templates,
+    templates:         legacy
+      ? (fullYear.templates as any[] ?? []).map((t: any) => ({
+          ...t,
+          bells: (t?.bells ?? []).map((b: any) => ({ ...b, soundFile: sf(b.soundFile) })),
+        }))
+      : fullYear.templates,
     calendar:          fullYear.calendar,
     fullYearVersion:   fullYear.fullYearVersion,
   };

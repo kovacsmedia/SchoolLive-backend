@@ -48,6 +48,17 @@ export const env = {
   // Üres = kikapcsolva, nincs kimenő webhook-hívás.
   CLUSTER_ALERT_WEBHOOK_URL: process.env.CLUSTER_ALERT_WEBHOOK_URL ?? "",
 
+  /**
+   * A kifelé hirdetett alap-URL – ebből épül minden olyan link, amit KLIENS
+   * kap meg (hangfájlok, firmware, üzenet-hangok).
+   *
+   * EGY HELYEN. Korábban öt különböző fájlban ismétlődött a
+   * `process.env.BASE_URL ?? "https://api.schoollive.hu"` minta; egy új
+   * helyen könnyű lemaradni az alapértékről, és akkor a kliens `undefined`
+   * kezdetű URL-t kapna.
+   */
+  BASE_URL: process.env.BASE_URL ?? "https://api.schoollive.hu",
+
   // ── Lokalizáció ────────────────────────────────────────────────────────
   //
   // Google Cloud Translation v2 REST API kulcs (üzenet-fordítás, ld.
@@ -62,3 +73,30 @@ export const env = {
 // célnyelv-listájában is megjelenik.
 export const SUPPORTED_LOCALES = ["hu", "en", "de", "sk", "pl", "ro", "uk", "sr", "hr"] as const;
 export type SupportedLocale = (typeof SUPPORTED_LOCALES)[number];
+
+/**
+ * Egy TÁROLT, abszolút URL visszahorgonyzása az AKTUÁLIS alap-URL-re.
+ *
+ * MIÉRT KELL: a `RadioFile.fileUrl` és a `Message.fileUrl` teljes URL-ként
+ * kerül az adatbázisba, a létrehozás pillanatában érvényes hoszttal. Ez
+ * két esetben hazudik:
+ *
+ *   1. A tesztszerveren egy éles adatbázis-másolattal a sorok az ÉLES hosztra
+ *      mutatnak – a mixer onnan töltötte le a hangot, és a teszt nem volt
+ *      önálló. (Élesben megfigyelve, 2026-09-18.)
+ *   2. Ha a domain valaha változik, MINDEN régi sor törött linkké válik.
+ *
+ * Csak a saját kiszolgálású útvonalakat írja át (`/uploads/`, `/audio/`,
+ * `/firmware/`); egy külső URL-hez (pl. internetrádió streamje) nem nyúl.
+ */
+export function rehostUrl(stored: string | null | undefined): string {
+  if (!stored) return "";
+  try {
+    const u = new URL(stored);
+    if (!/^\/(uploads|audio|firmware)\//.test(u.pathname)) return stored;
+    return `${env.BASE_URL.replace(/\/+$/, "")}${u.pathname}${u.search}`;
+  } catch {
+    // Nem abszolút URL (régi, relatív sor) – az alap-URL elé fűzzük.
+    return stored.startsWith("/") ? `${env.BASE_URL.replace(/\/+$/, "")}${stored}` : stored;
+  }
+}

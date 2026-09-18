@@ -10,6 +10,7 @@ import { startBellsScheduler }  from "./modules/bells/bell.scheduler";
 import { ensureDefaultBellSounds } from "./modules/bells/bell-sound-paths";
 import { startRadioScheduler }  from "./modules/radio/radio.scheduler";
 import { startMessageScheduler } from "./modules/messages/message.scheduler";
+import { startMessageJanitor } from "./modules/messages/message.janitor";
 import { startDeviceLifecycleScheduler } from "./modules/devices/device.lifecycle";
 import { startClusterHeartbeat } from "./modules/cluster/cluster.heartbeat";
 import { startLeaderElection, releaseLeadershipIfHeld } from "./modules/cluster/cluster.leader";
@@ -75,6 +76,7 @@ ensureDefaultBellSounds();
 startBellsScheduler();
 startRadioScheduler();
 startMessageScheduler();
+startMessageJanitor();
 startDeviceLifecycleScheduler();
 
 // ── Cluster (multi-node) ─────────────────────────────────────────────────────

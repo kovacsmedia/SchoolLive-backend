@@ -1796,11 +1796,33 @@ export class TenantAudioMixer extends EventEmitter {
       ? `volume=${explicitVolume.toFixed(2)}`
       : null;
 
+    /*
+     * RÁDIÓ-SZINTEZÉS.
+     *
+     * A rádió-ág eddig SEMMILYEN feldolgozást nem kapott. Egy internetrádió
+     * broadcast-feldolgozott (erősen tömörített, a plafon közelében jár), egy
+     * YouTube-videó viszont nem – ugyanazon a csúszka-álláson jóval halkabban
+     * szólt. A kezelőnek forrásonként kellett utánaállítani.
+     *
+     * SZÁNDÉKOSAN NEM `loudnorm`: annak 3 másodperces előretekintése van, ami
+     * pont a "snap követi a videó idővonalát" szinkront rontaná el. Egy
+     * kompresszor-limiter páros gyakorlatilag késleltetésmentes, és a
+     * bemondás-láncban (ANNOUNCEMENT_FILTER) már bevált.
+     *
+     * Enyhébb a bemondásénál: a zenének maradjon dinamikája, csak a
+     * forrásonkénti szintkülönbséget vegyük ki.
+     */
+    const RADIO_FILTER =
+      "acompressor=threshold=-18dB:ratio=3:attack=25:release=250:knee=6:makeup=3," +
+      "alimiter=level_in=1:level_out=1:limit=0.97";
+
     const chain: string[] = [];
     if (preGain) chain.push(preGain);
     if (job.jobType === "BELL" || job.jobType === "TTS") {
       // Bemondás/csengő: max-loud (de nem agresszív) chain a snap pipe-on.
       chain.push(ANNOUNCEMENT_FILTER);
+    } else if (job.jobType === "RADIO") {
+      chain.push(RADIO_FILTER);
     }
 
     const audioFilter = chain.length > 0 ? ["-af", chain.join(",")] : [];
